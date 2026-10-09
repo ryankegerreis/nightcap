@@ -17,7 +17,6 @@ pub mod theme;
 pub mod widgets;
 
 const SAVE_DELAY: Duration = Duration::from_millis(300);
-const RUNNING_REPAINT: Duration = Duration::from_millis(250);
 const NOTICE_DURATION: Duration = Duration::from_millis(4500);
 
 pub struct NightcapApp {
@@ -36,6 +35,8 @@ pub struct NightcapApp {
     save_after: Option<Instant>,
     notice: Option<StatusNote>,
     ctx: Option<egui::Context>,
+    #[cfg(target_os = "macos")]
+    _wake_observer: crate::platform::macos::WakeObserver,
 }
 
 struct StatusNote {
@@ -49,6 +50,8 @@ impl NightcapApp {
         let duration_min = settings.last_duration_min.clamp(MIN_MINUTES, MAX_MINUTES);
         let custom_duration = !PRESETS.contains(&duration_min);
         Self {
+            #[cfg(target_os = "macos")]
+            _wake_observer: crate::platform::macos::WakeObserver::new(engine.clone()),
             engine,
             tray,
             overlay: overlay::Overlay::new(),
@@ -196,14 +199,7 @@ impl eframe::App for NightcapApp {
         // Logic-only passes retain pending input until the root renders again.
         // Handle each native close once so its stale event cannot hide a tray reopen.
         let close_requested = ctx.input(|input| input.viewport().close_requested());
-        if !close_requested {
-            self.close_request_handled = false;
-        }
-        if close_requested && self.tray.is_some() && !self.quitting {
-            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
-        }
-        let new_close = close_requested && !self.close_request_handled;
-        self.close_request_handled |= close_requested;
+        let new_close = close_edge(close_requested, &mut self.close_request_handled);
         if new_close
             || (self.root_visible
                 && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W)))
@@ -245,14 +241,7 @@ impl eframe::App for NightcapApp {
                 snapshot.brightness_supported,
                 snapshot.volume_supported,
             );
-            ui.ctx().send_viewport_cmd_to(
-                egui::ViewportId::ROOT,
-                egui::ViewportCommand::Visible(false),
-            );
             return;
-        }
-        if snapshot.state == TimerState::Running {
-            ui.ctx().request_repaint_after(RUNNING_REPAINT);
         }
         if let Some(note) = &self.notice {
             ui.ctx()
@@ -349,6 +338,12 @@ impl eframe::App for NightcapApp {
     }
 }
 
+fn close_edge(requested: bool, handled: &mut bool) -> bool {
+    let edge = requested && !*handled;
+    *handled = requested;
+    edge
+}
+
 /// Keep native decorations on Windows/Linux; macOS paints its unified header.
 pub fn window_builder(title: &str) -> egui::ViewportBuilder {
     let icon = app_icon();
@@ -418,5 +413,21 @@ pub fn install_app_icon() {
                 NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_close_event_is_handled_once_and_a_new_close_is_handled() {
+        let mut handled = false;
+        assert!(close_edge(true, &mut handled));
+        for _ in 0..100 {
+            assert!(!close_edge(true, &mut handled));
+        }
+        assert!(!close_edge(false, &mut handled));
+        assert!(close_edge(true, &mut handled));
     }
 }

@@ -10,6 +10,13 @@ use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+pub const MIN_DURATION_MIN: u32 = 1;
+pub const MAX_DURATION_MIN: u32 = 720;
+pub const BEFORE_MINUTES: [u32; 7] = [5, 10, 15, 20, 30, 45, 60];
+pub const OVER_MINUTES: [u32; 8] = [1, 5, 10, 15, 20, 30, 45, 60];
+pub const MAX_BEFORE_MIN: u32 = BEFORE_MINUTES[BEFORE_MINUTES.len() - 1];
+pub const MAX_OVER_MIN: u32 = OVER_MINUTES[OVER_MINUTES.len() - 1];
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -67,6 +74,20 @@ impl Default for Settings {
 }
 
 impl Settings {
+    fn normalize(&mut self) {
+        for fade in [&mut self.dim, &mut self.volume] {
+            fade.target_percent = fade.target_percent.min(100);
+            // BEFORE_MINUTES starts at 5; OVER_MINUTES starts at 1. Both top out at 60.
+            fade.start_before_min = fade
+                .start_before_min
+                .clamp(BEFORE_MINUTES[0], MAX_BEFORE_MIN);
+            fade.over_min = fade.over_min.clamp(OVER_MINUTES[0], MAX_OVER_MIN);
+        }
+        self.last_duration_min = self
+            .last_duration_min
+            .clamp(MIN_DURATION_MIN, MAX_DURATION_MIN);
+    }
+
     pub fn config_path() -> Result<PathBuf> {
         let dirs = ProjectDirs::from("com", "Nightcap", "Nightcap")
             .ok_or_else(|| anyhow!("could not find the Nightcap configuration directory"))?;
@@ -90,9 +111,14 @@ impl Settings {
     fn load_from(path: &Path) -> Self {
         let result = fs::read(path)
             .with_context(|| format!("reading {}", path.display()))
-            .and_then(|bytes| serde_json::from_slice(&bytes).context("parsing settings JSON"));
+            .and_then(|bytes| {
+                serde_json::from_slice::<Self>(&bytes).context("parsing settings JSON")
+            });
         match result {
-            Ok(settings) => settings,
+            Ok(mut settings) => {
+                settings.normalize();
+                settings
+            }
             Err(error) => {
                 log::warn!("Using default settings: {error:#}");
                 Self::default()
@@ -121,6 +147,53 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_settings_are_normalized_to_ui_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = Settings {
+            dim: FadeSettings {
+                enabled: true,
+                start_before_min: 0,
+                over_min: 0,
+                target_percent: 255,
+            },
+            volume: FadeSettings {
+                enabled: false,
+                start_before_min: u32::MAX,
+                over_min: u32::MAX,
+                target_percent: 200,
+            },
+            last_duration_min: u32::MAX,
+            ..Settings::default()
+        };
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.dim.start_before_min, BEFORE_MINUTES[0]);
+        assert_eq!(loaded.dim.over_min, OVER_MINUTES[0]);
+        assert_eq!(loaded.dim.target_percent, 100);
+        assert_eq!(loaded.volume.start_before_min, 60);
+        assert_eq!(loaded.volume.over_min, 60);
+        assert_eq!(loaded.volume.target_percent, 100);
+        assert_eq!(loaded.last_duration_min, 720);
+        let settings = Settings {
+            dim: FadeSettings {
+                start_before_min: 7,
+                over_min: 1,
+                target_percent: 0,
+                ..FadeSettings::default()
+            },
+            last_duration_min: 0,
+            ..Settings::default()
+        };
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.last_duration_min, MIN_DURATION_MIN);
+        assert_eq!(loaded.dim.start_before_min, 7);
+        assert_eq!(loaded.dim.over_min, 1);
+        assert_eq!(loaded.dim.target_percent, 0);
+    }
 
     #[test]
     fn defaults_match_timer_preferences() {

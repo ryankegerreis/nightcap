@@ -1,7 +1,7 @@
 //! Native Windows controls. COM interfaces live only inside individual calls,
 //! so constructing a backend on the UI thread and moving it to the engine is safe.
 
-use std::ptr;
+use std::{collections::BTreeMap, ptr};
 
 use anyhow::{Context, Result, ensure};
 use windows::{
@@ -215,27 +215,38 @@ fn wmi_query(services: &IWbemServices, query: &str) -> Result<Vec<IWbemClassObje
     }
 }
 
-fn wmi_levels() -> Result<Vec<f32>> {
+fn wmi_levels() -> Result<BTreeMap<String, f32>> {
     let _apartment = ComApartment::enter()?;
     let services = wmi_services()?;
     let monitors = wmi_query(
         &services,
-        "SELECT CurrentBrightness FROM WmiMonitorBrightness WHERE Active = TRUE",
+        "SELECT InstanceName, CurrentBrightness FROM WmiMonitorBrightness WHERE Active = TRUE",
     )?;
-    let mut levels = Vec::new();
+    let mut levels = BTreeMap::new();
     for monitor in monitors {
         let value = property(&monitor, w!("CurrentBrightness"))?;
         // SAFETY: VARIANT came from WMI and remains owned until conversion returns.
         let percent = unsafe { VariantToUInt32(&value.0) }.context("converting WMI brightness")?;
         ensure!(percent <= 100, "WMI returned brightness above 100%");
-        levels.push(percent as f32 / 100.0);
+        levels.insert(wmi_instance_name(&monitor)?, percent as f32 / 100.0);
     }
     ensure!(!levels.is_empty(), "no active WMI brightness panels");
     Ok(levels)
 }
 
-fn wmi_set(level: f32) -> Result<()> {
-    let percent = (normalized(level)? * 100.0).round() as u8;
+fn wmi_instance_name(monitor: &IWbemClassObject) -> Result<String> {
+    let value = property(monitor, w!("InstanceName"))?;
+    let mut text = [0u16; 4096];
+    // SAFETY: value is an owned WMI VARIANT and the output buffer is valid.
+    unsafe { VariantToString(&value.0, &mut text) }.context("reading WMI instance name")?;
+    let end = text
+        .iter()
+        .position(|&c| c == 0)
+        .context("unterminated WMI instance name")?;
+    String::from_utf16(&text[..end]).context("decoding WMI instance name")
+}
+
+fn wmi_set(baselines: &BTreeMap<String, f32>, reference: f32, level: f32) -> Result<()> {
     let _apartment = ComApartment::enter()?;
     let services = wmi_services()?;
     let monitors = wmi_query(
@@ -269,6 +280,11 @@ fn wmi_set(level: f32) -> Result<()> {
     }
     let signature = signature.context("missing WmiSetBrightness input signature")?;
     for monitor in monitors {
+        let name = wmi_instance_name(&monitor)?;
+        let Some(baseline) = baselines.get(&name) else {
+            continue;
+        };
+        let percent = (super::scaled_brightness(*baseline, reference, level) * 100.0).round() as u8;
         let path = property(&monitor, w!("__PATH"))?;
         let mut path_text = [0u16; 4096];
         // SAFETY: buffer sizes and interface lifetimes are valid within this apartment.
@@ -322,6 +338,10 @@ fn wmi_set(level: f32) -> Result<()> {
 }
 
 struct PhysicalMonitors(Vec<PHYSICAL_MONITOR>);
+
+// SAFETY: dxva2 monitor handles are not COM/AppKit objects and have no thread
+// affinity. Ownership stays exclusive; Drop destroys them once on the worker.
+unsafe impl Send for PhysicalMonitors {}
 
 impl Drop for PhysicalMonitors {
     fn drop(&mut self) {
@@ -393,63 +413,89 @@ fn ddc_range(monitor: &PHYSICAL_MONITOR) -> Result<(u32, u32, u32)> {
     Ok((min, current, max))
 }
 
-fn ddc_levels() -> Result<Vec<f32>> {
-    let monitors = physical_monitors()?;
-    let levels: Vec<_> = monitors
-        .0
-        .iter()
-        .filter_map(|monitor| ddc_range(monitor).ok())
-        .map(|(min, current, max)| (current - min) as f32 / (max - min) as f32)
-        .collect();
-    ensure!(!levels.is_empty(), "no monitors support DDC/CI brightness");
-    Ok(levels)
+struct DdcBaselines {
+    monitors: PhysicalMonitors,
+    // Index into the retained handle array, baseline, native min/max.
+    levels: Vec<(usize, f32, u32, u32)>,
 }
 
-fn ddc_set(level: f32) -> Result<()> {
-    let level = normalized(level)?;
-    let monitors = physical_monitors()?;
-    let mut count = 0;
-    for monitor in &monitors.0 {
-        // Unsupported external monitors are skipped; supported ones are all updated.
-        if let Ok((min, _, max)) = ddc_range(monitor) {
-            let value = (f64::from(min) + f64::from(level) * f64::from(max - min)).round() as u32;
-            // SAFETY: live handle and value within the queried monitor range.
+impl DdcBaselines {
+    fn capture() -> Result<Self> {
+        let monitors = physical_monitors()?;
+        let levels: Vec<_> = monitors
+            .0
+            .iter()
+            .enumerate()
+            .filter_map(|(index, monitor)| {
+                ddc_range(monitor).ok().map(|(min, current, max)| {
+                    (index, (current - min) as f32 / (max - min) as f32, min, max)
+                })
+            })
+            .collect();
+        ensure!(!levels.is_empty(), "no monitors support DDC/CI brightness");
+        Ok(Self { monitors, levels })
+    }
+
+    fn set(&self, reference: f32, level: f32) -> Result<()> {
+        for &(index, baseline, min, max) in &self.levels {
+            let scaled = super::scaled_brightness(baseline, reference, level);
+            let value = (f64::from(min) + f64::from(scaled) * f64::from(max - min)).round() as u32;
+            // SAFETY: retained live handle and value within its captured native range.
             ensure!(
-                unsafe { SetMonitorBrightness(monitor.hPhysicalMonitor, value) } != 0,
+                unsafe { SetMonitorBrightness(self.monitors.0[index].hPhysicalMonitor, value) }
+                    != 0,
                 "setting DDC/CI brightness: {}",
                 windows::core::Error::from_thread()
             );
-            count += 1;
         }
+        Ok(())
     }
-    ensure!(count > 0, "no monitors support DDC/CI brightness");
-    Ok(())
 }
 
 struct WindowsBrightness {
     wmi: bool,
     ddc: bool,
+    wmi_baselines: BTreeMap<String, f32>,
+    ddc_baselines: Option<DdcBaselines>,
+    reference: f32,
 }
 
 impl Brightness for WindowsBrightness {
     fn get(&mut self) -> Result<f32> {
-        let mut levels = Vec::new();
-        if self.wmi {
-            levels.extend(wmi_levels()?);
-        }
-        if self.ddc {
-            levels.extend(ddc_levels()?);
-        }
+        let wmi = if self.wmi {
+            wmi_levels()?
+        } else {
+            BTreeMap::new()
+        };
+        let ddc = if self.ddc {
+            Some(DdcBaselines::capture()?)
+        } else {
+            None
+        };
+        let levels: Vec<_> = wmi
+            .values()
+            .copied()
+            .chain(
+                ddc.iter()
+                    .flat_map(|d| d.levels.iter().map(|&(_, level, _, _)| level)),
+            )
+            .collect();
         ensure!(!levels.is_empty(), "no supported brightness monitors");
-        Ok(levels.iter().sum::<f32>() / levels.len() as f32)
+        self.reference = levels.into_iter().fold(0.0, f32::max);
+        self.wmi_baselines = wmi;
+        self.ddc_baselines = ddc;
+        Ok(self.reference)
     }
 
     fn set(&mut self, level: f32) -> Result<()> {
-        if self.wmi {
-            wmi_set(level)?;
-        }
-        if self.ddc {
-            ddc_set(level)?;
+        let level = normalized(level)?;
+        if self.reference > 0.0 {
+            if self.wmi {
+                wmi_set(&self.wmi_baselines, self.reference, level)?;
+            }
+            if let Some(ddc) = &self.ddc_baselines {
+                ddc.set(self.reference, level)?;
+            }
         }
         Ok(())
     }
@@ -549,7 +595,10 @@ impl Power for WindowsPower {
 pub fn backends() -> Backends {
     let mut brightness = WindowsBrightness {
         wmi: wmi_levels().is_ok(),
-        ddc: ddc_levels().is_ok(),
+        ddc: DdcBaselines::capture().is_ok(),
+        wmi_baselines: BTreeMap::new(),
+        ddc_baselines: None,
+        reference: 0.0,
     };
     let brightness = brightness
         .get()

@@ -93,9 +93,10 @@ placement depends on the window manager; Wayland can select a different output.
 The overlay covers one monitor, is always on top, and lets mouse input pass
 through. It is a visual fade rather than hardware brightness control. With
 restoration disabled, Cancel leaves faded levels in place until changed manually;
-the overlay disappears when the app exits. Restoration after sleep is based on a
-wall-clock gap over 30 seconds. Real power actions and Windows/Linux desktop
-behavior require testing on the corresponding systems.
+the overlay disappears when the app exits. Restoration after sleep uses native
+macOS wake notifications and a wall-clock gap of more than 5 seconds after the
+end action (30 seconds while the timer is running or paused). Real power actions
+and Windows/Linux desktop behavior require testing on the corresponding systems.
 
 ## License
 

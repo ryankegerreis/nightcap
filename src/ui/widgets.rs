@@ -11,7 +11,6 @@ const RING_STROKE: f32 = 6.0;
 const TOGGLE_W: f32 = 32.0;
 const TOGGLE_H: f32 = 19.0;
 const ANIM_FAST: f32 = 0.15;
-const ANIM_RING: f32 = 0.25;
 
 pub enum RoundRole {
     Neutral,
@@ -162,11 +161,11 @@ pub fn toggle(ui: &mut Ui, id: Id, on: bool) -> Response {
     response
 }
 
-pub fn paint_progress_ring(ui: &Ui, id: Id, rect: Rect, progress: f32) {
+pub fn paint_progress_ring(ui: &Ui, _id: Id, rect: Rect, progress: f32) {
     let tokens = theme::tokens(ui.ctx());
-    let shown = ui
-        .ctx()
-        .animate_value_with_time(id, progress.clamp(0.0, 1.0), ANIM_RING);
+    // Timer progress changes every tick. Animating each change would repaint at
+    // display refresh rate throughout the countdown instead of four times/sec.
+    let shown = progress.clamp(0.0, 1.0);
     let center = rect.center();
     let radius = rect.width().min(rect.height()) * 0.5 - RING_STROKE * 0.5 - 1.0;
     let painter = ui.painter();
@@ -461,6 +460,25 @@ fn popup_frame(tokens: &ThemeTokens) -> egui::Frame {
         })
 }
 
+/// Commit the text before an action drawn earlier in the frame consumes the value.
+pub fn commit_stepper(
+    ctx: &egui::Context,
+    id: Id,
+    value: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+) -> bool {
+    let text_id = id.with("text");
+    let text = ctx.data(|data| data.get_temp::<String>(text_id));
+    let next = text
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .unwrap_or(*value)
+        .clamp(*range.start(), *range.end());
+    let changed = *value != next;
+    *value = next;
+    ctx.data_mut(|data| data.insert_temp(text_id, value.to_string()));
+    changed
+}
+
 /// Minutes field with stepper buttons. Commits typed text when focus leaves.
 pub fn stepper(ui: &mut Ui, id: Id, value: &mut u32, range: std::ops::RangeInclusive<u32>) -> bool {
     let tokens = theme::tokens(ui.ctx());
@@ -475,7 +493,6 @@ pub fn stepper(ui: &mut Ui, id: Id, value: &mut u32, range: std::ops::RangeInclu
             let text_id = id.with("text");
             let mut text = ui
                 .data(|data| data.get_temp::<String>(text_id))
-                .filter(|_| ui.memory(|memory| memory.has_focus(text_id)))
                 .unwrap_or_else(|| value.to_string());
             let response = TextEdit::singleline(&mut text)
                 .id(text_id)
@@ -486,8 +503,10 @@ pub fn stepper(ui: &mut Ui, id: Id, value: &mut u32, range: std::ops::RangeInclu
                 .char_limit(3)
                 .show(ui)
                 .response;
-            if response.lost_focus() {
-                let parsed = text.parse::<u32>().unwrap_or(*value);
+            if response.lost_focus()
+                || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            {
+                let parsed = text.trim().parse::<u32>().unwrap_or(*value);
                 let next = parsed.clamp(*range.start(), *range.end());
                 if next != *value {
                     *value = next;
@@ -495,14 +514,19 @@ pub fn stepper(ui: &mut Ui, id: Id, value: &mut u32, range: std::ops::RangeInclu
                 }
                 text = value.to_string();
             }
+            if !response.has_focus() {
+                text = value.to_string();
+            }
             ui.data_mut(|data| data.insert_temp(text_id, text));
             caption(ui, "min");
             let (up, down) = step_pair(ui, id.with("steps"));
             if up {
                 *value = value.saturating_add(1).min(*range.end());
+                ui.data_mut(|data| data.insert_temp(text_id, value.to_string()));
                 changed = true;
             } else if down {
                 *value = value.saturating_sub(1).max(*range.start());
+                ui.data_mut(|data| data.insert_temp(text_id, value.to_string()));
                 changed = true;
             }
         },

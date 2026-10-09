@@ -1,7 +1,7 @@
 //! Nightcap: a sleep timer that dims the screen and lowers the volume
 //! before putting the computer to sleep.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use eframe::egui;
 use nightcap::{
@@ -59,7 +59,14 @@ fn main() -> eframe::Result {
                 settings.clone(),
                 backends,
                 clock,
-                Box::new(move || context.request_repaint_of(egui::ViewportId::ROOT)),
+                // A nonzero delay avoids egui's extra immediate-repaint pass.
+                // Hidden roots run App::logic only, refreshing tray/overlay at engine cadence.
+                Box::new(move || {
+                    context.request_repaint_after_for(
+                        Duration::from_millis(16),
+                        egui::ViewportId::ROOT,
+                    )
+                }),
             )?;
             let context = cc.egui_ctx.clone();
             let tray = Tray::new(

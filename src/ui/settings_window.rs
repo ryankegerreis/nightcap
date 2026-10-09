@@ -2,13 +2,10 @@
 
 use eframe::egui::{self, Id, Margin, Vec2};
 
-use crate::settings::{EndAction, FadeSettings, Settings};
+use crate::settings::{BEFORE_MINUTES, EndAction, FadeSettings, OVER_MINUTES, Settings};
 
 use super::main_window::end_action_label;
 use super::widgets::{self, Choice, MeterKind};
-
-const BEFORE_MINUTES: [u32; 7] = [5, 10, 15, 20, 30, 45, 60];
-const OVER_MINUTES: [u32; 8] = [1, 5, 10, 15, 20, 30, 45, 60];
 
 pub fn show(
     ctx: &egui::Context,

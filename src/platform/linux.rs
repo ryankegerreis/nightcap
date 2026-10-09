@@ -200,7 +200,11 @@ impl Backlight {
     }
 }
 
-struct LinuxBrightness(Vec<Backlight>);
+struct LinuxBrightness {
+    devices: Vec<Backlight>,
+    baselines: Vec<f32>,
+    reference: f32,
+}
 
 impl LinuxBrightness {
     fn discover() -> Result<Self> {
@@ -254,24 +258,37 @@ impl LinuxBrightness {
             !devices.is_empty(),
             "no usable backlight control (sysfs/logind/brightnessctl)"
         );
-        Ok(Self(devices))
+        Ok(Self {
+            devices,
+            baselines: Vec::new(),
+            reference: 0.0,
+        })
     }
 }
 
 impl Brightness for LinuxBrightness {
     fn get(&mut self) -> Result<f32> {
-        ensure!(!self.0.is_empty(), "no backlights");
-        let total = self
-            .0
+        ensure!(!self.devices.is_empty(), "no backlights");
+        let baselines = self
+            .devices
             .iter()
             .map(Backlight::get)
             .collect::<Result<Vec<_>>>()?;
-        Ok(total.iter().sum::<f32>() / total.len() as f32)
+        self.reference = baselines.iter().copied().fold(0.0, f32::max);
+        self.baselines = baselines;
+        Ok(self.reference)
     }
 
     fn set(&mut self, level: f32) -> Result<()> {
-        for device in &self.0 {
-            device.set(level)?;
+        ensure!(level.is_finite(), "non-finite brightness");
+        ensure!(
+            self.baselines.len() == self.devices.len(),
+            "brightness must be read before setting"
+        );
+        if self.reference > 0.0 {
+            for (device, baseline) in self.devices.iter().zip(&self.baselines) {
+                device.set(super::scaled_brightness(*baseline, self.reference, level))?;
+            }
         }
         Ok(())
     }
@@ -348,6 +365,48 @@ pub fn backends() -> Backends {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backlight_baselines_refresh_only_on_get_and_restore_each_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut devices = Vec::new();
+        for (name, level) in [("dim", 20), ("bright", 80)] {
+            let path = dir.path().join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("brightness"), level.to_string()).unwrap();
+            fs::write(path.join("max_brightness"), "100").unwrap();
+            devices.push(Backlight {
+                path,
+                name: name.into(),
+                writer: BacklightWriter::Sysfs,
+            });
+        }
+        let mut backend = LinuxBrightness {
+            devices,
+            baselines: Vec::new(),
+            reference: 0.0,
+        };
+        assert_eq!(backend.get().unwrap(), 0.8);
+        backend.set(0.4).unwrap();
+        assert_eq!(backend.devices[0].get().unwrap(), 0.1);
+        assert_eq!(backend.devices[1].get().unwrap(), 0.4);
+        backend.set(0.8).unwrap();
+        assert_eq!(backend.devices[0].get().unwrap(), 0.2);
+        assert_eq!(backend.devices[1].get().unwrap(), 0.8);
+        backend.set(0.4).unwrap();
+        assert_eq!(backend.get().unwrap(), 0.4);
+        backend.set(0.2).unwrap();
+        assert_eq!(backend.devices[0].get().unwrap(), 0.05);
+        assert_eq!(backend.devices[1].get().unwrap(), 0.2);
+        backend
+            .devices
+            .iter()
+            .for_each(|device| device.set(0.0).unwrap());
+        assert_eq!(backend.get().unwrap(), 0.0);
+        backend.set(0.8).unwrap();
+        assert_eq!(backend.devices[0].get().unwrap(), 0.0);
+        assert_eq!(backend.devices[1].get().unwrap(), 0.0);
+    }
 
     #[test]
     fn pipewire_levels_preserve_muted_scalar_and_clamp_amplification() {

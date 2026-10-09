@@ -49,7 +49,7 @@ src/
 window is hidden and egui is not repainting. It owns the platform backends.
 
 - Commands (via `std::sync::mpsc`): `Start { duration }`, `Pause`, `Resume`, `Cancel`,
-  `AddMinutes(u32)`, `UpdateSettings(Settings)`, `Shutdown`.
+  `AddMinutes(u32)`, `UpdateSettings(Settings)`, `SystemWoke`, `Shutdown`.
 - Shared snapshot (`Arc<Mutex<Snapshot>>`): `state: Idle | Running | Paused | Finishing`,
   `total`, `remaining`, `ends_at` (wall clock, for "10:20 PM"), current brightness /
   volume percent applied, `overlay_alpha: f32` (0 = no overlay), backend capability flags
@@ -57,7 +57,7 @@ window is hidden and egui is not repainting. It owns the platform backends.
 - Ticks about every 250 ms. Uses `Instant` for remaining time; captures original
   brightness/volume when a fade begins and restores them on Cancel (if the restore
   setting is on), and after the end action when the machine wakes (detect a wall-clock
-  jump larger than ~30 s between ticks).
+  gap over 5 s while Finishing (30 s while Running/Paused), plus native macOS workspace wake notifications).
 - If hardware brightness is unsupported, the dim fade drives `overlay_alpha` instead
   (max alpha 0.9 at target 0 %, mapped linearly).
 - Calls a `repaint: Box<dyn Fn() + Send>` hook after each snapshot change so the UI and

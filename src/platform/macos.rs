@@ -534,6 +534,45 @@ pub fn backends() -> Backends {
     }
 }
 
+/// Owns the workspace block observer and unregisters it before releasing its token.
+/// The callback only queues a command; hardware restoration stays on the engine.
+pub struct WakeObserver {
+    center: objc2::rc::Retained<objc2_foundation::NSNotificationCenter>,
+    token:
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>,
+}
+
+impl WakeObserver {
+    pub fn new(engine: crate::engine::EngineHandle) -> Self {
+        use block2::RcBlock;
+        use objc2_app_kit::{NSWorkspace, NSWorkspaceDidWakeNotification};
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        let block = RcBlock::new(move |_| {
+            let _ = engine.send(crate::engine::Command::SystemWoke);
+        });
+        // SAFETY: no object filter or operation queue, and the captured engine
+        // handle is Send + Sync. NotificationCenter copies and retains the block.
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSWorkspaceDidWakeNotification),
+                None,
+                None,
+                &block,
+            )
+        };
+        Self { center, token }
+    }
+}
+
+impl Drop for WakeObserver {
+    fn drop(&mut self) {
+        // SAFETY: this exact live token came from this center's block registration.
+        unsafe {
+            self.center.removeObserver(self.token.as_ref());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

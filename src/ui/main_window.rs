@@ -13,8 +13,7 @@ use super::theme;
 use super::widgets::{self, Choice, RoundRole};
 
 pub const PRESETS: [u32; 5] = [15, 30, 45, 60, 90];
-pub const MIN_MINUTES: u32 = 1;
-pub const MAX_MINUTES: u32 = 720;
+pub use crate::settings::{MAX_DURATION_MIN as MAX_MINUTES, MIN_DURATION_MIN as MIN_MINUTES};
 
 const RING_SIZE: f32 = 204.0;
 const RING_WRAP: f32 = 236.0;
@@ -50,6 +49,7 @@ pub fn show(ui: &mut egui::Ui, view: MainView<'_>) -> MainOutcome {
         notice: None,
     };
     let idle = snapshot.state == TimerState::Idle;
+    let mut start_requested = false;
 
     if widgets::main_header(ui).clicked() {
         outcome.open_settings = true;
@@ -68,7 +68,8 @@ pub fn show(ui: &mut egui::Ui, view: MainView<'_>) -> MainOutcome {
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::ZERO;
                     ui.set_min_width(ui.available_width());
-                    timer_block(ui, snapshot, settings, *duration_min, notice, &mut outcome);
+                    start_requested =
+                        timer_block(ui, snapshot, settings, *duration_min, notice, &mut outcome);
                     ui.add_space(16.0);
                     duration_control(ui, duration_min, custom, idle);
                     ui.add_space(16.0);
@@ -85,6 +86,19 @@ pub fn show(ui: &mut egui::Ui, view: MainView<'_>) -> MainOutcome {
                 });
         });
 
+    if start_requested {
+        if *custom {
+            widgets::commit_stepper(
+                ui.ctx(),
+                Id::new("nightcap-custom-minutes"),
+                duration_min,
+                MIN_MINUTES..=MAX_MINUTES,
+            );
+        }
+        outcome.command = Some(Command::Start {
+            duration: Duration::from_secs(u64::from(*duration_min) * 60),
+        });
+    }
     outcome
 }
 
@@ -95,7 +109,7 @@ fn timer_block(
     duration_min: u32,
     notice: Option<&str>,
     outcome: &mut MainOutcome,
-) {
+) -> bool {
     let width = ui.available_width();
     let (wrap, _) = ui.allocate_exact_size(vec2(width, RING_WRAP), Sense::hover());
     let ring = Rect::from_center_size(
@@ -172,14 +186,14 @@ fn timer_block(
     )
     .clicked()
     {
-        outcome.command = Some(match snapshot.state {
-            TimerState::Running => Command::Pause,
-            TimerState::Paused => Command::Resume,
-            _ => Command::Start {
-                duration: Duration::from_secs(u64::from(duration_min) * 60),
-            },
-        });
+        match snapshot.state {
+            TimerState::Running => outcome.command = Some(Command::Pause),
+            TimerState::Paused => outcome.command = Some(Command::Resume),
+            TimerState::Idle => return true,
+            TimerState::Finishing => {}
+        }
     }
+    false
 }
 
 fn duration_control(ui: &mut egui::Ui, duration_min: &mut u32, custom: &mut bool, idle: bool) {
@@ -461,6 +475,132 @@ fn end_action_choices() -> [Choice<'static, EndAction>; 3] {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>, duration: &mut u32) -> MainOutcome {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.families.insert(
+            egui::FontFamily::Name("countdown".into()),
+            fonts.families[&egui::FontFamily::Proportional].clone(),
+        );
+        ctx.set_fonts(fonts);
+        let mut outcome = None;
+        let mut settings = Settings::default();
+        let mut custom = true;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(340.0, 620.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                theme::install(ui.ctx());
+                outcome = Some(show(
+                    ui,
+                    MainView {
+                        snapshot: &Snapshot::default(),
+                        settings: &mut settings,
+                        duration_min: duration,
+                        custom: &mut custom,
+                        notice: None,
+                    },
+                ));
+            },
+        );
+        output.textures_delta.clear();
+        drop(output);
+        outcome.unwrap()
+    }
+
+    #[test]
+    fn clicking_start_commits_custom_text_in_the_same_frame() {
+        for (text, expected) in [("15", 15), ("0", 1), ("999", 720), ("bad", 2)] {
+            let ctx = egui::Context::default();
+            let mut duration = 2;
+            frame(&ctx, vec![], &mut duration);
+            let id = Id::new("nightcap-custom-minutes").with("text");
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            ctx.data_mut(|data| data.insert_temp(id, text.to_owned()));
+            let pos = ctx
+                .read_response(Id::new("nightcap-primary"))
+                .unwrap()
+                .rect
+                .center();
+            let press = egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(
+                &ctx,
+                vec![egui::Event::PointerMoved(pos), press],
+                &mut duration,
+            );
+            let release = egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let outcome = frame(&ctx, vec![release], &mut duration);
+            assert!(
+                matches!(outcome.command, Some(Command::Start { duration }) if duration == Duration::from_secs(expected * 60)),
+                "text={text}"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_commits_custom_text() {
+        for (text, expected) in [("15", 15), ("0", 1), ("999", 720), ("bad", 2)] {
+            let ctx = egui::Context::default();
+            let mut duration = 2;
+            frame(&ctx, vec![], &mut duration);
+            let id = Id::new("nightcap-custom-minutes").with("text");
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            ctx.data_mut(|data| data.insert_temp(id, text.to_owned()));
+            frame(
+                &ctx,
+                vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut duration,
+            );
+            assert_eq!(duration, expected, "text={text}");
+        }
+    }
+
+    #[test]
+    fn idle_and_changing_progress_settle_without_animation_repaints() {
+        let ctx = egui::Context::default();
+        let mut output = None;
+        for i in 0..10 {
+            let mut next = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(i as f64),
+                    ..Default::default()
+                },
+                |ui| {
+                    widgets::paint_progress_ring(
+                        ui,
+                        Id::new("ring"),
+                        Rect::from_min_size(Pos2::ZERO, Vec2::splat(200.0)),
+                        1.0 - i as f32 / 100.0,
+                    );
+                },
+            );
+            next.textures_delta.clear();
+            output = Some(next);
+        }
+        assert_eq!(
+            output.unwrap().viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+            Duration::MAX
+        );
+    }
 
     #[test]
     fn timer_text_uses_minutes_until_an_hour() {
