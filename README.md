@@ -47,6 +47,18 @@ cargo fmt --check
 
 On Linux, egui needs a few system libraries. See the [eframe documentation](https://github.com/emilk/egui/tree/main/crates/eframe) for the list.
 
+### Installing on macOS
+
+```sh
+scripts/bundle-macos.sh            # builds target/release/bundle/Nightcap.app
+scripts/bundle-macos.sh --install  # also copies it to /Applications
+```
+
+The bundle is signed ad hoc for local use. Run Nightcap from the bundle rather
+than `cargo run` when you want it to appear as itself: macOS lists a bare binary
+under the app that launched it (your terminal or editor). The icon source is
+`assets/AppIcon.png`, drawn by `scripts/make-icon.swift`.
+
 ## Safe preview and accelerated time
 
 ```sh

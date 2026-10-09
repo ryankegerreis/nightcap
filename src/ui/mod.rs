@@ -348,7 +348,12 @@ fn close_edge(requested: bool, handled: &mut bool) -> bool {
 
 /// Keep native decorations on Windows/Linux; macOS paints its unified header.
 pub fn window_builder(title: &str) -> egui::ViewportBuilder {
-    let icon = app_icon();
+    // An empty icon tells eframe to leave the bundle's own icon alone.
+    let icon = if in_app_bundle() {
+        egui::IconData::default()
+    } else {
+        app_icon()
+    };
     let builder = egui::ViewportBuilder::default()
         .with_title(title)
         .with_icon(icon);
@@ -378,6 +383,12 @@ fn set_activation_policy(visible: bool) {
     let _ = visible;
 }
 
+fn in_app_bundle() -> bool {
+    cfg!(target_os = "macos")
+        && std::env::current_exe()
+            .is_ok_and(|path| path.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
 fn app_icon() -> egui::IconData {
     let mut rgba = crate::tray::moon_rgba(128);
     for pixel in rgba.chunks_exact_mut(4) {
@@ -391,9 +402,12 @@ fn app_icon() -> egui::IconData {
 }
 
 /// macOS ignores winit's window icon; use the same crescent for the Dock.
+/// A bundled Nightcap.app keeps the icon from its bundle instead.
 pub fn install_app_icon() {
     #[cfg(target_os = "macos")]
-    if let Some(mtm) = objc2::MainThreadMarker::new() {
+    if let Some(mtm) = objc2::MainThreadMarker::new()
+        && !in_app_bundle()
+    {
         use image::ImageEncoder as _;
         use objc2::AnyThread;
         use objc2_app_kit::{NSApplication, NSImage};
