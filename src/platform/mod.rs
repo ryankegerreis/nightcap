@@ -5,7 +5,8 @@ use anyhow::Result;
 use crate::settings::EndAction;
 
 pub mod fallback;
-#[cfg(target_os = "linux")]
+// Linux's command parsers and sysfs math are portable and tested on every host.
+#[cfg(any(target_os = "linux", test))]
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
