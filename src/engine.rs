@@ -1,0 +1,910 @@
+//! Clock-driven timer state machine and its independent worker thread.
+
+use std::{
+    io,
+    sync::{Arc, Mutex, mpsc},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime},
+};
+
+use crate::{fade::FadePlan, platform::Backends, settings::Settings};
+
+const TICK_INTERVAL: Duration = Duration::from_millis(250);
+const WAKE_THRESHOLD: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClockReading {
+    pub monotonic: Duration,
+    pub wall: SystemTime,
+}
+
+pub trait Clock: Send {
+    fn now(&self) -> ClockReading;
+}
+
+pub struct SystemClock {
+    origin: Instant,
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Clock for SystemClock {
+    fn now(&self) -> ClockReading {
+        ClockReading {
+            monotonic: self.origin.elapsed(),
+            wall: SystemTime::now(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimerState {
+    #[default]
+    Idle,
+    Running,
+    Paused,
+    Finishing,
+}
+
+#[derive(Clone, Debug)]
+pub enum Command {
+    Start { duration: Duration },
+    Pause,
+    Resume,
+    Cancel,
+    AddMinutes(u32),
+    UpdateSettings(Settings),
+    Shutdown,
+}
+
+/// Percent fields use `0.0..=100.0`; `None` means no level has been applied yet.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Snapshot {
+    pub state: TimerState,
+    pub total: Duration,
+    pub remaining: Duration,
+    pub ends_at: Option<chrono::DateTime<chrono::Local>>,
+    pub brightness_percent: Option<f32>,
+    pub volume_percent: Option<f32>,
+    pub overlay_alpha: f32,
+    pub brightness_supported: bool,
+    pub volume_supported: bool,
+    pub last_error: Option<String>,
+}
+
+/// Cloning retains the worker; dropping the last handle shuts it down and joins it.
+#[derive(Clone)]
+pub struct EngineHandle {
+    inner: Arc<HandleInner>,
+}
+
+struct HandleInner {
+    sender: mpsc::Sender<Command>,
+    snapshot: Arc<Mutex<Snapshot>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl EngineHandle {
+    pub fn send(&self, command: Command) -> Result<(), mpsc::SendError<Command>> {
+        self.inner.sender.send(command)
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+impl Drop for HandleInner {
+    fn drop(&mut self) {
+        let _ = self.sender.send(Command::Shutdown);
+        if let Some(worker) = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Default)]
+struct FadeTrack {
+    original: Option<f32>,
+    from: Option<f32>,
+    last: Option<f32>,
+    overlay: bool,
+    unavailable: bool,
+}
+
+impl FadeTrack {
+    fn level(&self, plan: FadePlan, elapsed: Duration, target: u8) -> f32 {
+        let from = self.from.unwrap_or(1.0);
+        plan.level_at(elapsed, from, f32::from(target) / 100.0)
+            .min(self.last.unwrap_or(from))
+    }
+}
+
+pub struct Engine<C: Clock = SystemClock> {
+    clock: C,
+    backends: Backends,
+    settings: Settings,
+    snapshot: Snapshot,
+    shared: Arc<Mutex<Snapshot>>,
+    repaint: Box<dyn Fn() + Send>,
+    last_time: ClockReading,
+    brightness: FadeTrack,
+    volume: FadeTrack,
+}
+
+impl Engine<SystemClock> {
+    pub fn spawn(
+        settings: Settings,
+        backends: Backends,
+        repaint: Box<dyn Fn() + Send>,
+    ) -> io::Result<EngineHandle> {
+        let mut engine = Self::new(settings, backends, SystemClock::default());
+        engine.repaint = repaint;
+        let snapshot = Arc::clone(&engine.shared);
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("nightcap-timer".into())
+            .spawn(move || {
+                loop {
+                    match receiver.recv_timeout(TICK_INTERVAL) {
+                        Ok(command) => {
+                            if !engine.command(command) {
+                                break;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => engine.tick(),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            engine.command(Command::Shutdown);
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(EngineHandle {
+            inner: Arc::new(HandleInner {
+                sender,
+                snapshot,
+                worker: Mutex::new(Some(worker)),
+            }),
+        })
+    }
+}
+
+impl<C: Clock> Engine<C> {
+    pub fn new(settings: Settings, backends: Backends, clock: C) -> Self {
+        let snapshot = Snapshot {
+            brightness_supported: backends.brightness.is_some(),
+            volume_supported: backends.volume.is_some(),
+            ..Snapshot::default()
+        };
+        let last_time = clock.now();
+        Self {
+            clock,
+            backends,
+            settings,
+            shared: Arc::new(Mutex::new(snapshot.clone())),
+            snapshot,
+            repaint: Box::new(|| {}),
+            last_time,
+            brightness: FadeTrack::default(),
+            volume: FadeTrack::default(),
+        }
+    }
+
+    /// Applies a command immediately; returns false when the worker should stop.
+    pub fn command(&mut self, command: Command) -> bool {
+        self.advance_time();
+        match command {
+            Command::Start { duration } => {
+                self.cancel();
+                self.snapshot.state = TimerState::Running;
+                self.snapshot.total = duration;
+                self.snapshot.remaining = duration;
+                self.snapshot.last_error = None;
+                self.snapshot.brightness_supported = self.backends.brightness.is_some();
+                self.snapshot.volume_supported = self.backends.volume.is_some();
+            }
+            Command::Pause
+                if self.snapshot.state == TimerState::Running
+                    && !self.snapshot.remaining.is_zero() =>
+            {
+                self.apply_fades();
+                self.snapshot.state = TimerState::Paused;
+            }
+            Command::Resume if self.snapshot.state == TimerState::Paused => {
+                self.snapshot.state = TimerState::Running;
+            }
+            Command::Cancel => self.cancel(),
+            Command::AddMinutes(minutes)
+                if matches!(
+                    self.snapshot.state,
+                    TimerState::Running | TimerState::Paused
+                ) =>
+            {
+                let extra = Duration::from_secs(u64::from(minutes) * 60);
+                self.snapshot.total = self.snapshot.total.saturating_add(extra);
+                self.snapshot.remaining = self.snapshot.remaining.saturating_add(extra);
+            }
+            // Retain captured originals, and never raise an already faded level.
+            Command::UpdateSettings(settings) => self.settings = settings,
+            Command::Shutdown => {
+                self.cancel();
+                self.publish();
+                return false;
+            }
+            _ => {}
+        }
+        self.evaluate();
+        true
+    }
+
+    pub fn tick(&mut self) {
+        self.advance_time();
+        self.evaluate();
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot.clone()
+    }
+
+    fn advance_time(&mut self) {
+        let now = self.clock.now();
+        let elapsed = now.monotonic.saturating_sub(self.last_time.monotonic);
+        let wall_gap = now
+            .wall
+            .duration_since(self.last_time.wall)
+            .unwrap_or_default();
+        self.last_time = now;
+        if self.snapshot.state != TimerState::Idle && wall_gap > WAKE_THRESHOLD {
+            // Suspend may stop the monotonic clock on some operating systems.
+            self.cancel();
+        } else if self.snapshot.state == TimerState::Running {
+            self.snapshot.remaining = self.snapshot.remaining.saturating_sub(elapsed);
+        }
+    }
+
+    fn evaluate(&mut self) {
+        if self.snapshot.state == TimerState::Running {
+            self.apply_fades();
+            if self.snapshot.remaining.is_zero() {
+                self.snapshot.state = TimerState::Finishing;
+                self.snapshot.ends_at = None;
+                self.publish();
+                if let Err(error) = self.backends.power.perform(self.settings.end_action) {
+                    self.report_error("performing end action", error);
+                    self.cancel();
+                }
+            }
+        }
+        self.snapshot.ends_at = if self.snapshot.state == TimerState::Running {
+            chrono::TimeDelta::from_std(self.snapshot.remaining)
+                .ok()
+                .and_then(|remaining| {
+                    chrono::DateTime::<chrono::Local>::from(self.last_time.wall)
+                        .checked_add_signed(remaining)
+                })
+        } else {
+            None
+        };
+        self.publish();
+    }
+
+    fn apply_fades(&mut self) {
+        let elapsed = self.snapshot.total.saturating_sub(self.snapshot.remaining);
+        let dim = self.settings.dim;
+        let dim_plan = FadePlan::new(self.snapshot.total, &dim);
+        if dim.enabled && elapsed >= dim_plan.start_offset {
+            self.apply_brightness(dim_plan, elapsed, dim.target_percent);
+        }
+        let volume = self.settings.volume;
+        let volume_plan = FadePlan::new(self.snapshot.total, &volume);
+        if volume.enabled && elapsed >= volume_plan.start_offset && !self.volume.unavailable {
+            self.apply_volume(volume_plan, elapsed, volume.target_percent);
+        }
+    }
+
+    fn apply_brightness(&mut self, plan: FadePlan, elapsed: Duration, target: u8) {
+        if self.brightness.from.is_none() {
+            let original = self
+                .backends
+                .brightness
+                .as_mut()
+                .map(|backend| backend.get().and_then(valid_level));
+            match original {
+                Some(Ok(level)) => {
+                    self.brightness.original = Some(level);
+                    self.brightness.from = Some(level);
+                    self.brightness.last = Some(level);
+                    self.snapshot.brightness_percent = Some(level * 100.0);
+                }
+                result => {
+                    if let Some(Err(error)) = result {
+                        self.report_error("reading brightness", error);
+                    }
+                    self.brightness.overlay = true;
+                    self.brightness.from = Some(1.0 - self.snapshot.overlay_alpha / 0.9);
+                    self.snapshot.brightness_supported = false;
+                }
+            }
+        }
+        let level = self.brightness.level(plan, elapsed, target);
+        if !self.brightness.overlay
+            && self.brightness.last != Some(level)
+            && let Some(backend) = self.backends.brightness.as_mut()
+            && let Err(error) = backend.set(level)
+        {
+            self.report_error("setting brightness", error);
+            self.snapshot.brightness_supported = false;
+            self.brightness.overlay = true;
+        }
+        if self.brightness.overlay {
+            self.snapshot.overlay_alpha = 0.9 * (1.0 - level);
+        }
+        self.brightness.last = Some(level);
+        self.snapshot.brightness_percent = Some(level * 100.0);
+    }
+
+    fn apply_volume(&mut self, plan: FadePlan, elapsed: Duration, target: u8) {
+        if self.volume.from.is_none() {
+            let original = self
+                .backends
+                .volume
+                .as_mut()
+                .map(|backend| backend.get().and_then(valid_level));
+            match original {
+                Some(Ok(level)) => {
+                    self.volume.original = Some(level);
+                    self.volume.from = Some(level);
+                    self.volume.last = Some(level);
+                    self.snapshot.volume_percent = Some(level * 100.0);
+                }
+                result => {
+                    if let Some(Err(error)) = result {
+                        self.report_error("reading volume", error);
+                    }
+                    self.volume.unavailable = true;
+                    self.snapshot.volume_supported = false;
+                    return;
+                }
+            }
+        }
+        let level = self.volume.level(plan, elapsed, target);
+        if self.volume.last != Some(level)
+            && let Some(backend) = self.backends.volume.as_mut()
+            && let Err(error) = backend.set(level)
+        {
+            self.report_error("setting volume", error);
+            self.volume.unavailable = true;
+            self.snapshot.volume_supported = false;
+            return;
+        }
+        self.volume.last = Some(level);
+        self.snapshot.volume_percent = Some(level * 100.0);
+    }
+
+    fn restore(&mut self) {
+        if let Some(level) = self.brightness.original.take()
+            && let Some(backend) = self.backends.brightness.as_mut()
+        {
+            match backend.set(level) {
+                Ok(()) => self.snapshot.brightness_percent = Some(level * 100.0),
+                Err(error) => self.report_error("restoring brightness", error),
+            }
+        }
+        if let Some(level) = self.volume.original.take()
+            && let Some(backend) = self.backends.volume.as_mut()
+        {
+            match backend.set(level) {
+                Ok(()) => self.snapshot.volume_percent = Some(level * 100.0),
+                Err(error) => self.report_error("restoring volume", error),
+            }
+        }
+        self.snapshot.overlay_alpha = 0.0;
+        if self.brightness.overlay {
+            self.snapshot.brightness_percent = None;
+        }
+    }
+
+    fn cancel(&mut self) {
+        if self.settings.restore_on_cancel_or_wake {
+            self.restore();
+        }
+        self.brightness = FadeTrack::default();
+        self.volume = FadeTrack::default();
+        self.snapshot.state = TimerState::Idle;
+        self.snapshot.total = Duration::ZERO;
+        self.snapshot.remaining = Duration::ZERO;
+        self.snapshot.ends_at = None;
+    }
+
+    fn report_error(&mut self, context: &str, error: anyhow::Error) {
+        let message = format!("{context}: {error:#}");
+        log::warn!("{message}");
+        self.snapshot.last_error = Some(message);
+    }
+
+    fn publish(&self) {
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *shared != self.snapshot {
+            *shared = self.snapshot.clone();
+            drop(shared);
+            (self.repaint)();
+        }
+    }
+}
+
+fn valid_level(level: f32) -> anyhow::Result<f32> {
+    anyhow::ensure!(level.is_finite(), "backend returned a non-finite level");
+    Ok(level.clamp(0.0, 1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        platform::fallback::{MockBrightness, MockPower, MockVolume},
+        settings::{EndAction, FadeSettings},
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct FakeClock(Arc<Mutex<ClockReading>>);
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(ClockReading {
+                monotonic: Duration::ZERO,
+                wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            })))
+        }
+
+        fn advance(&self, delta: Duration) {
+            let mut reading = self.0.lock().unwrap();
+            reading.monotonic += delta;
+            reading.wall += delta;
+        }
+
+        fn jump_wall(&self, seconds: u64) {
+            self.0.lock().unwrap().wall += Duration::from_secs(seconds);
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> ClockReading {
+            *self.0.lock().unwrap()
+        }
+    }
+
+    struct Harness {
+        engine: Engine<FakeClock>,
+        clock: FakeClock,
+        brightness: MockBrightness,
+        volume: MockVolume,
+        power: MockPower,
+    }
+
+    fn preferences() -> Settings {
+        Settings {
+            dim: FadeSettings {
+                enabled: true,
+                start_before_min: 2,
+                over_min: 1,
+                target_percent: 20,
+            },
+            volume: FadeSettings {
+                enabled: true,
+                start_before_min: 1,
+                over_min: 1,
+                target_percent: 20,
+            },
+            ..Settings::default()
+        }
+    }
+
+    impl Harness {
+        fn new(settings: Settings, brightness_supported: bool) -> Self {
+            let clock = FakeClock::new();
+            let brightness = MockBrightness::new(0.8);
+            let volume = MockVolume::new(0.6);
+            let power = MockPower::default();
+            let backends = Backends {
+                brightness: brightness_supported
+                    .then(|| Box::new(brightness.clone()) as Box<dyn crate::platform::Brightness>),
+                volume: Some(Box::new(volume.clone())),
+                power: Box::new(power.clone()),
+            };
+            let engine = Engine::new(settings, backends, clock.clone());
+            Self {
+                engine,
+                clock,
+                brightness,
+                volume,
+                power,
+            }
+        }
+
+        fn start(&mut self) {
+            self.engine.command(Command::Start {
+                duration: Duration::from_secs(180),
+            });
+        }
+
+        fn advance(&mut self, seconds: u64) {
+            let mut remaining = seconds;
+            while remaining > 0 {
+                let step = remaining.min(10);
+                self.clock.advance(Duration::from_secs(step));
+                self.engine.tick();
+                remaining -= step;
+            }
+        }
+
+        fn brightness(&self) -> f32 {
+            self.brightness.state.lock().unwrap().level
+        }
+        fn volume(&self) -> f32 {
+            self.volume.state.lock().unwrap().level
+        }
+    }
+
+    fn close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 0.0001, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn captures_at_each_fade_start_and_finishes_once() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(59);
+        assert_eq!(h.brightness.state.lock().unwrap().get_calls, 0);
+        // Capture a user change made before fading, rather than the launch-time value.
+        h.brightness.state.lock().unwrap().level = 1.0;
+        h.advance(1);
+        assert_eq!(h.brightness.state.lock().unwrap().get_calls, 1);
+        assert_eq!(h.volume.state.lock().unwrap().get_calls, 0);
+        h.advance(30);
+        close(h.brightness(), 0.6);
+        h.advance(30);
+        close(h.brightness(), 0.2);
+        assert_eq!(h.volume.state.lock().unwrap().get_calls, 1);
+        h.advance(30);
+        close(h.volume(), 0.4);
+        h.advance(30);
+        close(h.volume(), 0.2);
+        assert_eq!(h.engine.snapshot().state, TimerState::Finishing);
+        assert_eq!(h.engine.snapshot().remaining, Duration::ZERO);
+        h.advance(10);
+        assert_eq!(h.power.state.lock().unwrap().calls, vec![EndAction::Sleep]);
+    }
+
+    #[test]
+    fn cancel_restores_captured_originals_and_clears_timer() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(150);
+        h.engine.command(Command::Cancel);
+        close(h.brightness(), 0.8);
+        close(h.volume(), 0.6);
+        assert_eq!(h.engine.snapshot().state, TimerState::Idle);
+        assert_eq!(h.engine.snapshot().remaining, Duration::ZERO);
+        assert_eq!(h.engine.snapshot().ends_at, None);
+        assert!(h.power.state.lock().unwrap().calls.is_empty());
+    }
+
+    #[test]
+    fn pause_freezes_countdown_and_fades_until_resume() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(90);
+        h.engine.command(Command::Pause);
+        assert_eq!(h.engine.snapshot().ends_at, None);
+        h.advance(120);
+        assert_eq!(h.engine.snapshot().remaining, Duration::from_secs(90));
+        close(h.brightness(), 0.5);
+        assert_eq!(h.engine.snapshot().state, TimerState::Paused);
+        h.engine.command(Command::Resume);
+        assert!(h.engine.snapshot().ends_at.is_some());
+        h.advance(30);
+        assert_eq!(h.engine.snapshot().remaining, Duration::from_secs(60));
+        close(h.brightness(), 0.2);
+    }
+
+    #[test]
+    fn adding_minutes_moves_deadline_without_restarting_or_raising_fade() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(90);
+        let old_end = h.engine.snapshot().ends_at.unwrap();
+        h.engine.command(Command::AddMinutes(1));
+        assert_eq!(h.engine.snapshot().total, Duration::from_secs(240));
+        assert_eq!(h.engine.snapshot().remaining, Duration::from_secs(150));
+        assert_eq!(
+            h.engine.snapshot().ends_at.unwrap() - old_end,
+            chrono::TimeDelta::minutes(1)
+        );
+        h.advance(30);
+        close(h.brightness(), 0.5);
+        h.advance(60);
+        close(h.brightness(), 0.2);
+        h.engine.command(Command::Cancel);
+        close(h.brightness(), 0.8);
+    }
+
+    #[test]
+    fn adding_minutes_while_paused_keeps_it_paused() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(30);
+        h.engine.command(Command::Pause);
+        h.engine.command(Command::AddMinutes(2));
+        h.advance(10);
+        assert_eq!(h.engine.snapshot().state, TimerState::Paused);
+        assert_eq!(h.engine.snapshot().remaining, Duration::from_secs(270));
+        assert_eq!(h.engine.snapshot().ends_at, None);
+    }
+
+    #[test]
+    fn settings_changes_apply_without_losing_originals_or_raising_levels() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(90);
+        let mut settings = preferences();
+        settings.dim.target_percent = 0;
+        settings.end_action = EndAction::Hibernate;
+        h.engine.command(Command::UpdateSettings(settings.clone()));
+        close(h.brightness(), 0.4);
+        settings.dim.target_percent = 90;
+        h.engine.command(Command::UpdateSettings(settings));
+        close(h.brightness(), 0.4);
+        h.advance(90);
+        assert_eq!(
+            h.power.state.lock().unwrap().calls,
+            vec![EndAction::Hibernate]
+        );
+        h.engine.command(Command::Cancel);
+        close(h.brightness(), 0.8);
+    }
+
+    #[test]
+    fn missing_brightness_drives_overlay_and_cancel_removes_it() {
+        let mut h = Harness::new(preferences(), false);
+        h.start();
+        h.advance(60);
+        close(h.engine.snapshot().overlay_alpha, 0.0);
+        h.advance(30);
+        close(h.engine.snapshot().overlay_alpha, 0.36);
+        assert!(!h.engine.snapshot().brightness_supported);
+        h.advance(30);
+        close(h.engine.snapshot().overlay_alpha, 0.72);
+        h.engine.command(Command::Cancel);
+        close(h.engine.snapshot().overlay_alpha, 0.0);
+    }
+
+    #[test]
+    fn brightness_get_failure_uses_overlay_and_reports_error() {
+        let mut h = Harness::new(preferences(), true);
+        h.brightness.state.lock().unwrap().fail_get = true;
+        h.start();
+        h.advance(90);
+        close(h.engine.snapshot().overlay_alpha, 0.36);
+        assert!(!h.engine.snapshot().brightness_supported);
+        assert!(h.engine.snapshot().last_error.is_some());
+        assert_eq!(h.brightness.state.lock().unwrap().get_calls, 1);
+    }
+
+    #[test]
+    fn wake_after_end_action_restores_and_does_not_repeat_action() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(180);
+        h.clock.jump_wall(3600);
+        h.engine.tick();
+        assert_eq!(h.engine.snapshot().state, TimerState::Idle);
+        close(h.brightness(), 0.8);
+        close(h.volume(), 0.6);
+        h.advance(10);
+        assert_eq!(h.power.state.lock().unwrap().calls.len(), 1);
+    }
+
+    #[test]
+    fn wake_during_run_restores_and_stops_timer() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(90);
+        h.clock.jump_wall(31);
+        h.engine.tick();
+        assert_eq!(h.engine.snapshot().state, TimerState::Idle);
+        close(h.brightness(), 0.8);
+        assert!(h.power.state.lock().unwrap().calls.is_empty());
+    }
+
+    #[test]
+    fn restoration_setting_is_honored_on_cancel_and_wake() {
+        for wake in [false, true] {
+            let mut settings = preferences();
+            settings.restore_on_cancel_or_wake = false;
+            let mut h = Harness::new(settings, true);
+            h.start();
+            h.advance(150);
+            if wake {
+                h.clock.jump_wall(60);
+                h.engine.tick();
+            } else {
+                h.engine.command(Command::Cancel);
+            }
+            close(h.brightness(), 0.2);
+            close(h.volume(), 0.4);
+            assert_eq!(h.engine.snapshot().state, TimerState::Idle);
+        }
+    }
+
+    #[test]
+    fn power_failure_restores_and_reports_error_instead_of_staying_finishing() {
+        let mut h = Harness::new(preferences(), true);
+        h.power.state.lock().unwrap().fail = true;
+        h.start();
+        h.advance(180);
+        assert_eq!(h.engine.snapshot().state, TimerState::Idle);
+        assert!(h.engine.snapshot().last_error.is_some());
+        close(h.brightness(), 0.8);
+        close(h.volume(), 0.6);
+        h.advance(10);
+        assert_eq!(h.power.state.lock().unwrap().calls.len(), 1);
+    }
+
+    #[test]
+    fn zero_duration_finishes_once_and_shutdown_restores() {
+        let mut h = Harness::new(preferences(), true);
+        h.engine.command(Command::Start {
+            duration: Duration::ZERO,
+        });
+        h.engine.tick();
+        assert_eq!(h.power.state.lock().unwrap().calls.len(), 1);
+        assert!(!h.engine.command(Command::Shutdown));
+        close(h.brightness(), 0.8);
+        close(h.volume(), 0.6);
+    }
+
+    #[test]
+    fn pause_arriving_at_zero_cannot_prevent_end_action() {
+        let mut h = Harness::new(preferences(), true);
+        h.engine.command(Command::Start {
+            duration: Duration::from_secs(10),
+        });
+        h.clock.advance(Duration::from_secs(10));
+        h.engine.command(Command::Pause);
+        assert_eq!(h.engine.snapshot().state, TimerState::Finishing);
+        assert_eq!(h.power.state.lock().unwrap().calls, vec![EndAction::Sleep]);
+    }
+
+    #[test]
+    fn disabled_fades_do_not_read_or_write_levels() {
+        let mut settings = preferences();
+        settings.dim.enabled = false;
+        settings.volume.enabled = false;
+        let mut h = Harness::new(settings, true);
+        h.start();
+        h.advance(180);
+        assert_eq!(h.brightness.state.lock().unwrap().get_calls, 0);
+        assert_eq!(h.volume.state.lock().unwrap().get_calls, 0);
+        assert!(h.brightness.state.lock().unwrap().set_calls.is_empty());
+        assert!(h.volume.state.lock().unwrap().set_calls.is_empty());
+        assert_eq!(h.power.state.lock().unwrap().calls.len(), 1);
+    }
+
+    #[test]
+    fn target_above_original_never_raises_hardware_levels() {
+        let mut settings = preferences();
+        settings.dim.target_percent = 90;
+        settings.volume.target_percent = 90;
+        let mut h = Harness::new(settings, true);
+        h.start();
+        h.advance(180);
+        close(h.brightness(), 0.8);
+        close(h.volume(), 0.6);
+        assert!(h.brightness.state.lock().unwrap().set_calls.is_empty());
+        assert!(h.volume.state.lock().unwrap().set_calls.is_empty());
+    }
+
+    #[test]
+    fn failed_volume_read_is_not_retried_each_tick_or_restored() {
+        let mut h = Harness::new(preferences(), true);
+        h.volume.state.lock().unwrap().fail_get = true;
+        h.start();
+        h.advance(150);
+        assert!(!h.engine.snapshot().volume_supported);
+        assert_eq!(h.engine.snapshot().volume_percent, None);
+        assert_eq!(h.volume.state.lock().unwrap().get_calls, 1);
+        h.engine.command(Command::Cancel);
+        assert!(h.volume.state.lock().unwrap().set_calls.is_empty());
+        close(h.brightness(), 0.8);
+    }
+
+    #[test]
+    fn brightness_write_failure_switches_to_overlay_and_retains_original() {
+        let mut h = Harness::new(preferences(), true);
+        h.brightness.state.lock().unwrap().fail_set = true;
+        h.start();
+        h.advance(90);
+        assert!(!h.engine.snapshot().brightness_supported);
+        assert!(h.engine.snapshot().overlay_alpha > 0.0);
+        h.brightness.state.lock().unwrap().fail_set = false;
+        h.engine.command(Command::Cancel);
+        close(h.brightness(), 0.8);
+        close(h.engine.snapshot().overlay_alpha, 0.0);
+    }
+
+    #[test]
+    fn overlay_never_exceeds_point_nine_at_zero_target() {
+        let mut settings = preferences();
+        settings.dim.target_percent = 0;
+        let mut h = Harness::new(settings, false);
+        h.start();
+        h.advance(120);
+        close(h.engine.snapshot().overlay_alpha, 0.9);
+    }
+
+    #[test]
+    fn backwards_wall_clock_does_not_change_monotonic_countdown() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.clock.advance(Duration::from_secs(10));
+        h.clock.0.lock().unwrap().wall -= Duration::from_secs(3600);
+        h.engine.tick();
+        assert_eq!(h.engine.snapshot().remaining, Duration::from_secs(170));
+        assert_eq!(h.engine.snapshot().state, TimerState::Running);
+    }
+
+    #[test]
+    fn worker_processes_commands_and_last_handle_drop_restores() {
+        let brightness = MockBrightness::new(0.8);
+        let volume = MockVolume::new(0.6);
+        let power = MockPower::default();
+        let (repaint_sender, repaint_receiver) = mpsc::channel();
+        let handle = Engine::spawn(
+            preferences(),
+            Backends {
+                brightness: Some(Box::new(brightness.clone())),
+                volume: Some(Box::new(volume.clone())),
+                power: Box::new(power.clone()),
+            },
+            Box::new(move || {
+                let _ = repaint_sender.send(());
+            }),
+        )
+        .unwrap();
+        let clone = handle.clone();
+        drop(handle);
+        clone
+            .send(Command::Start {
+                duration: Duration::ZERO,
+            })
+            .unwrap();
+        repaint_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(clone.snapshot().state, TimerState::Finishing);
+        drop(clone);
+        assert_eq!(power.state.lock().unwrap().calls, vec![EndAction::Sleep]);
+        close(brightness.state.lock().unwrap().level, 0.8);
+        close(volume.state.lock().unwrap().level, 0.6);
+    }
+}

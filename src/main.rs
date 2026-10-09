@@ -2,8 +2,12 @@
 //! before putting the computer to sleep.
 
 use eframe::egui;
+use nightcap::{engine::Engine, platform, settings::Settings, ui::NightcapApp};
 
 fn main() -> eframe::Result {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let settings = Settings::load();
+    let backends = platform::backends();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Nightcap")
@@ -15,24 +19,15 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Nightcap",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             cc.egui_ctx.set_theme(egui::ThemePreference::System);
-            Ok(Box::new(Nightcap::default()))
+            let context = cc.egui_ctx.clone();
+            let engine = Engine::spawn(
+                settings,
+                backends,
+                Box::new(move || context.request_repaint()),
+            )?;
+            Ok(Box::new(NightcapApp::new(engine)))
         }),
     )
-}
-
-#[derive(Default)]
-struct Nightcap {}
-
-impl eframe::App for Nightcap {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.heading("Nightcap");
-                ui.label("Sleep timer coming soon.");
-            });
-        });
-    }
 }
