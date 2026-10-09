@@ -20,6 +20,11 @@ pub struct ClockReading {
 
 pub trait Clock: Send {
     fn now(&self) -> ClockReading;
+
+    /// Convert timer time to real time for the displayed end time.
+    fn wall_duration(&self, duration: Duration) -> Duration {
+        duration
+    }
 }
 
 pub struct SystemClock {
@@ -40,6 +45,39 @@ impl Clock for SystemClock {
             monotonic: self.origin.elapsed(),
             wall: SystemTime::now(),
         }
+    }
+}
+
+/// Speeds up timer time without speeding up wall time (and falsely detecting wake).
+pub struct SpeedClock<C> {
+    clock: C,
+    speed: f64,
+}
+
+impl<C: Clock> SpeedClock<C> {
+    pub fn new(clock: C, speed: f64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            speed.is_finite() && speed > 0.0,
+            "speed must be finite and positive"
+        );
+        Ok(Self { clock, speed })
+    }
+}
+
+impl<C: Clock> Clock for SpeedClock<C> {
+    fn now(&self) -> ClockReading {
+        let mut reading = self.clock.now();
+        reading.monotonic =
+            Duration::try_from_secs_f64(reading.monotonic.as_secs_f64() * self.speed)
+                .unwrap_or(Duration::MAX);
+        reading
+    }
+
+    fn wall_duration(&self, duration: Duration) -> Duration {
+        self.clock.wall_duration(
+            Duration::try_from_secs_f64(duration.as_secs_f64() / self.speed)
+                .unwrap_or(Duration::MAX),
+        )
     }
 }
 
@@ -93,6 +131,20 @@ struct HandleInner {
 impl EngineHandle {
     pub fn send(&self, command: Command) -> Result<(), mpsc::SendError<Command>> {
         self.inner.sender.send(command)
+    }
+
+    /// Stop the worker and wait for level restoration, even when other handles exist.
+    pub fn shutdown(&self) {
+        let _ = self.send(Command::Shutdown);
+        if let Some(worker) = self
+            .inner
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = worker.join();
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -153,7 +205,18 @@ impl Engine<SystemClock> {
         backends: Backends,
         repaint: Box<dyn Fn() + Send>,
     ) -> io::Result<EngineHandle> {
-        let mut engine = Self::new(settings, backends, SystemClock::default());
+        Self::spawn_with_clock(settings, backends, SystemClock::default(), repaint)
+    }
+}
+
+impl<C: Clock + 'static> Engine<C> {
+    pub fn spawn_with_clock(
+        settings: Settings,
+        backends: Backends,
+        clock: C,
+        repaint: Box<dyn Fn() + Send>,
+    ) -> io::Result<EngineHandle> {
+        let mut engine = Self::new(settings, backends, clock);
         engine.repaint = repaint;
         let snapshot = Arc::clone(&engine.shared);
         let (sender, receiver) = mpsc::channel();
@@ -292,7 +355,7 @@ impl<C: Clock> Engine<C> {
             }
         }
         self.snapshot.ends_at = if self.snapshot.state == TimerState::Running {
-            chrono::TimeDelta::from_std(self.snapshot.remaining)
+            chrono::TimeDelta::from_std(self.clock.wall_duration(self.snapshot.remaining))
                 .ok()
                 .and_then(|remaining| {
                     chrono::DateTime::<chrono::Local>::from(self.last_time.wall)
@@ -906,5 +969,52 @@ mod tests {
         assert_eq!(power.state.lock().unwrap().calls, vec![EndAction::Sleep]);
         close(brightness.state.lock().unwrap().level, 0.8);
         close(volume.state.lock().unwrap().level, 0.6);
+    }
+    #[test]
+    fn accelerated_clock_uses_real_end_time_and_real_wake_detection() {
+        let clock = FakeClock::new();
+        let wall = clock.now().wall;
+        let power = MockPower::default();
+        let mut engine = Engine::new(
+            preferences(),
+            Backends {
+                brightness: None,
+                volume: None,
+                power: Box::new(power.clone()),
+            },
+            SpeedClock::new(clock.clone(), 60.0).unwrap(),
+        );
+        engine.command(Command::Start {
+            duration: Duration::from_secs(900),
+        });
+        assert_eq!(
+            SystemTime::from(engine.snapshot().ends_at.unwrap()),
+            wall + Duration::from_secs(15)
+        );
+        clock.advance(Duration::from_secs(5));
+        engine.tick();
+        assert_eq!(engine.snapshot().remaining, Duration::from_secs(600));
+        assert_eq!(engine.snapshot().state, TimerState::Running);
+        clock.advance(Duration::from_secs(10));
+        engine.tick();
+        assert_eq!(engine.snapshot().state, TimerState::Finishing);
+        assert_eq!(power.state.lock().unwrap().calls, vec![EndAction::Sleep]);
+        clock.jump_wall(31);
+        engine.tick();
+        assert_eq!(engine.snapshot().state, TimerState::Idle);
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(SpeedClock::new(clock.clone(), invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn shutdown_during_fade_restores_without_performing_power_action() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(150);
+        assert!(!h.engine.command(Command::Shutdown));
+        close(h.brightness(), 0.8);
+        close(h.volume(), 0.6);
+        assert!(h.power.state.lock().unwrap().calls.is_empty());
     }
 }

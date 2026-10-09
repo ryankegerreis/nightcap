@@ -102,7 +102,7 @@ fn timer_block(
         pos2(wrap.center().x, wrap.top() + RING_SIZE * 0.5),
         Vec2::splat(RING_SIZE),
     );
-    let progress = ring_progress(snapshot, duration_min);
+    let progress = ring_progress(snapshot);
     widgets::paint_progress_ring(ui, Id::new("nightcap-ring"), ring, progress);
 
     let paused = snapshot.state == TimerState::Paused;
@@ -139,7 +139,6 @@ fn timer_block(
         pos2(wrap.right() - 2.0 - BUTTON, wrap.bottom() - BUTTON),
         Vec2::splat(BUTTON),
     );
-    let running = snapshot.state == TimerState::Running;
     let (primary_label, primary_enabled) = match snapshot.state {
         TimerState::Idle => ("Start", true),
         TimerState::Running => ("Pause", true),
@@ -152,7 +151,7 @@ fn timer_block(
         Id::new("nightcap-cancel"),
         "Cancel",
         RoundRole::Neutral,
-        running || paused,
+        snapshot.state != TimerState::Idle,
     )
     .clicked()
     {
@@ -356,16 +355,12 @@ fn paint_subtitle(
     );
 }
 
-fn ring_progress(snapshot: &Snapshot, duration_min: u32) -> f32 {
+fn ring_progress(snapshot: &Snapshot) -> f32 {
     match snapshot.state {
         TimerState::Idle => 1.0,
         TimerState::Finishing => 0.0,
         TimerState::Running | TimerState::Paused => {
-            let total = snapshot
-                .total
-                .as_secs_f32()
-                .max(duration_min as f32 * 60.0)
-                .max(1.0);
+            let total = snapshot.total.as_secs_f32().max(1.0);
             (snapshot.remaining.as_secs_f32() / total).clamp(0.0, 1.0)
         }
     }
@@ -509,5 +504,20 @@ mod tests {
             fade_caption(&fade, &running, Some(42.2)),
             "Now 42%, going to 10%"
         );
+    }
+    #[test]
+    fn active_ring_uses_the_engine_total_for_tray_timers_and_extensions() {
+        let mut snapshot = Snapshot {
+            state: TimerState::Running,
+            total: Duration::from_secs(900),
+            remaining: Duration::from_secs(900),
+            ..Default::default()
+        };
+        assert_eq!(ring_progress(&snapshot), 1.0);
+        snapshot.remaining = Duration::from_secs(450);
+        assert_eq!(ring_progress(&snapshot), 0.5);
+        snapshot.total += Duration::from_secs(900);
+        snapshot.remaining += Duration::from_secs(900);
+        assert_eq!(ring_progress(&snapshot), 0.75);
     }
 }

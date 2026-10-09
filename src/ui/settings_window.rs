@@ -17,25 +17,32 @@ pub fn show(
     brightness_supported: bool,
     volume_supported: bool,
 ) -> bool {
-    if !*open {
-        return false;
-    }
+    // Register at launch, even while hidden. eframe cannot create an immediate
+    // viewport in every event-loop phase used to reopen the root from the tray.
+    let visible = *open;
     let mut changed = false;
     let mut close = false;
     ctx.show_viewport_immediate(
-        egui::ViewportId::from_hash_of("nightcap-settings"),
-        egui::ViewportBuilder::default()
-            .with_title("Settings")
+        viewport_id(),
+        super::window_builder("Settings")
+            .with_visible(visible)
+            .with_active(true)
             .with_inner_size([460.0, 700.0])
             .with_min_inner_size([420.0, 480.0]),
         |ui, _class| {
-            if ui.input(|input| input.viewport().close_requested()) {
+            if !visible {
+                return;
+            }
+            if ui.input(|input| input.viewport().close_requested())
+                || ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
+            {
                 close = true;
             }
             let tokens = super::theme::tokens(ui.ctx());
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(tokens.window))
                 .show(ui, |ui| {
+                    widgets::settings_header(ui);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -365,4 +372,8 @@ fn section_title(ui: &mut egui::Ui, text: &str) {
 fn footnote(ui: &mut egui::Ui, text: &str) {
     ui.add_space(6.0);
     widgets::caption(ui, text);
+}
+
+pub fn viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("nightcap-settings")
 }

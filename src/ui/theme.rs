@@ -190,3 +190,63 @@ fn black_alpha(opacity: f32) -> Color32 {
 fn white_alpha(opacity: f32) -> Color32 {
     Color32::from_white_alpha(alpha(opacity))
 }
+
+/// Read OS fonts at runtime; Apple fonts are never included in the binary.
+pub fn install_fonts(ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    let paths = [
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/SFNSText.ttf",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+    ];
+    #[cfg(target_os = "windows")]
+    let paths = [r"C:\Windows\Fonts\segoeui.ttf"];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let paths: [&str; 0] = [];
+    let mut definitions = egui::FontDefinitions::default();
+    if let Some((path, bytes)) = paths
+        .iter()
+        .find_map(|path| std::fs::read(path).ok().map(|bytes| (*path, bytes)))
+    {
+        let regular = egui::FontData::from_owned(bytes);
+        let mut light = regular.clone();
+        if let Some(weight) = light
+            .variation_axes()
+            .iter()
+            .find(|axis| axis.tag == "wght")
+        {
+            light.tweak.coords.push(b"wght", weight.range.min);
+        } else {
+            // Static light faces are used when the system font has no weight axis.
+            #[cfg(target_os = "macos")]
+            if let Ok(bytes) = std::fs::read("/System/Library/Fonts/HelveticaNeue.ttc") {
+                light = egui::FontData::from_owned(bytes);
+                light.index = 5; // HelveticaNeue-UltraLight
+            }
+            #[cfg(target_os = "windows")]
+            if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeuil.ttf") {
+                light = egui::FontData::from_owned(bytes);
+            }
+        }
+        definitions
+            .font_data
+            .insert("system".into(), regular.into());
+        definitions
+            .font_data
+            .insert("countdown".into(), light.into());
+        definitions
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "system".into());
+        log::debug!("Loaded system font from {path}");
+    }
+    let mut countdown = definitions.families[&egui::FontFamily::Proportional].clone();
+    if definitions.font_data.contains_key("countdown") {
+        countdown.insert(0, "countdown".into());
+    }
+    definitions
+        .families
+        .insert(egui::FontFamily::Name("countdown".into()), countdown);
+    ctx.set_fonts(definitions);
+}

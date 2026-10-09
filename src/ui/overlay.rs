@@ -3,8 +3,8 @@
 //! The integrator must enable transparency on NativeOptions' root viewport and return
 //! `[0.0; 4]` from App::clear_color (all viewports share that clear color). Paint the
 //! normal windows' backgrounds explicitly. Call `show` on every root UI pass.
-//! An existing deferred child keeps rendering while the root is hidden; creating it
-//! for the first time still requires a root UI pass, not App::logic.
+//! Register the hidden child on the first root UI pass, before the root can close.
+//! Logic-only updates can then reveal it without revealing or focusing the root.
 
 use std::sync::{
     Arc,
@@ -18,6 +18,7 @@ use eframe::egui::{
 pub struct Overlay {
     alpha: Arc<AtomicU32>,
     id: ViewportId,
+    registered: bool,
 }
 
 impl Default for Overlay {
@@ -31,27 +32,24 @@ impl Overlay {
         Self {
             alpha: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
             id: ViewportId::from_hash_of("nightcap-dimming-overlay"),
+            registered: false,
         }
     }
 
-    /// Call from the root App::ui. Zero alpha omits (and therefore destroys) the viewport.
+    /// Call from every root App::ui pass. Zero alpha keeps the child hidden, ready
+    /// for a fade started from the tray while the root is hidden.
     /// Covers one monitor; on macOS this follows the root's monitor without entering a
     /// fullscreen Space. On other desktops, the window manager selects the fullscreen
     /// monitor from the root's position; Wayland may choose a different output.
     pub fn show(&mut self, ctx: &Context, alpha: f32) {
-        let alpha = if alpha.is_finite() {
-            alpha.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let previous = self.alpha.swap(alpha.to_bits(), Ordering::Relaxed);
-        if alpha == 0.0 {
-            return;
-        }
+        self.sync(ctx, alpha);
+        let alpha = f32::from_bits(self.alpha.load(Ordering::Relaxed));
+        self.registered = true;
         #[cfg(target_os = "macos")]
         install_macos_focus_guard();
         let builder = monitor_builder(ctx)
             .with_title("Nightcap Dimming Overlay")
+            .with_visible(alpha > 0.0)
             .with_decorations(false)
             .with_transparent(true)
             .with_window_level(WindowLevel::AlwaysOnTop)
@@ -85,7 +83,19 @@ impl Overlay {
                 Color32::from_black_alpha((alpha * 255.0).round() as u8),
             );
         });
-        if previous != alpha.to_bits() {
+    }
+
+    /// Logic-only updates keep an existing child alive when the root is hidden.
+    pub fn sync(&mut self, ctx: &Context, alpha: f32) {
+        let alpha = if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let previous = self.alpha.swap(alpha.to_bits(), Ordering::Relaxed);
+        if self.registered && previous != alpha.to_bits() {
+            // Hiding is immediate even if the root has no UI pass to remove it.
+            ctx.send_viewport_cmd_to(self.id, egui::ViewportCommand::Visible(alpha > 0.0));
             ctx.request_repaint_of(self.id);
         }
     }
@@ -248,19 +258,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zero_alpha_has_no_native_viewport_and_invalid_alpha_is_ignored() {
+    fn zero_or_invalid_alpha_registers_a_hidden_passive_viewport() {
         let ctx = Context::default();
         ctx.set_embed_viewports(false);
         let mut overlay = Overlay::new();
         for alpha in [0.0, -1.0, f32::NAN, f32::INFINITY] {
             let mut output = ctx.run_ui(Default::default(), |ui| overlay.show(ui.ctx(), alpha));
             output.textures_delta.clear();
-            assert!(!output.viewport_output.contains_key(&overlay.id));
+            assert_eq!(
+                output.viewport_output[&overlay.id].builder.visible,
+                Some(false)
+            );
         }
     }
 
     #[test]
-    fn dimming_child_is_passive_and_disappears_when_cleared() {
+    fn dimming_child_is_passive_and_hides_when_cleared() {
         let ctx = Context::default();
         ctx.set_embed_viewports(false);
         let mut overlay = Overlay::new();
@@ -276,6 +289,24 @@ mod tests {
         assert_eq!(child.builder.window_level, Some(WindowLevel::AlwaysOnTop));
         let mut output = ctx.run_ui(Default::default(), |ui| overlay.show(ui.ctx(), 0.0));
         output.textures_delta.clear();
-        assert!(!output.viewport_output.contains_key(&overlay.id));
+        assert_eq!(
+            output.viewport_output[&overlay.id].builder.visible,
+            Some(false)
+        );
+    }
+    #[test]
+    fn logic_only_updates_reveal_and_hide_the_registered_child() {
+        let ctx = Context::default();
+        ctx.set_embed_viewports(false);
+        let mut overlay = Overlay::new();
+        let mut output = ctx.run_ui(Default::default(), |ui| overlay.show(ui.ctx(), 0.0));
+        output.textures_delta.clear();
+        for (alpha, visible) in [(0.6, true), (0.0, false)] {
+            let output = ctx.run_logic(&Default::default(), |ctx| overlay.sync(ctx, alpha));
+            assert!(
+                output.viewport_commands[&overlay.id]
+                    .contains(&egui::ViewportCommand::Visible(visible))
+            );
+        }
     }
 }

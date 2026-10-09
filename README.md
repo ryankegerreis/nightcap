@@ -4,19 +4,20 @@ A sleep timer for your computer, like the one on a TV. Set a time, and Nightcap 
 
 Nightcap is built in Rust with [egui](https://github.com/emilk/egui) and runs on macOS, Windows and Linux. It works offline and needs no account.
 
-> **Status:** early development. The app opens a window and nothing more yet. The features below are planned.
+> **Status:** working desktop app. Timer, fades, menu bar/tray controls, Settings, and overlay fallback are integrated. macOS has been exercised with real brightness and volume fades; Windows and Linux are compile-checked.
 
 ![Nightcap main window in light and dark appearance](docs/design/main-window.png)
 
-## Planned features
+## Features
 
 - **Sleep timer:** pick 15, 30, 45, 60 or 90 minutes, or set your own length.
 - **Screen fade:** dim the screen to a level you choose, starting when you choose, over as long as you choose.
 - **Volume fade:** lower the volume the same way, set up separately from the screen fade.
 - **When the timer ends:** sleep, hibernate or shut down.
 - **Restore:** put brightness and volume back when you cancel the timer or wake the computer.
-- **Menu bar and system tray:** start, pause and cancel timers without opening the window.
-- **Overlay fallback:** on displays that don't support brightness control, dim the screen with an overlay instead.
+- **Menu bar and system tray:** start, pause, resume, extend and cancel timers without opening the window. Closing the window keeps the timer running; Open Nightcap brings it back. Quit restores faded levels when restoration is enabled.
+- **Overlay fallback:** on displays that don't support brightness control, dim the root window’s monitor with a passive, transparent overlay. It keeps updating while the main window is hidden.
+- **Native appearance:** system light/dark theme, runtime system fonts on macOS/Windows, thin countdown digits in fixed-width cells, and separate Settings (gear button or ⌘, on macOS). Preferences are saved in the OS configuration directory.
 
 ## Design
 
@@ -28,9 +29,73 @@ You need a recent stable [Rust toolchain](https://rustup.rs).
 
 ```sh
 cargo run
+cargo build --release
+```
+
+The standalone binary is `target/release/nightcap` (`nightcap.exe` on Windows).
+Use a native toolchain on each platform to build its executable. Compile-only
+cross-target checks do not produce runnable applications.
+
+For development checks:
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
 ```
 
 On Linux, egui needs a few system libraries. See the [eframe documentation](https://github.com/emilk/egui/tree/main/crates/eframe) for the list.
+
+## Safe preview and accelerated time
+
+```sh
+NIGHTCAP_DRY_RUN=1 NIGHTCAP_SPEED=60 cargo run
+```
+
+`NIGHTCAP_DRY_RUN=1` replaces all end actions with a log message; no sleep,
+hibernation or shutdown is requested. Brightness and volume fades still affect
+real hardware. After a dry-run timer ends, use Cancel or Quit to restore levels
+when restoration is enabled.
+
+`NIGHTCAP_SPEED=<n>` advances timer and fade time at `n` times real speed. At
+`60`, a 15-minute timer finishes in 15 seconds. The displayed end time uses real
+wall time, and wake detection stays unscaled. The default is `1`; invalid,
+non-finite or non-positive values are logged and fall back to real time. Speed
+alone does not disable power actions, so use both variables for previews.
+
+## Platform notes
+
+On macOS, the window has a unified header with native traffic lights. Nightcap
+appears in the Dock and Cmd-Tab while its window is visible, then becomes a
+menu-bar-only app when the window closes. The menu’s Open Nightcap restores and
+focuses the window. Cmd-W hides the main window (or closes Settings); Cmd-Q and
+Quit Nightcap exit gracefully. Brightness uses DisplayServices on the primary
+display, with an overlay fallback for unsupported displays. Volume uses
+CoreAudio, with an AppleScript fallback. Hibernate requests sleep because macOS
+has no public user-level hibernate action. Shutdown can prompt for Automation
+permission to control System Events; allow it in System Settings → Privacy &
+Security → Automation. The timer itself requires no Accessibility permission.
+
+On Windows, volume uses the default CoreAudio endpoint. Brightness uses WMI for
+supported built-in panels and DDC/CI for supported external monitors. Native
+window decorations and the notification-area tray are retained. Power actions
+depend on Windows privileges and hibernation configuration.
+
+On Linux, the tray needs a D-Bus session with a StatusNotifier host (for example
+KDE Plasma, or a compatible GNOME extension). If tray initialization fails,
+closing the main window quits instead of leaving an inaccessible background
+process. Brightness needs a supported `/sys/class/backlight` device and access
+through writable sysfs, logind’s SetBrightness, or `brightnessctl`; otherwise the
+overlay is used. Volume tries `wpctl`, `pactl`, then `amixer`. Power actions use
+systemd/logind and remain subject to the session’s polkit permissions. Overlay
+placement depends on the window manager; Wayland can select a different output.
+
+The overlay covers one monitor, is always on top, and lets mouse input pass
+through. It is a visual fade rather than hardware brightness control. With
+restoration disabled, Cancel leaves faded levels in place until changed manually;
+the overlay disappears when the app exits. Restoration after sleep is based on a
+wall-clock gap over 30 seconds. Real power actions and Windows/Linux desktop
+behavior require testing on the corresponding systems.
 
 ## License
 

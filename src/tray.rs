@@ -161,7 +161,7 @@ impl Display {
 }
 
 /// Four-by-four supersampling gives a clean crescent at menu-bar sizes.
-fn moon_rgba(size: u32) -> Vec<u8> {
+pub(crate) fn moon_rgba(size: u32) -> Vec<u8> {
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
         for x in 0..size {
@@ -257,6 +257,8 @@ mod native {
         active_separator: PredefinedMenuItem,
         active_visible: bool,
         _events: Arc<Events>,
+        #[cfg(target_os = "macos")]
+        _app_menu: Menu,
     }
 
     impl NativeTray {
@@ -307,6 +309,40 @@ mod native {
                 items.push((item.id().clone(), Action::Ui(action)));
                 menu.append(&item)?;
             }
+            // Route native Cmd+Q through the same graceful shutdown as tray Quit.
+            // AppKit's default terminate: can otherwise end the process before restore.
+            #[cfg(target_os = "macos")]
+            let app_menu = {
+                use tray_icon::menu::Submenu;
+                let app_menu = Menu::new();
+                let application = Submenu::new("Nightcap", true);
+                let settings = MenuItem::new(
+                    "Settings…",
+                    true,
+                    Some(Accelerator::new(Modifiers::META, Code::Comma)),
+                );
+                let quit = MenuItem::new(
+                    "Quit Nightcap",
+                    true,
+                    Some(Accelerator::new(Modifiers::META, Code::KeyQ)),
+                );
+                items.push((settings.id().clone(), Action::Ui(TrayAction::OpenSettings)));
+                items.push((quit.id().clone(), Action::Ui(TrayAction::Quit)));
+                application.append_items(&[
+                    &settings,
+                    &PredefinedMenuItem::separator(),
+                    &PredefinedMenuItem::hide(Some("Hide Nightcap")),
+                    &PredefinedMenuItem::hide_others(None),
+                    &PredefinedMenuItem::show_all(None),
+                    &PredefinedMenuItem::separator(),
+                    &quit,
+                ])?;
+                let window = Submenu::new("Window", true);
+                window.append(&PredefinedMenuItem::close_window(None))?;
+                app_menu.append_items(&[&application, &window])?;
+                app_menu.init_for_nsapp();
+                app_menu
+            };
             let icon_data = Icon::from_rgba(moon_rgba(32), 32, 32)?;
             let builder = TrayIconBuilder::new().with_menu(Box::new(menu.clone()));
             #[cfg(target_os = "macos")]
@@ -337,6 +373,8 @@ mod native {
                 active_separator: PredefinedMenuItem::separator(),
                 active_visible: false,
                 _events: events,
+                #[cfg(target_os = "macos")]
+                _app_menu: app_menu,
             };
             tray.update(display);
             Ok(tray)

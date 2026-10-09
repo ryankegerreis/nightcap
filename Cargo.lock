@@ -2152,6 +2152,7 @@ dependencies = [
  "tempfile",
  "tray-icon",
  "windows",
+ "winit",
 ]
 
 [[package]]

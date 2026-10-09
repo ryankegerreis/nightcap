@@ -191,7 +191,7 @@ pub fn paint_progress_ring(ui: &Ui, id: Id, rect: Rect, progress: f32) {
 
 /// Fixed-width digit cells so the countdown does not jitter as digits change.
 pub fn paint_tabular_time(ui: &Ui, center: Pos2, text: &str, size: f32, color: Color32) -> Rect {
-    let font = FontId::proportional(size);
+    let font = FontId::new(size, egui::FontFamily::Name("countdown".into()));
     let digit_width = ui.fonts_mut(|fonts| {
         ('0'..='9')
             .map(|digit| fonts.glyph_width(&font, digit))
@@ -643,13 +643,14 @@ fn paint_meter_icon(ui: &mut Ui, kind: MeterKind, large: bool) {
 pub fn main_header(ui: &mut Ui) -> Response {
     let tokens = theme::tokens(ui.ctx());
     let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
-    ui.painter().text(
-        bar.center(),
-        Align2::CENTER_CENTER,
-        "Nightcap",
-        FontId::proportional(13.0),
-        tokens.label,
+    if cfg!(target_os = "macos") {
+        paint_header_title(ui, bar, "Nightcap");
+    }
+    let drag = Rect::from_min_max(
+        pos2(bar.left() + 80.0, bar.top()),
+        pos2(bar.right() - 45.0, bar.bottom()),
     );
+    header_drag(ui, drag);
     let button = Rect::from_center_size(pos2(bar.right() - 25.0, bar.center().y), vec2(30.0, 24.0));
     let response = ui.interact(button, Id::new("nightcap-settings-button"), Sense::click());
     let hover = ui
@@ -788,4 +789,35 @@ fn arc_points(center: Pos2, radius: f32, start: f32, sweep: f32) -> Vec<Pos2> {
             center + Vec2::angled(start + sweep * t) * radius
         })
         .collect()
+}
+
+/// A unified macOS header; other platforms retain their native window title.
+pub fn settings_header(ui: &mut Ui) {
+    if cfg!(target_os = "macos") {
+        let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
+        paint_header_title(ui, bar, "Settings");
+        header_drag(
+            ui,
+            Rect::from_min_max(pos2(bar.left() + 80.0, bar.top()), bar.max),
+        );
+    }
+}
+
+fn paint_header_title(ui: &Ui, bar: Rect, title: &str) {
+    ui.painter().text(
+        bar.center(),
+        Align2::CENTER_CENTER,
+        title,
+        FontId::proportional(13.0),
+        theme::tokens(ui.ctx()).label,
+    );
+}
+
+fn header_drag(ui: &Ui, rect: Rect) {
+    if ui
+        .interact(rect, ui.id().with("header-drag"), Sense::drag())
+        .drag_started()
+    {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
 }

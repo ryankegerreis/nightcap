@@ -51,3 +51,13 @@ pub fn backends() -> Backends {
         fallback::backends()
     }
 }
+
+/// Used for live UI/fade verification without requesting any system power action.
+pub struct DryRunPower;
+
+impl Power for DryRunPower {
+    fn perform(&mut self, action: EndAction) -> Result<()> {
+        log::warn!("NIGHTCAP_DRY_RUN: would perform {action:?}; no power action requested");
+        Ok(())
+    }
+}

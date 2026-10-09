@@ -28,6 +28,7 @@ tray-icon = { version = "0.26.1", default-features = false }
 ksni = { version = "0.3.6", features = ["blocking"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30.13", default-features = false }
 objc2 = "0.6.5"
 objc2-foundation = "0.3.2"
 objc2-app-kit = "0.3.2"
