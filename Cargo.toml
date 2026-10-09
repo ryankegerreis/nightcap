@@ -1,0 +1,13 @@
+[package]
+name = "nightcap"
+version = "0.1.0"
+edition = "2024"
+description = "A sleep timer for your computer: dims the screen, lowers the volume, then puts it to sleep."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ryankegerreis/nightcap"
+readme = "README.md"
+keywords = ["sleep-timer", "brightness", "volume", "egui", "desktop"]
+categories = ["gui"]
+
+[dependencies]
+eframe = "0.36.2"

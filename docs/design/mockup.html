@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nightcap: Mac design, light and dark</title>
+<style>
+*{box-sizing:border-box}
+:root{--sf:-apple-system,BlinkMacSystemFont,"SF Pro Text","Inter","Segoe UI",system-ui,sans-serif}
+body{margin:0;background:#FBFBFD;color:#1D1D1F;font:15px/1.5 var(--sf);-webkit-font-smoothing:antialiased}
+button,select,input{font:inherit;color:inherit}
+
+/* ---------- page ---------- */
+.page{max-width:1200px;margin:0 auto;padding:56px 24px 72px}
+.head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:24px;margin-bottom:32px}
+.head h1{font-size:34px;line-height:1.1;font-weight:600;letter-spacing:-.02em;margin:0 0 8px}
+.head p{margin:0;color:#6E6E73;max-width:56ch}
+.fast{display:flex;align-items:center;gap:10px;font-size:13px;color:#6E6E73}
+.modes{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}
+.mode{border-radius:20px;padding:28px 24px 40px;display:flex;flex-direction:column;align-items:center;gap:12px;min-width:0}
+.mode-name{align-self:flex-start;font-size:13px;font-weight:600;margin:0 0 16px}
+.surface{display:flex;flex-direction:column;align-items:center;width:100%;margin-bottom:28px}
+.surface-cap{font-size:12px;margin:14px 0 0;color:var(--label2)}
+.notes{display:grid;grid-template-columns:1.2fr 1fr 1.3fr;gap:40px;margin-top:56px;font-size:14px}
+.notes h2{font-size:15px;font-weight:600;margin:0 0 12px}
+.notes table{border-collapse:collapse;width:100%;font-size:13px}
+.notes th{font-weight:500;text-align:left;color:#6E6E73;padding:0 0 6px}
+.notes td{padding:5px 8px 5px 0;border-top:1px solid #E5E5EA;vertical-align:middle;font-variant-numeric:tabular-nums}
+.chip{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-1px;margin-right:6px;box-shadow:inset 0 0 0 .5px rgba(0,0,0,.2)}
+.notes ul{margin:0;padding-left:1.1em;display:grid;gap:8px;color:#3A3A3C}
+.notes code{font:12.5px ui-monospace,SFMono-Regular,Menlo,monospace;background:#F0F0F3;padding:1px 4px;border-radius:4px}
+.scale td:first-child{color:#6E6E73;width:96px}
+
+/* ---------- appearance tokens ---------- */
+.light{--backdrop:#E4E5EA;--win:#F4F4F4;--group:#FFFFFF;--group-edge:rgba(0,0,0,.07);
+  --label:rgba(0,0,0,.85);--label2:rgba(0,0,0,.5);--label3:rgba(0,0,0,.25);--sep:rgba(0,0,0,.08);
+  --fill:rgba(0,0,0,.055);--fill2:rgba(0,0,0,.09);--seg-sel:#FFFFFF;--knob:#FFFFFF;
+  --accent:#5856D6;--accent-tint:rgba(88,86,214,.13);--field:#FFFFFF;
+  --win-edge:0 0 0 .5px rgba(0,0,0,.22);--win-shadow:0 18px 50px rgba(0,0,0,.18),0 2px 6px rgba(0,0,0,.06);
+  --menu:rgba(246,246,246,.97);--menu-edge:0 0 0 .5px rgba(0,0,0,.18);--menubar:rgba(250,250,250,.75);
+  background:var(--backdrop);color:var(--label)}
+.dark{--backdrop:#3A3A3D;--win:#1F1F1F;--group:#2A2A2A;--group-edge:rgba(255,255,255,.06);
+  --label:rgba(255,255,255,.88);--label2:rgba(255,255,255,.55);--label3:rgba(255,255,255,.25);--sep:rgba(255,255,255,.08);
+  --fill:rgba(255,255,255,.08);--fill2:rgba(255,255,255,.14);--seg-sel:#646466;--knob:#E8E8E8;
+  --accent:#5E5CE6;--accent-tint:rgba(94,92,230,.24);--field:rgba(255,255,255,.06);
+  --win-edge:0 0 0 .5px #000,inset 0 0 0 .5px rgba(255,255,255,.14);--win-shadow:0 18px 50px rgba(0,0,0,.45);
+  --menu:rgba(44,44,46,.97);--menu-edge:0 0 0 .5px #000,inset 0 0 0 .5px rgba(255,255,255,.14);--menubar:rgba(30,30,30,.7);
+  background:var(--backdrop);color:var(--label);color-scheme:dark}
+.mode :focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:1px}
+
+/* ---------- window chrome ---------- */
+.mac-win{width:340px;max-width:100%;background:var(--win);border-radius:12px;box-shadow:var(--win-edge),var(--win-shadow);overflow:hidden;font:13px/1.35 var(--sf);color:var(--label)}
+.set-win{width:460px}
+.toolbar{height:38px;display:grid;grid-template-columns:70px 1fr 70px;align-items:center;padding:0 10px 0 14px}
+.lights{display:flex;gap:8px}
+.lights i{width:12px;height:12px;border-radius:50%;box-shadow:inset 0 0 0 .5px rgba(0,0,0,.15)}
+.lights i:nth-child(1){background:#FF5F57}.lights i:nth-child(2){background:#FEBC2E}.lights i:nth-child(3){background:#28C840}
+.tb-title{text-align:center;font-weight:600;font-size:13px}
+.tb-btn{justify-self:end;width:30px;height:24px;border:0;border-radius:6px;background:none;color:var(--label2);display:grid;place-items:center;cursor:default}
+.tb-btn:hover{background:var(--fill)}
+
+/* ---------- controls ---------- */
+.group{background:var(--group);border-radius:9px;box-shadow:0 0 0 .5px var(--group-edge)}
+.row{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:40px;padding:7px 12px}
+.row+.row{border-top:1px solid var(--sep)}
+.row[hidden]{display:none}
+.row-text{display:grid;gap:1px}
+.cap{font-size:11px;color:var(--label2);font-variant-numeric:tabular-nums}
+.group.off .dep{opacity:.4;pointer-events:none}
+.switch{position:relative;flex:none;width:32px;height:19px;border-radius:10px;border:0;padding:0;background:var(--fill2);cursor:default;transition:background .15s}
+.switch::after{content:"";position:absolute;top:1.5px;left:1.5px;width:16px;height:16px;border-radius:50%;background:var(--knob);box-shadow:0 1px 2px rgba(0,0,0,.25),0 0 0 .5px rgba(0,0,0,.06);transition:transform .15s}
+.switch[aria-checked="true"]{background:var(--accent)}
+.switch[aria-checked="true"]::after{transform:translateX(13px)}
+.pop{appearance:none;-webkit-appearance:none;border:0;border-radius:5px;padding:3px 20px 3px 8px;margin-right:-6px;font:13px var(--sf);color:var(--label2);background:transparent no-repeat right 6px center;cursor:default}
+.light .pop{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='12'%3E%3Cpath d='M1.5 4.5L4 2l2.5 2.5M1.5 7.5L4 10l2.5-2.5' fill='none' stroke='%236E6E73' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")}
+.dark .pop{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='12'%3E%3Cpath d='M1.5 4.5L4 2l2.5 2.5M1.5 7.5L4 10l2.5-2.5' fill='none' stroke='%23A1A1A6' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")}
+.pop:hover{background-color:var(--fill)}
+.pop option{color:initial}
+.seg{display:grid;grid-template-columns:repeat(6,1fr);background:var(--fill);border-radius:7px;padding:2px}
+.seg button{height:22px;padding:0;white-space:nowrap;border:0;border-radius:5px;background:none;font-size:12px;color:var(--label);cursor:default;font-variant-numeric:tabular-nums}
+.seg button[aria-checked="true"]{background:var(--seg-sel);box-shadow:0 0 0 .5px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.14)}
+.seg[aria-disabled="true"]{opacity:.45;pointer-events:none}
+.stepper{display:flex;align-items:center;gap:6px;color:var(--label2)}
+.stepper input{width:52px;height:22px;border:0;border-radius:5px;background:var(--field);box-shadow:inset 0 0 0 .5px var(--label3);text-align:right;padding:0 6px;font:13px var(--sf);color:var(--label);font-variant-numeric:tabular-nums;-moz-appearance:textfield}
+.stepper input::-webkit-inner-spin-button{-webkit-appearance:none}
+.step-btns{display:grid;border-radius:5px;overflow:hidden;box-shadow:0 0 0 .5px var(--label3);background:var(--field)}
+.step-btns button{width:15px;height:11px;border:0;background:none;display:grid;place-items:center;padding:0;color:var(--label2);cursor:default}
+.step-btns button+button{border-top:.5px solid var(--sep)}
+.step-btns button:active{background:var(--fill2)}
+.slider{display:flex;align-items:center;gap:8px;color:var(--label2)}
+.slider output{width:34px;text-align:right;color:var(--label2);font-variant-numeric:tabular-nums}
+input[type=range]{-webkit-appearance:none;appearance:none;width:150px;height:18px;background:transparent;margin:0}
+input[type=range]::-webkit-slider-runnable-track{height:4px;border-radius:2px;background:linear-gradient(to right,var(--accent) var(--p),var(--fill2) var(--p))}
+input[type=range]::-moz-range-track{height:4px;border-radius:2px;background:linear-gradient(to right,var(--accent) var(--p),var(--fill2) var(--p))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;margin-top:-7px;background:var(--knob);box-shadow:0 1px 3px rgba(0,0,0,.3),0 0 0 .5px rgba(0,0,0,.08)}
+input[type=range]::-moz-range-thumb{width:18px;height:18px;border:0;border-radius:50%;background:var(--knob);box-shadow:0 1px 3px rgba(0,0,0,.3)}
+
+/* ---------- main window ---------- */
+.main-body{padding:4px 16px 16px;display:grid;gap:16px}
+.ring-wrap{position:relative;height:236px}
+.ring{position:absolute;left:50%;top:0;width:204px;height:204px;transform:translateX(-50%) rotate(-90deg)}
+.ring circle{fill:none;stroke-width:6}
+.ring-track{stroke:var(--fill)}
+.ring-prog{stroke:var(--accent);stroke-linecap:round;transition:stroke-dashoffset .25s linear}
+.ring-center{position:absolute;left:50%;top:102px;transform:translate(-50%,-50%);width:170px;text-align:center}
+.ring-time{font-size:50px;font-weight:200;letter-spacing:-.02em;line-height:1;font-variant-numeric:tabular-nums}
+.paused .ring-time{color:var(--label2)}
+.ring-sub{display:flex;justify-content:center;align-items:center;gap:5px;margin-top:8px;font-size:13px;color:var(--label2);min-height:18px;line-height:1.3}
+.ring-sub svg{flex:none}
+.round{position:absolute;bottom:0;width:62px;height:62px;border-radius:50%;border:0;font-size:13px;font-weight:500;cursor:default}
+.round:disabled{opacity:.4}
+.round.gray{left:2px;background:var(--fill2);color:var(--label)}
+.round.tint{right:2px;background:var(--accent-tint);color:var(--accent)}
+.round:not(:disabled):active{filter:brightness(.92)}
+
+/* ---------- settings window ---------- */
+.set-body{padding:4px 20px 22px}
+.sec-h{font-size:13px;font-weight:600;margin:16px 0 7px 2px}
+.foot{font-size:11px;color:var(--label2);margin:6px 2px 0;line-height:1.4}
+
+/* ---------- menu bar ---------- */
+.mb-area{width:460px;max-width:100%;height:270px;position:relative;font:13px/1.2 var(--sf)}
+.menubar{height:26px;border-radius:8px;background:var(--menubar);box-shadow:0 0 0 .5px var(--sep);display:flex;justify-content:flex-end;align-items:center;gap:4px;padding:0 10px;color:var(--label)}
+.mb-item{display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 7px;border-radius:5px;font-variant-numeric:tabular-nums}
+.mb-item.open{background:var(--fill2)}
+.menu{position:absolute;right:96px;top:31px;width:236px;padding:5px;border-radius:9px;background:var(--menu);box-shadow:var(--menu-edge),0 10px 30px rgba(0,0,0,.22)}
+.mi{display:flex;justify-content:space-between;width:100%;border:0;background:none;text-align:left;padding:3px 9px;border-radius:5px;font:13px/1.35 var(--sf);color:var(--label);cursor:default}
+.mi kbd{font:inherit;color:var(--label2)}
+.mi:hover,.mi:focus-visible{background:var(--accent);color:#fff;outline:none}
+.mi:hover kbd,.mi:focus-visible kbd{color:rgba(255,255,255,.8)}
+.mi-head{padding:5px 9px 2px;font-size:11px;font-weight:600;color:var(--label2)}
+.mi-info{padding:3px 9px;color:var(--label2);font-variant-numeric:tabular-nums}
+.msep{height:1px;background:var(--sep);margin:5px 9px}
+
+@media (max-width:1060px){.modes{grid-template-columns:1fr}.notes{grid-template-columns:1fr}}
+@media (max-width:520px){.page{padding:32px 12px}.mode{padding:20px 12px 28px}.menu{right:12px}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important}}
+</style>
+</head>
+<body>
+<main class="page">
+  <header class="head">
+    <div>
+      <h1>Nightcap</h1>
+      <p>Mac-native design in light and dark. Both columns run the same timer, so a change in one shows up in the other. Choose a length, then Start.</p>
+    </div>
+    <label class="fast"><button type="button" class="switch" role="switch" aria-checked="false" id="fast" style="--fill2:#D1D1D6;--knob:#fff;--accent:#5856D6"></button>Fast preview (60× speed)</label>
+  </header>
+
+  <div class="modes">
+    <section class="mode light" id="light" aria-label="Light appearance"><p class="mode-name">Light</p></section>
+    <section class="mode dark" id="dark" aria-label="Dark appearance"><p class="mode-name">Dark</p></section>
+  </div>
+
+  <section class="notes" aria-label="Design notes">
+    <div>
+      <h2>Colors</h2>
+      <table>
+        <tr><th></th><th>Light</th><th>Dark</th></tr>
+        <tr><td>Window</td><td><span class="chip" style="background:#F4F4F4"></span>#F4F4F4</td><td><span class="chip" style="background:#1F1F1F"></span>#1F1F1F</td></tr>
+        <tr><td>Group</td><td><span class="chip" style="background:#FFFFFF"></span>#FFFFFF</td><td><span class="chip" style="background:#2A2A2A"></span>#2A2A2A</td></tr>
+        <tr><td>Label</td><td><span class="chip" style="background:rgba(0,0,0,.85)"></span>black 85%</td><td><span class="chip" style="background:rgba(255,255,255,.88)"></span>white 88%</td></tr>
+        <tr><td>Secondary</td><td><span class="chip" style="background:rgba(0,0,0,.5)"></span>black 50%</td><td><span class="chip" style="background:rgba(255,255,255,.55)"></span>white 55%</td></tr>
+        <tr><td>Accent</td><td><span class="chip" style="background:#5856D6"></span>#5856D6</td><td><span class="chip" style="background:#5E5CE6"></span>#5E5CE6</td></tr>
+      </table>
+      <p style="font-size:13px;color:#6E6E73;margin:12px 0 0">The accent is Apple’s system indigo, the color macOS and iOS already use for Sleep.</p>
+    </div>
+    <div>
+      <h2>Type</h2>
+      <table class="scale">
+        <tr><td>Countdown</td><td>50 px, Ultralight, tabular figures</td></tr>
+        <tr><td>Body</td><td>13 px Regular</td></tr>
+        <tr><td>Window title</td><td>13 px Semibold</td></tr>
+        <tr><td>Segments</td><td>12 px Regular</td></tr>
+        <tr><td>Captions</td><td>11 px Regular, secondary</td></tr>
+      </table>
+      <p style="font-size:13px;color:#6E6E73;margin:12px 0 0">SF Pro on Mac. Inter on Windows and Linux, since SF Pro can’t be bundled outside Apple platforms.</p>
+    </div>
+    <div>
+      <h2>Building it in egui</h2>
+      <ul>
+        <li>Two <code>Visuals</code> built from the table, with <code>ThemePreference::System</code> so the app follows the OS appearance.</li>
+        <li>On Mac, use <code>with_fullsize_content_view</code> and a transparent title bar for the unified toolbar. Windows and Linux keep native title bars.</li>
+        <li>egui can’t turn on tabular figures, so lay out countdown digits in fixed-width cells to stop the time from jittering.</li>
+        <li>The ring is a <code>PathShape</code> arc sampled every few degrees. Settings is a second viewport opened with ⌘,.</li>
+        <li>The menu bar item uses <code>tray-icon</code> with a native <code>muda</code> menu, which follows light and dark by itself.</li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<script>
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
+const PRESETS=[15,30,45,60,90];
+const ACTIONS={
+  sleep:{label:'Sleep',going:'Going to sleep…',woke:'Woke from sleep'},
+  hibernate:{label:'Hibernate',going:'Hibernating…',woke:'Woke from hibernation'},
+  shutdown:{label:'Shut Down',going:'Shutting down…',woke:'Started up again'}
+};
+let simNow=Date.now(),speed=1;
+const fmtClock=ms=>new Date(ms).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+const fmtDur=s=>{s=Math.max(0,Math.ceil(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),r=s%60,p=n=>String(n).padStart(2,'0');return h?`${h}:${p(m)}:${p(r)}`:`${p(m)}:${p(r)}`};
+const minLabel=m=>m===60?'1 hour':m%60===0?`${m/60} hours`:`${m} minutes`;
+
+/* ---------- one timer, two appearances ---------- */
+const t=(()=>{
+  const ls=new Set();let total=0,rem=0,msgTimer;
+  const t={
+    state:'idle',minutes:45,custom:false,action:'sleep',restore:true,menuTitle:true,message:'',
+    screen:{on:true,before:20,length:15,min:10},
+    sound:{on:true,before:15,length:10,min:20},
+    on(f){ls.add(f);f()},emit(){ls.forEach(f=>f())},
+    get active(){return t.state==='running'||t.state==='paused'},
+    get total(){return t.state==='idle'?t.minutes*60:total},
+    get remaining(){return t.state==='idle'?t.minutes*60:rem},
+    setMinutes(m,custom){if(t.state!=='idle')return;t.minutes=clamp(Math.round(m),1,240);if(custom!==undefined)t.custom=custom;t.emit()},
+    start(){if(t.state!=='idle')return;t.state='running';total=rem=t.minutes*60;t.message='';t.emit()},
+    startWith(m){t.state='idle';t.minutes=m;t.custom=!PRESETS.includes(m);t.start()},
+    togglePause(){if(t.state==='running')t.state='paused';else if(t.state==='paused')t.state='running';t.emit()},
+    cancel(){if(!t.active)return;t.state='idle';t.say(t.restore?'Brightness and volume restored':'Timer canceled')},
+    add(m){if(!t.active)return;rem+=m*60;total+=m*60;t.emit()},
+    tick(sec){
+      if(t.state==='running'){rem-=sec;
+        if(rem<=0){rem=0;t.state='done';t.emit();
+          setTimeout(()=>{t.state='idle';t.say(ACTIONS[t.action].woke+(t.restore?'. Levels restored.':''))},2800);return}}
+      t.emit();
+    },
+    say(m){t.message=m;t.emit();clearTimeout(msgTimer);msgTimer=setTimeout(()=>{t.message='';t.emit()},4500)},
+    level(kind,remSec){
+      const f=t[kind];if(!f.on)return 100;
+      const r=remSec/60,before=Math.min(f.before,t.total/60),len=Math.min(f.length,before),end=before-len;
+      if(r>=before)return 100;if(r<=end||len<=0)return f.min;
+      return f.min+(100-f.min)*(r-end)/len;
+    },
+    levels(){
+      if(t.state==='idle')return{screen:100,sound:100};
+      if(t.state==='done')return{screen:t.level('screen',0),sound:t.level('sound',0)};
+      return{screen:t.level('screen',rem),sound:t.level('sound',rem)};
+    },
+    endMs(){return simNow+t.remaining*1000}
+  };
+  return t;
+})();
+function onKey(key,fn){let last;t.on(()=>{const k=key();if(k!==last){last=k;fn()}})}
+
+const ICON={
+  gear:'<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M2 4.5h7M12 4.5h2M2 11.5h2M7 11.5h7"/><circle cx="10.5" cy="4.5" r="1.6"/><circle cx="5.5" cy="11.5" r="1.6"/></svg>',
+  moon:'<svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M7.9 1.2a4.9 4.9 0 1 0 2.9 7.3A4 4 0 0 1 7.9 1.2z" fill="currentColor"/></svg>',
+  moonMb:'<svg width="15" height="15" viewBox="0 0 15 15" aria-hidden="true"><path d="M9.6 1.6a6 6 0 1 0 3.7 8.9A4.9 4.9 0 0 1 9.6 1.6z" fill="currentColor"/><path d="M11 2.5h2.5L11 5h2.5" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/></svg>',
+  up:'<svg width="7" height="4" viewBox="0 0 7 4" aria-hidden="true"><path d="M.8 3.4L3.5.8l2.7 2.6" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>',
+  down:'<svg width="7" height="4" viewBox="0 0 7 4" aria-hidden="true"><path d="M.8.6l2.7 2.6L6.2.6" fill="none" stroke="currentColor" stroke-width="1.1"/></svg>',
+  sunS:'<svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1" aria-hidden="true"><circle cx="6" cy="6" r="2"/><path d="M6 1v1M6 10v1M1 6h1M10 6h1"/></svg>',
+  sunL:'<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 .8v2M8 13.2v2M.8 8h2M13.2 8h2M2.9 2.9l1.4 1.4M11.7 11.7l1.4 1.4M2.9 13.1l1.4-1.4M11.7 4.3l1.4-1.4"/></svg>',
+  spkS:'<svg width="11" height="11" viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 4.3h2l3-2.5v8.4l-3-2.5h-2z" fill="currentColor"/></svg>',
+  spkL:'<svg width="17" height="15" viewBox="0 0 18 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M1.5 5.5h2.6l3.6-3v11l-3.6-3H1.5z" fill="currentColor" stroke="none"/><path d="M10.5 5.5a3.5 3.5 0 0 1 0 5M12.8 3.3a6.6 6.6 0 0 1 0 9.4"/></svg>',
+  cc:'<svg width="15" height="13" viewBox="0 0 16 14" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><rect x="1" y="1.5" width="14" height="4.5" rx="2.25"/><rect x="1" y="8" width="14" height="4.5" rx="2.25"/><circle cx="12.7" cy="3.75" r="1.2" fill="currentColor"/><circle cx="3.3" cy="10.25" r="1.2" fill="currentColor"/></svg>'
+};
+const opts=(list,sel,fmt,dis=()=>false)=>list.map(v=>`<option value="${v}" ${v===sel?'selected':''} ${dis(v)?'disabled':''}>${fmt(v)}</option>`).join('');
+const setSwitch=(el,on)=>el.setAttribute('aria-checked',on);
+const setRange=(el,v)=>{if(document.activeElement!==el)el.value=v;el.style.setProperty('--p',(el.value/el.max*100)+'%')};
+
+/* ---------- main window ---------- */
+function buildMain(host,px){
+  const C=2*Math.PI*102;
+  host.insertAdjacentHTML('beforeend',`<div class="surface">
+   <div class="mac-win" id="${px}-main">
+    <div class="toolbar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="tb-title">Nightcap</span><button type="button" class="tb-btn" data-gear aria-label="Settings">${ICON.gear}</button></div>
+    <div class="main-body">
+      <div class="ring-wrap">
+        <svg class="ring" viewBox="0 0 216 216" aria-hidden="true"><circle class="ring-track" cx="108" cy="108" r="102"/><circle class="ring-prog" cx="108" cy="108" r="102" stroke-dasharray="${C}" data-prog/></svg>
+        <div class="ring-center" role="timer" aria-live="off"><div class="ring-time" data-time></div><div class="ring-sub" data-sub></div></div>
+        <button type="button" class="round gray" data-cancel>Cancel</button>
+        <button type="button" class="round tint" data-primary>Start</button>
+      </div>
+      <div class="seg" role="radiogroup" aria-label="Timer length" data-seg>${PRESETS.map(m=>`<button type="button" role="radio" data-m="${m}" aria-label="${minLabel(m)}">${m} min</button>`).join('')}<button type="button" role="radio" data-m="custom">Custom</button></div>
+      <div class="group">
+        <div class="row" data-custom-row hidden><label for="${px}-len">Length</label><span class="stepper"><input type="number" id="${px}-len" min="1" max="240" data-len><span>min</span><span class="step-btns"><button type="button" data-inc="1" aria-label="One minute more">${ICON.up}</button><button type="button" data-inc="-1" aria-label="One minute less">${ICON.down}</button></span></span></div>
+        <div class="row"><label for="${px}-act">When finished</label><select class="pop" id="${px}-act" data-act>${opts(Object.keys(ACTIONS),t.action,k=>ACTIONS[k].label)}</select></div>
+        <div class="row"><span class="row-text"><span id="${px}-ds">Dim screen</span><span class="cap" data-cap="screen"></span></span><button type="button" class="switch" role="switch" data-fade="screen" aria-labelledby="${px}-ds"></button></div>
+        <div class="row"><span class="row-text"><span id="${px}-lv">Lower volume</span><span class="cap" data-cap="sound"></span></span><button type="button" class="switch" role="switch" data-fade="sound" aria-labelledby="${px}-lv"></button></div>
+      </div>
+    </div>
+   </div><p class="surface-cap">Main window</p></div>`);
+  const w=host.querySelector(`#${px}-main`),$=s=>w.querySelector(s);
+  w.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+    if(b.dataset.m){b.dataset.m==='custom'?t.setMinutes(t.minutes,true):t.setMinutes(+b.dataset.m,false)}
+    else if(b.dataset.inc)t.setMinutes(t.minutes+ +b.dataset.inc);
+    else if(b.dataset.fade){t[b.dataset.fade].on=!t[b.dataset.fade].on;t.emit()}
+    else if(b.hasAttribute('data-cancel'))t.cancel();
+    else if(b.hasAttribute('data-primary'))t.state==='idle'?t.start():t.togglePause();
+    else if(b.hasAttribute('data-gear')){const s=document.getElementById(px+'-set');s.scrollIntoView({behavior:'smooth',block:'center'});s.querySelector('button').focus({preventScroll:true})}
+  });
+  $('[data-act]').addEventListener('change',e=>{t.action=e.target.value;t.emit()});
+  $('[data-len]').addEventListener('change',e=>t.setMinutes(+e.target.value||1));
+  t.on(()=>{
+    const lv=t.levels(),idle=t.state==='idle';
+    $('[data-time]').textContent=fmtDur(t.remaining);
+    $('[data-prog]').style.strokeDashoffset=C*(1-(idle?1:t.remaining/Math.max(t.total,1)));
+    w.classList.toggle('paused',t.state==='paused');
+    $('[data-sub]').innerHTML=t.message?t.message:t.state==='done'?ACTIONS[t.action].going:t.state==='paused'?'Paused':`${ICON.moon}<span>${fmtClock(t.endMs())}</span>`;
+    $('[data-cancel]').disabled=!t.active;
+    const p=$('[data-primary]');p.textContent=idle||t.state==='done'?'Start':t.state==='paused'?'Resume':'Pause';p.disabled=t.state==='done';
+    $('[data-seg]').setAttribute('aria-disabled',!idle);
+    w.querySelectorAll('[data-m]').forEach(b=>setSwitch(b,b.dataset.m==='custom'?t.custom:(!t.custom&&+b.dataset.m===t.minutes)));
+    $('[data-custom-row]').hidden=!t.custom;
+    const len=$('[data-len]');if(document.activeElement!==len)len.value=t.minutes;
+    const act=$('[data-act]');if(act.value!==t.action)act.value=t.action;
+    ['screen','sound'].forEach(k=>{const f=t[k];setSwitch($(`[data-fade=${k}]`),f.on);
+      const fading=t.active&&lv[k]<100;
+      $(`[data-cap=${k}]`).textContent=!f.on?'Off':fading?`Now ${Math.round(lv[k])}%, going to ${f.min}%`:`To ${f.min}%, starting ${f.before} min before`});
+  });
+}
+
+/* ---------- settings window ---------- */
+function fadeGroup(px,kind,{title,toggle,start,over,to,iconS,iconL,foot}){
+  return `<h3 class="sec-h">${title}</h3>
+  <div class="group" data-kind="${kind}">
+    <div class="row"><span id="${px}-${kind}-on">${toggle}</span><button type="button" class="switch" role="switch" data-on aria-labelledby="${px}-${kind}-on"></button></div>
+    <div class="row dep"><label for="${px}-${kind}-b">${start}</label><select class="pop" id="${px}-${kind}-b" data-f="before"></select></div>
+    <div class="row dep"><label for="${px}-${kind}-l">${over}</label><select class="pop" id="${px}-${kind}-l" data-f="length"></select></div>
+    <div class="row dep"><label for="${px}-${kind}-m">${to}</label><span class="slider">${iconS}<input type="range" id="${px}-${kind}-m" min="0" max="90" step="5" data-f="min">${iconL}<output data-o></output></span></div>
+  </div>${foot?`<p class="foot">${foot}</p>`:''}`;
+}
+function buildSettings(host,px){
+  host.insertAdjacentHTML('beforeend',`<div class="surface">
+   <div class="mac-win set-win" id="${px}-set">
+    <div class="toolbar"><span class="lights" aria-hidden="true"><i></i><i></i><i></i></span><span class="tb-title">Settings</span><span></span></div>
+    <div class="set-body">
+      ${fadeGroup(px,'screen',{title:'Screen brightness',toggle:'Dim screen before sleep',start:'Start dimming',over:'Dim over',to:'Dim to',iconS:ICON.sunS,iconL:ICON.sunL,
+        foot:'This display doesn’t support brightness control. Nightcap will dim it with an overlay instead.'})}
+      ${fadeGroup(px,'sound',{title:'Volume',toggle:'Lower volume before sleep',start:'Start lowering',over:'Lower over',to:'Lower to',iconS:ICON.spkS,iconL:ICON.spkL})}
+      <h3 class="sec-h">When the timer ends</h3>
+      <div class="group">
+        <div class="row"><label for="${px}-action">Action</label><select class="pop" id="${px}-action" data-action>${opts(Object.keys(ACTIONS),t.action,k=>ACTIONS[k].label)}</select></div>
+        <div class="row"><span id="${px}-rs">Restore brightness and volume after canceling or waking</span><button type="button" class="switch" role="switch" data-restore aria-labelledby="${px}-rs"></button></div>
+      </div>
+      <h3 class="sec-h">Menu bar</h3>
+      <div class="group"><div class="row"><span id="${px}-mt">Show time remaining in the menu bar</span><button type="button" class="switch" role="switch" data-menutitle aria-labelledby="${px}-mt"></button></div></div>
+    </div>
+   </div><p class="surface-cap">Settings (⌘,)</p></div>`);
+  const w=host.querySelector(`#${px}-set`);
+  const BEFORE=[5,10,15,20,30,45,60],LEN=[1,5,10,15,20,30,45,60];
+  w.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+    const g=b.closest('[data-kind]');
+    if(b.hasAttribute('data-on')){t[g.dataset.kind].on=!t[g.dataset.kind].on}
+    else if(b.hasAttribute('data-restore'))t.restore=!t.restore;
+    else if(b.hasAttribute('data-menutitle'))t.menuTitle=!t.menuTitle;
+    else return;t.emit()});
+  w.addEventListener('change',e=>{const el=e.target,g=el.closest('[data-kind]');
+    if(el.dataset.action!==undefined){t.action=el.value}
+    else if(g&&el.dataset.f==='before'){const f=t[g.dataset.kind];f.before=+el.value;if(f.length>f.before)f.length=Math.max(...LEN.filter(v=>v<=f.before))}
+    else if(g&&el.dataset.f==='length'){t[g.dataset.kind].length=+el.value}
+    else return;t.emit()});
+  w.addEventListener('input',e=>{const g=e.target.closest('[data-kind]');if(g&&e.target.dataset.f==='min'){t[g.dataset.kind].min=+e.target.value;t.emit()}});
+  let sig='';
+  t.on(()=>{
+    w.querySelectorAll('[data-kind]').forEach(g=>{const f=t[g.dataset.kind];
+      g.classList.toggle('off',!f.on);setSwitch(g.querySelector('[data-on]'),f.on);
+      const r=g.querySelector('[data-f=min]');setRange(r,f.min);g.querySelector('[data-o]').textContent=f.min+'%'});
+    const s=JSON.stringify([t.screen.before,t.screen.length,t.sound.before,t.sound.length]);
+    if(s!==sig){sig=s;w.querySelectorAll('[data-kind]').forEach(g=>{const f=t[g.dataset.kind];
+      g.querySelector('[data-f=before]').innerHTML=opts(BEFORE,f.before,v=>`${v} minutes before`);
+      g.querySelector('[data-f=length]').innerHTML=opts(LEN,f.length,v=>v===1?'1 minute':`${v} minutes`,v=>v>f.before)})}
+    const a=w.querySelector('[data-action]');if(a.value!==t.action)a.value=t.action;
+    setSwitch(w.querySelector('[data-restore]'),t.restore);setSwitch(w.querySelector('[data-menutitle]'),t.menuTitle);
+  });
+}
+
+/* ---------- menu bar ---------- */
+function buildMenuBar(host,px){
+  host.insertAdjacentHTML('beforeend',`<div class="surface">
+   <div class="mb-area" id="${px}-mb">
+    <div class="menubar"><span class="mb-item open">${ICON.moonMb}<span data-title></span></span><span class="mb-item">${ICON.cc}</span><span class="mb-item" data-clock></span></div>
+    <div class="menu" role="menu" aria-label="Nightcap menu"><div data-items></div><div class="msep"></div>
+      <button type="button" class="mi" role="menuitem" data-open>Open Nightcap</button>
+      <button type="button" class="mi" role="menuitem" data-settings>Settings…<kbd>⌘,</kbd></button>
+      <div class="msep"></div>
+      <button type="button" class="mi" role="menuitem" data-quit>Quit Nightcap<kbd>⌘Q</kbd></button></div>
+   </div><p class="surface-cap">Menu bar</p></div>`);
+  const w=host.querySelector(`#${px}-mb`),items=w.querySelector('[data-items]');
+  onKey(()=>t.state,()=>{
+    items.innerHTML=t.active
+      ?`<div class="mi-info" data-info></div><div class="msep"></div>
+        <button type="button" class="mi" role="menuitem" data-pause>${t.state==='paused'?'Resume Timer':'Pause Timer'}</button>
+        <button type="button" class="mi" role="menuitem" data-add>Add 15 Minutes</button>
+        <button type="button" class="mi" role="menuitem" data-cancel>Cancel Timer</button>`
+      :`<div class="mi-head">Start Timer</div>`+PRESETS.map(m=>`<button type="button" class="mi" role="menuitem" data-start="${m}">${m===60?'1 Hour':m+' Minutes'}</button>`).join('');
+  });
+  w.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;
+    if(b.dataset.start){if(t.state!=='done')t.startWith(+b.dataset.start)}
+    else if(b.hasAttribute('data-pause'))t.togglePause();
+    else if(b.hasAttribute('data-add'))t.add(15);
+    else if(b.hasAttribute('data-cancel'))t.cancel();
+    else if(b.hasAttribute('data-open')||b.hasAttribute('data-settings')){
+      const s=document.getElementById(px+(b.hasAttribute('data-open')?'-main':'-set'));s.scrollIntoView({behavior:'smooth',block:'center'});s.querySelector('button').focus({preventScroll:true})}
+  });
+  t.on(()=>{
+    w.querySelector('[data-title]').textContent=t.active&&t.menuTitle?fmtDur(t.remaining):'';
+    w.querySelector('[data-clock]').textContent=new Date(simNow).toLocaleString('en-US',{weekday:'short',hour:'numeric',minute:'2-digit'}).replace(',','');
+    const info=w.querySelector('[data-info]');
+    if(info)info.textContent=t.state==='paused'?`Paused, ${fmtDur(t.remaining)} left`:`${ACTIONS[t.action].label} at ${fmtClock(t.endMs())}`;
+  });
+}
+
+['light','dark'].forEach(px=>{const host=document.getElementById(px);buildMain(host,px);buildSettings(host,px);buildMenuBar(host,px)});
+let last=performance.now();
+setInterval(()=>{const now=performance.now(),dt=(now-last)/1000;last=now;simNow+=dt*1000*speed;t.tick(dt*speed)},200);
+const fast=document.getElementById('fast');
+fast.addEventListener('click',()=>{speed=speed===1?60:1;setSwitch(fast,speed!==1)});
+</script>
+</body>
+</html>
