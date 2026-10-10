@@ -531,6 +531,7 @@ pub fn backends() -> Backends {
         brightness,
         volume,
         power: Box::new(MacPower),
+        hibernate_supported: false,
     }
 }
 

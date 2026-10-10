@@ -2,9 +2,9 @@
 
 use eframe::egui::{self, Id, Margin, Vec2};
 
-use crate::settings::{BEFORE_MINUTES, EndAction, FadeSettings, OVER_MINUTES, Settings};
+use crate::settings::{BEFORE_MINUTES, FadeSettings, OVER_MINUTES, Settings};
 
-use super::main_window::end_action_label;
+use super::main_window::{end_action_choices, end_action_label};
 use super::widgets::{self, Choice, MeterKind};
 
 pub fn show(
@@ -13,6 +13,7 @@ pub fn show(
     settings: &mut Settings,
     brightness_supported: bool,
     volume_supported: bool,
+    hibernate_supported: bool,
 ) -> bool {
     // Register at launch, even while hidden. eframe cannot create an immediate
     // viewport in every event-loop phase used to reopen the root from the tray.
@@ -43,8 +44,13 @@ pub fn show(
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            changed |=
-                                settings_body(ui, settings, brightness_supported, volume_supported);
+                            changed |= settings_body(
+                                ui,
+                                settings,
+                                brightness_supported,
+                                volume_supported,
+                                hibernate_supported,
+                            );
                         });
                 });
         },
@@ -60,6 +66,7 @@ fn settings_body(
     settings: &mut Settings,
     brightness_supported: bool,
     volume_supported: bool,
+    hibernate_supported: bool,
 ) -> bool {
     let mut changed = false;
     egui::Frame::NONE
@@ -114,23 +121,7 @@ fn settings_body(
                         ui,
                         |ui| widgets::body(ui, "Action"),
                         |ui| {
-                            let choices = [
-                                Choice {
-                                    label: "Sleep",
-                                    value: EndAction::Sleep,
-                                    enabled: true,
-                                },
-                                Choice {
-                                    label: "Hibernate",
-                                    value: EndAction::Hibernate,
-                                    enabled: true,
-                                },
-                                Choice {
-                                    label: "Shut Down",
-                                    value: EndAction::Shutdown,
-                                    enabled: true,
-                                },
-                            ];
+                            let choices = end_action_choices(hibernate_supported);
                             if let Some(action) = widgets::popup_select(
                                 ui,
                                 Id::new("settings-end-action"),
@@ -373,4 +364,31 @@ fn footnote(ui: &mut egui::Ui, text: &str) {
 
 pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("nightcap-settings")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::EndAction;
+
+    #[test]
+    fn end_action_menu_only_offers_hibernate_when_available() {
+        for (supported, expected) in [
+            (false, vec![EndAction::Sleep, EndAction::Shutdown]),
+            (
+                true,
+                vec![EndAction::Sleep, EndAction::Hibernate, EndAction::Shutdown],
+            ),
+        ] {
+            let choices = end_action_choices(supported);
+            assert_eq!(
+                choices
+                    .iter()
+                    .map(|choice| choice.value)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(choices.iter().all(|choice| choice.enabled));
+        }
+    }
 }

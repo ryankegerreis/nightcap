@@ -53,7 +53,8 @@ window is hidden and egui is not repainting. It owns the platform backends.
 - Shared snapshot (`Arc<Mutex<Snapshot>>`): `state: Idle | Running | Paused | Finishing`,
   `total`, `remaining`, `ends_at` (wall clock, for "10:20 PM"), current brightness /
   volume percent applied, `overlay_alpha: f32` (0 = no overlay), backend capability flags
-  (`brightness_supported`, `volume_supported`), last error string.
+  (`brightness_supported`, `volume_supported`, `hibernate_supported`), last error string.
+  Hibernate availability is checked once at startup and includes permission to request it.
 - Ticks about every 250 ms. Uses `Instant` for remaining time; captures original
   brightness/volume when a fade begins and restores them on Cancel (if the restore
   setting is on), and after the end action when the machine wakes (detect a wall-clock

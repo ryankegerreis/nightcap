@@ -240,6 +240,7 @@ impl eframe::App for NightcapApp {
                 &mut self.settings,
                 snapshot.brightness_supported,
                 snapshot.volume_supported,
+                snapshot.hibernate_supported,
             );
             return;
         }
@@ -302,6 +303,7 @@ impl eframe::App for NightcapApp {
             &mut self.settings,
             snapshot.brightness_supported,
             snapshot.volume_supported,
+            snapshot.hibernate_supported,
         ) {
             settings_changed = true;
         }

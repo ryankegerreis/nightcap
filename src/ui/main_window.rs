@@ -249,7 +249,7 @@ fn options_group(
                 ui,
                 |ui| widgets::body(ui, "When finished"),
                 |ui| {
-                    let choices = end_action_choices();
+                    let choices = end_action_choices(snapshot.hibernate_supported);
                     if let Some(action) = widgets::popup_select(
                         ui,
                         Id::new("nightcap-end-action"),
@@ -451,24 +451,16 @@ pub fn end_action_progress(action: EndAction) -> &'static str {
     }
 }
 
-fn end_action_choices() -> [Choice<'static, EndAction>; 3] {
-    [
-        Choice {
-            label: "Sleep",
-            value: EndAction::Sleep,
+pub(super) fn end_action_choices(hibernate_supported: bool) -> Vec<Choice<'static, EndAction>> {
+    [EndAction::Sleep, EndAction::Hibernate, EndAction::Shutdown]
+        .into_iter()
+        .filter(|action| *action != EndAction::Hibernate || hibernate_supported)
+        .map(|action| Choice {
+            label: end_action_label(action),
+            value: action,
             enabled: true,
-        },
-        Choice {
-            label: "Hibernate",
-            value: EndAction::Hibernate,
-            enabled: true,
-        },
-        Choice {
-            label: "Shut Down",
-            value: EndAction::Shutdown,
-            enabled: true,
-        },
-    ]
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -477,6 +469,23 @@ mod tests {
     use chrono::TimeZone;
 
     fn frame(ctx: &egui::Context, events: Vec<egui::Event>, duration: &mut u32) -> MainOutcome {
+        frame_with_settings(
+            ctx,
+            events,
+            duration,
+            &Snapshot::default(),
+            &mut Settings::default(),
+        )
+        .0
+    }
+
+    fn frame_with_settings(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        duration: &mut u32,
+        snapshot: &Snapshot,
+        settings: &mut Settings,
+    ) -> (MainOutcome, egui::FullOutput) {
         let mut fonts = egui::FontDefinitions::default();
         fonts.families.insert(
             egui::FontFamily::Name("countdown".into()),
@@ -484,7 +493,6 @@ mod tests {
         );
         ctx.set_fonts(fonts);
         let mut outcome = None;
-        let mut settings = Settings::default();
         let mut custom = true;
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -497,8 +505,8 @@ mod tests {
                 outcome = Some(show(
                     ui,
                     MainView {
-                        snapshot: &Snapshot::default(),
-                        settings: &mut settings,
+                        snapshot,
+                        settings,
                         duration_min: duration,
                         custom: &mut custom,
                         notice: None,
@@ -507,8 +515,57 @@ mod tests {
             },
         );
         output.textures_delta.clear();
-        drop(output);
-        outcome.unwrap()
+        (outcome.unwrap(), output)
+    }
+
+    fn text_position(output: &egui::FullOutput, label: &str) -> Option<Pos2> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == label => {
+                Some(text.pos + text.galley.size() / 2.0)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn main_menu_hides_unavailable_hibernate_and_selects_it_when_available() {
+        for supported in [false, true] {
+            let ctx = egui::Context::default();
+            let snapshot = Snapshot {
+                hibernate_supported: supported,
+                ..Default::default()
+            };
+            let mut settings = Settings::default();
+            let mut duration = 45;
+            let mut render =
+                |events| frame_with_settings(&ctx, events, &mut duration, &snapshot, &mut settings);
+            render(vec![]);
+            let (_, output) = render(vec![]);
+            let sleep = text_position(&output, "Sleep").expect("main-window action picker");
+            let pointer = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            render(vec![egui::Event::PointerMoved(sleep), pointer(sleep, true)]);
+            render(vec![pointer(sleep, false)]);
+            let (_, output) = render(vec![]);
+            assert!(
+                text_position(&output, "Shut Down").is_some(),
+                "action menu is open"
+            );
+            let hibernate = text_position(&output, "Hibernate");
+            assert_eq!(hibernate.is_some(), supported);
+            if let Some(pos) = hibernate {
+                render(vec![egui::Event::PointerMoved(pos), pointer(pos, true)]);
+                let (outcome, _) = render(vec![pointer(pos, false)]);
+                assert!(outcome.settings_changed);
+                assert_eq!(settings.end_action, EndAction::Hibernate);
+            } else {
+                assert_eq!(settings.end_action, EndAction::Sleep);
+            }
+        }
     }
 
     #[test]

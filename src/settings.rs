@@ -74,6 +74,15 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Keep the selected action consistent with this machine's startup capabilities.
+    pub fn apply_hibernate_availability(&mut self, supported: bool) -> bool {
+        if self.end_action == EndAction::Hibernate && !supported {
+            self.end_action = EndAction::Sleep;
+            return true;
+        }
+        false
+    }
+
     fn normalize(&mut self) {
         for fade in [&mut self.dim, &mut self.volume] {
             fade.target_percent = fade.target_percent.min(100);

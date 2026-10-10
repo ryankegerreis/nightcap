@@ -20,6 +20,7 @@ pub fn backends() -> Backends {
         brightness: None,
         volume: None,
         power: Box::new(UnsupportedPower),
+        hibernate_supported: false,
     }
 }
 

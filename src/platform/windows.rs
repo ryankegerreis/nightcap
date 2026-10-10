@@ -30,12 +30,13 @@ use windows::{
                 CoInitializeEx, CoInitializeSecurity, CoSetProxyBlanket, CoUninitialize, EOAC_NONE,
                 RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
             },
-            Power::SetSuspendState,
+            Power::{GetPwrCapabilities, SYSTEM_POWER_CAPABILITIES, SetSuspendState},
             Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE},
             Shutdown::{
                 EWX_POWEROFF, EWX_SHUTDOWN, ExitWindowsEx, SHTDN_REASON_FLAG_PLANNED,
                 SHTDN_REASON_MAJOR_APPLICATION,
             },
+            SystemServices::HIBERFILE_TYPE_FULL,
             Threading::{GetCurrentProcess, OpenProcessToken},
             Variant::{VARIANT, VT_I4, VT_UI1, VariantClear, VariantToString, VariantToUInt32},
             Wmi::{
@@ -568,6 +569,35 @@ impl Drop for ShutdownPrivilege {
 
 struct WindowsPower;
 
+fn hibernate_supported() -> bool {
+    let mut capabilities = SYSTEM_POWER_CAPABILITIES::default();
+    // SAFETY: capabilities is a valid, writable output structure; this only reads OS state.
+    if !unsafe { GetPwrCapabilities(&mut capabilities) } {
+        log::debug!(
+            "Hibernate capability check failed: {}",
+            windows::core::Error::from_thread()
+        );
+        return false;
+    }
+    if !hibernation_configured(&capabilities) {
+        return false;
+    }
+    // The guard immediately restores the token's previous privileges. No power action runs.
+    match ShutdownPrivilege::enable() {
+        Ok(_privilege) => true,
+        Err(error) => {
+            log::debug!("Hibernate privilege is unavailable: {error:#}");
+            false
+        }
+    }
+}
+
+fn hibernation_configured(capabilities: &SYSTEM_POWER_CAPABILITIES) -> bool {
+    capabilities.SystemS4
+        && capabilities.HiberFilePresent
+        && u32::from(capabilities.HiberFileType) == HIBERFILE_TYPE_FULL
+}
+
 impl Power for WindowsPower {
     fn perform(&mut self, action: EndAction) -> Result<()> {
         let _privilege = ShutdownPrivilege::enable()?;
@@ -613,5 +643,33 @@ pub fn backends() -> Backends {
         brightness,
         volume,
         power: Box::new(WindowsPower),
+        hibernate_supported: hibernate_supported(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::SystemServices::{HIBERFILE_TYPE_NONE, HIBERFILE_TYPE_REDUCED};
+
+    #[test]
+    fn hibernate_requires_s4_and_a_full_hibernation_file() {
+        let mut capabilities = SYSTEM_POWER_CAPABILITIES {
+            SystemS4: true,
+            HiberFilePresent: true,
+            HiberFileType: HIBERFILE_TYPE_FULL as u8,
+            ..Default::default()
+        };
+        assert!(hibernation_configured(&capabilities));
+        capabilities.SystemS4 = false;
+        assert!(!hibernation_configured(&capabilities));
+        capabilities.SystemS4 = true;
+        capabilities.HiberFilePresent = false;
+        assert!(!hibernation_configured(&capabilities));
+        capabilities.HiberFilePresent = true;
+        for file_type in [HIBERFILE_TYPE_NONE, HIBERFILE_TYPE_REDUCED, 255] {
+            capabilities.HiberFileType = file_type as u8;
+            assert!(!hibernation_configured(&capabilities));
+        }
     }
 }
