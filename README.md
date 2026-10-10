@@ -13,7 +13,8 @@ Nightcap is built in Rust with [egui](https://github.com/emilk/egui) and runs on
 - **Sleep timer:** pick 15, 30, 45, 60 or 90 minutes, or set your own length.
 - **Screen fade:** dim the screen to a level you choose, starting when you choose, over as long as you choose.
 - **Volume fade:** lower the volume the same way, set up separately from the screen fade.
-- **When the timer ends:** sleep, hibernate or shut down.
+- **When the timer ends:** sleep, hibernate or shut down. Hibernate is shown only
+  when a startup check confirms that this machine supports it and the app can request it.
 - **Restore:** put brightness and volume back when you cancel the timer or wake the computer.
 - **Menu bar and system tray:** start, pause, resume, extend and cancel timers without opening the window. Closing the window keeps the timer running; Open Nightcap brings it back. Quit restores faded levels when restoration is enabled.
 - **Overlay fallback:** on displays that don't support brightness control, dim the root window’s monitor with a passive, transparent overlay. It keeps updating while the main window is hidden.
@@ -71,15 +72,18 @@ menu-bar-only app when the window closes. The menu’s Open Nightcap restores an
 focuses the window. Cmd-W hides the main window (or closes Settings); Cmd-Q and
 Quit Nightcap exit gracefully. Brightness uses DisplayServices on the primary
 display, with an overlay fallback for unsupported displays. Volume uses
-CoreAudio, with an AppleScript fallback. Hibernate requests sleep because macOS
+CoreAudio, with an AppleScript fallback. Hibernate is hidden because macOS
 has no public user-level hibernate action. Shutdown can prompt for Automation
 permission to control System Events; allow it in System Settings → Privacy &
 Security → Automation. The timer itself requires no Accessibility permission.
 
-On Windows, volume uses the default CoreAudio endpoint. Brightness uses WMI for
-supported built-in panels and DDC/CI for supported external monitors. Native
+Windows support targets Windows 10 or later. Volume uses the default CoreAudio
+endpoint. Brightness uses WMI for supported built-in panels and DDC/CI for supported
+external monitors. Native
 window decorations and the notification-area tray are retained. Power actions
-depend on Windows privileges and hibernation configuration.
+depend on Windows privileges and hibernation configuration. Hibernate is offered
+only when Windows reports S4 support, a full hibernation file, and access to the
+required shutdown privilege; a reduced Fast Startup file is insufficient.
 
 On Linux, the tray needs a D-Bus session with a StatusNotifier host (for example
 KDE Plasma, or a compatible GNOME extension). If tray initialization fails,
@@ -87,7 +91,9 @@ closing the main window quits instead of leaving an inaccessible background
 process. Brightness needs a supported `/sys/class/backlight` device and access
 through writable sysfs, logind’s SetBrightness, or `brightnessctl`; otherwise the
 overlay is used. Volume tries `wpctl`, `pactl`, then `amixer`. Power actions use
-systemd/logind and remain subject to the session’s polkit permissions. Overlay
+systemd/logind and remain subject to the session’s polkit permissions. Hibernate
+is offered only when logind's CanHibernate check returns yes, allowing it without
+an authorization prompt. Failed or unavailable checks keep the option hidden. Overlay
 placement depends on the window manager; Wayland can select a different output.
 
 The overlay covers one monitor, is always on top, and lets mouse input pass
@@ -97,6 +103,11 @@ the overlay disappears when the app exits. Restoration after sleep uses native
 macOS wake notifications and a wall-clock gap of more than 5 seconds after the
 end action (30 seconds while the timer is running or paused). Real power actions
 and Windows/Linux desktop behavior require testing on the corresponding systems.
+
+Capability checks run once when the app launches. If a saved Hibernate preference
+is unavailable, Nightcap changes it to Sleep. Restart Nightcap after changing
+hibernation configuration or permissions. The OS can still reject a power action
+if its configuration or permissions change after startup.
 
 ## License
 

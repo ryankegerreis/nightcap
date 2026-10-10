@@ -14,8 +14,14 @@ use nightcap::{
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-    let settings = Settings::load();
+    let mut settings = Settings::load();
     let mut backends = platform::backends();
+    if settings.apply_hibernate_availability(backends.hibernate_supported) {
+        log::warn!("Hibernate is unavailable on this machine; using Sleep instead");
+        if let Err(error) = settings.save() {
+            log::warn!("Could not save the fallback end action: {error:#}");
+        }
+    }
     if std::env::var("NIGHTCAP_DRY_RUN").as_deref() == Ok("1") {
         log::warn!("Dry run enabled: brightness/volume fades are real, power actions are disabled");
         backends.power = Box::new(platform::DryRunPower);

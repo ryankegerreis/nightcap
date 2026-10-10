@@ -116,6 +116,7 @@ pub struct Snapshot {
     pub overlay_alpha: f32,
     pub brightness_supported: bool,
     pub volume_supported: bool,
+    pub hibernate_supported: bool,
     pub last_error: Option<String>,
 }
 
@@ -263,10 +264,12 @@ impl<C: Clock + 'static> Engine<C> {
 }
 
 impl<C: Clock> Engine<C> {
-    pub fn new(settings: Settings, backends: Backends, clock: C) -> Self {
+    pub fn new(mut settings: Settings, backends: Backends, clock: C) -> Self {
+        settings.apply_hibernate_availability(backends.hibernate_supported);
         let snapshot = Snapshot {
             brightness_supported: backends.brightness.is_some(),
             volume_supported: backends.volume.is_some(),
+            hibernate_supported: backends.hibernate_supported,
             ..Snapshot::default()
         };
         let last_time = clock.now();
@@ -322,7 +325,10 @@ impl<C: Clock> Engine<C> {
                 self.snapshot.remaining = self.snapshot.remaining.saturating_add(extra);
             }
             // Retain captured originals, and never raise an already faded level.
-            Command::UpdateSettings(settings) => self.settings = settings,
+            Command::UpdateSettings(mut settings) => {
+                settings.apply_hibernate_availability(self.snapshot.hibernate_supported);
+                self.settings = settings;
+            }
             Command::Shutdown => {
                 self.cancel();
                 self.publish();
@@ -629,8 +635,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unavailable_saved_hibernate_falls_back_to_sleep() {
+        let mut settings = preferences();
+        settings.end_action = EndAction::Hibernate;
+        let mut h = Harness::new(settings, true);
+        assert!(!h.engine.snapshot().hibernate_supported);
+        h.start();
+        h.advance(180);
+        assert_eq!(h.power.state.lock().unwrap().calls, vec![EndAction::Sleep]);
+    }
+
+    #[test]
+    fn unavailable_hibernate_cannot_be_reintroduced_by_settings_updates() {
+        let mut h = Harness::new(preferences(), true);
+        let mut settings = preferences();
+        settings.end_action = EndAction::Hibernate;
+        h.engine.command(Command::UpdateSettings(settings));
+        h.start();
+        h.advance(180);
+        assert_eq!(h.power.state.lock().unwrap().calls, vec![EndAction::Sleep]);
+    }
+
+    #[test]
+    fn available_saved_hibernate_remains_selected_and_executes() {
+        let mut settings = preferences();
+        settings.end_action = EndAction::Hibernate;
+        let mut h = Harness::with_hibernate(settings, true, true);
+        assert!(h.engine.snapshot().hibernate_supported);
+        h.start();
+        h.advance(180);
+        assert_eq!(
+            h.power.state.lock().unwrap().calls,
+            vec![EndAction::Hibernate]
+        );
+    }
+
     impl Harness {
         fn new(settings: Settings, brightness_supported: bool) -> Self {
+            Self::with_hibernate(settings, brightness_supported, false)
+        }
+
+        fn with_hibernate(
+            settings: Settings,
+            brightness_supported: bool,
+            hibernate_supported: bool,
+        ) -> Self {
             let clock = FakeClock::new();
             let brightness = MockBrightness::new(0.8);
             let volume = MockVolume::new(0.6);
@@ -640,6 +690,7 @@ mod tests {
                     .then(|| Box::new(brightness.clone()) as Box<dyn crate::platform::Brightness>),
                 volume: Some(Box::new(volume.clone())),
                 power: Box::new(power.clone()),
+                hibernate_supported,
             };
             let engine = Engine::new(settings, backends, clock.clone());
             Self {
@@ -773,7 +824,7 @@ mod tests {
 
     #[test]
     fn settings_changes_apply_without_losing_originals_or_raising_levels() {
-        let mut h = Harness::new(preferences(), true);
+        let mut h = Harness::with_hibernate(preferences(), true, true);
         h.start();
         h.advance(90);
         let mut settings = preferences();
@@ -1143,6 +1194,7 @@ mod tests {
                 brightness: Some(Box::new(brightness.clone())),
                 volume: Some(Box::new(volume.clone())),
                 power: Box::new(power.clone()),
+                hibernate_supported: false,
             },
             Box::new(move || {
                 let _ = repaint_sender.send(());
@@ -1176,6 +1228,7 @@ mod tests {
                 brightness: None,
                 volume: None,
                 power: Box::new(power.clone()),
+                hibernate_supported: false,
             },
             SpeedClock::new(clock.clone(), 60.0).unwrap(),
         );

@@ -296,6 +296,33 @@ impl Brightness for LinuxBrightness {
 
 struct LinuxPower;
 
+fn hibernate_supported() -> bool {
+    match command(
+        "busctl",
+        &[
+            "--system",
+            "--timeout=5",
+            "--allow-interactive-authorization=no",
+            "call",
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            "CanHibernate",
+        ],
+    ) {
+        Ok(output) => logind_allows_hibernate(&output),
+        Err(error) => {
+            log::debug!("Hibernate capability check failed: {error:#}");
+            false
+        }
+    }
+}
+
+fn logind_allows_hibernate(output: &str) -> bool {
+    // "challenge" requires authentication and cannot be used unattended by the timer.
+    output.trim() == "s \"yes\""
+}
+
 impl Power for LinuxPower {
     fn perform(&mut self, action: EndAction) -> Result<()> {
         let (verb, method) = match action {
@@ -359,12 +386,32 @@ pub fn backends() -> Backends {
         brightness,
         volume,
         power: Box::new(LinuxPower),
+        hibernate_supported: hibernate_supported(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hibernate_requires_logind_to_allow_it_without_authentication() {
+        assert!(logind_allows_hibernate("s \"yes\"\n"));
+        for output in [
+            "s \"no\"",
+            "s \"na\"",
+            "s \"challenge\"",
+            "s \"inhibited\"",
+            "s \"inhibitor-blocked\"",
+            "s \"challenge-inhibitor-blocked\"",
+            "",
+            "yes",
+            "b true",
+            "s \"yes\" garbage",
+        ] {
+            assert!(!logind_allows_hibernate(output), "{output:?}");
+        }
+    }
 
     #[test]
     fn backlight_baselines_refresh_only_on_get_and_restore_each_device() {

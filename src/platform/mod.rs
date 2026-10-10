@@ -41,6 +41,8 @@ pub struct Backends {
     pub brightness: Option<Box<dyn Brightness>>,
     pub volume: Option<Box<dyn Volume>>,
     pub power: Box<dyn Power>,
+    /// Checked once at startup, including permission to request hibernation.
+    pub hibernate_supported: bool,
 }
 
 pub fn backends() -> Backends {
