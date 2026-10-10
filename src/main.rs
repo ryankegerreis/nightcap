@@ -1,6 +1,9 @@
 //! Nightcap: a sleep timer that dims the screen and lowers the volume
 //! before putting the computer to sleep.
 
+// Release builds on Windows run without a console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::{sync::Arc, time::Duration};
 
 use eframe::egui;

@@ -59,6 +59,29 @@ than `cargo run` when you want it to appear as itself: macOS lists a bare binary
 under the app that launched it (your terminal or editor). The icon source is
 `assets/AppIcon.png`, drawn by `scripts/make-icon.swift`.
 
+## Releasing
+
+Pushing a version tag builds and publishes a GitHub release
+(`.github/workflows/release.yml`):
+
+```sh
+# bump version in Cargo.toml, commit, then:
+git tag v0.1.0
+git push origin master v0.1.0
+```
+
+The workflow checks that the tag matches `Cargo.toml`, runs the tests on each
+platform, and uploads `Nightcap-macOS.dmg` (universal), `Nightcap-Windows-x64.zip`
+and `Nightcap-Linux-x86_64.tar.gz`. Tags with a hyphen (`v0.2.0-beta.1`) become
+prereleases. The asset names carry no version, so
+`https://github.com/ryankegerreis/nightcap/releases/latest/download/<asset>`
+always serves the newest build; the marketing site links there. Build the same
+DMG locally with `scripts/bundle-macos.sh --universal --dmg`.
+
+The macOS app is signed ad hoc, not with a Developer ID, so Gatekeeper blocks
+the first launch: open it once, then choose Open Anyway in System Settings →
+Privacy & Security. The Windows build is unsigned and SmartScreen may warn.
+
 ## Safe preview and accelerated time
 
 ```sh

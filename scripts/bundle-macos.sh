@@ -1,16 +1,40 @@
 #!/bin/sh
-# Build Nightcap.app in target/release/bundle. Pass --install to copy it to /Applications.
+# Build Nightcap.app in target/release/bundle.
+#   --install    also copy it to /Applications
+#   --universal  build one binary for Apple Silicon and Intel (used for releases)
+#   --dmg        also build target/release/bundle/Nightcap.dmg
 set -eu
 
 cd "$(dirname "$0")/.."
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-app=target/release/bundle/Nightcap.app
+bundle=target/release/bundle
+app=$bundle/Nightcap.app
 
-cargo build --release
+install=false universal=false dmg=false
+for arg in "$@"; do
+    case "$arg" in
+        --install) install=true ;;
+        --universal) universal=true ;;
+        --dmg) dmg=true ;;
+        *) echo "unknown option: $arg" >&2; exit 2 ;;
+    esac
+done
+
+if $universal; then
+    cargo build --release --target aarch64-apple-darwin
+    cargo build --release --target x86_64-apple-darwin
+    binary=target/release/nightcap-universal
+    lipo -create -output "$binary" \
+        target/aarch64-apple-darwin/release/nightcap \
+        target/x86_64-apple-darwin/release/nightcap
+else
+    cargo build --release
+    binary=target/release/nightcap
+fi
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp target/release/nightcap "$app/Contents/MacOS/nightcap"
+cp "$binary" "$app/Contents/MacOS/nightcap"
 
 iconset=$(mktemp -d)/AppIcon.iconset
 mkdir -p "$iconset"
@@ -45,7 +69,16 @@ PLIST
 codesign --force --sign - "$app"
 echo "Built $app"
 
-if [ "${1:-}" = "--install" ]; then
+if $dmg; then
+    staging=$(mktemp -d)
+    cp -R "$app" "$staging/Nightcap.app"
+    ln -s /Applications "$staging/Applications"
+    rm -f "$bundle/Nightcap.dmg"
+    hdiutil create -volname Nightcap -srcfolder "$staging" -format UDZO -ov "$bundle/Nightcap.dmg" >/dev/null
+    echo "Built $bundle/Nightcap.dmg"
+fi
+
+if $install; then
     pkill -x nightcap 2>/dev/null || true
     rm -rf /Applications/Nightcap.app
     cp -R "$app" /Applications/Nightcap.app
