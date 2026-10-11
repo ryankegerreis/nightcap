@@ -36,7 +36,10 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/nightcap"
 
-iconset=$(mktemp -d)/AppIcon.iconset
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT
+trap 'exit 1' HUP INT TERM
+iconset=$temporary/AppIcon.iconset
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
     sips -z $size $size assets/AppIcon.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
@@ -70,7 +73,8 @@ codesign --force --sign - "$app"
 echo "Built $app"
 
 if $dmg; then
-    staging=$(mktemp -d)
+    staging=$temporary/dmg
+    mkdir -p "$staging"
     cp -R "$app" "$staging/Nightcap.app"
     ln -s /Applications "$staging/Applications"
     rm -f "$bundle/Nightcap.dmg"

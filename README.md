@@ -107,8 +107,11 @@ menu-bar-only app when the window closes. The menu’s Open Nightcap restores an
 focuses the window. Cmd-W hides the main window (or closes Settings); Cmd-Q and
 Quit Nightcap exit gracefully. Brightness uses DisplayServices on the primary
 display, with an overlay fallback for unsupported displays. Volume uses
-CoreAudio, with an AppleScript fallback. Hibernate is hidden because macOS
-has no public user-level hibernate action. Shutdown can prompt for Automation
+CoreAudio, with an AppleScript fallback. Brightness and native audio writes stay
+on the device captured at the start of its fade, so changing the primary display
+or default audio output cannot redirect restoration. The AppleScript fallback
+waits for its captured output to be selected again before restoring it. Hibernate
+is hidden because macOS has no public user-level hibernate action. Shutdown can prompt for Automation
 permission to control System Events; allow it in System Settings → Privacy &
 Security → Automation. The timer itself requires no Accessibility permission.
 
@@ -154,3 +157,6 @@ Licensed under either of
 at your option.
 
 Unless you explicitly state otherwise, any contribution you intentionally submit for inclusion in this work, as defined in the Apache-2.0 license, is dual licensed as above, without any additional terms or conditions.
+
+The [macOS hardening report](docs/macos-hardening.md) records feature coverage,
+opt-in hardware checks, and remaining platform limitations.
