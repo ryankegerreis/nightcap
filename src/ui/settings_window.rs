@@ -115,7 +115,7 @@ fn settings_body(
                 footnote(ui, "Volume control isn’t available on this device.");
             }
             section_title(ui, "When the timer ends");
-            widgets::InsetGroup::show(ui, |group| {
+            widgets::InsetGroup::show(ui, "end-action-settings", |group| {
                 group.row(true, |ui| {
                     widgets::split(
                         ui,
@@ -149,6 +149,7 @@ fn settings_body(
                                 ui,
                                 Id::new("settings-restore"),
                                 settings.restore_on_cancel_or_wake,
+                                "Restore brightness and volume after canceling or waking",
                             )
                             .clicked()
                             {
@@ -161,7 +162,7 @@ fn settings_body(
                 });
             });
             section_title(ui, "Menu bar");
-            widgets::InsetGroup::show(ui, |group| {
+            widgets::InsetGroup::show(ui, "menu-bar-settings", |group| {
                 group.row(true, |ui| {
                     widgets::split(
                         ui,
@@ -171,6 +172,7 @@ fn settings_body(
                                 ui,
                                 Id::new("settings-menu-title"),
                                 settings.show_time_in_menu_bar,
+                                "Show time remaining in the menu bar",
                             )
                             .clicked()
                             {
@@ -207,13 +209,19 @@ fn fade_group(
         target: target_label,
     } = copy;
     let mut changed = false;
-    widgets::InsetGroup::show(ui, |group| {
+    widgets::InsetGroup::show(ui, salt, |group| {
         group.row(true, |ui| {
             widgets::split(
                 ui,
                 |ui| widgets::body(ui, toggle_label),
                 |ui| {
-                    if widgets::toggle(ui, Id::new(("settings-fade", salt)), fade.enabled).clicked()
+                    if widgets::toggle(
+                        ui,
+                        Id::new(("settings-fade", salt)),
+                        fade.enabled,
+                        toggle_label,
+                    )
+                    .clicked()
                     {
                         fade.enabled = !fade.enabled;
                         changed = true;

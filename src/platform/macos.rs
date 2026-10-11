@@ -67,6 +67,8 @@ struct DisplayBrightness {
     _library: DynamicLibrary,
     get: GetBrightness,
     set: SetBrightness,
+    current_display: unsafe extern "C" fn() -> u32,
+    captured_display: Option<u32>,
 }
 
 impl DisplayBrightness {
@@ -93,6 +95,8 @@ impl DisplayBrightness {
                 _library: library,
                 get,
                 set,
+                current_display: CGMainDisplayID,
+                captured_display: None,
             })
         }
     }
@@ -101,19 +105,26 @@ impl DisplayBrightness {
 impl Brightness for DisplayBrightness {
     fn get(&mut self) -> Result<f32> {
         let mut level = 0.0;
+        // SAFETY: the selector has the CoreGraphics signature and no thread affinity.
+        let display = unsafe { (self.current_display)() };
         // SAFETY: framework is alive and level is a valid output pointer.
         status(
-            unsafe { (self.get)(CGMainDisplayID(), &mut level) },
+            unsafe { (self.get)(display, &mut level) },
             "reading display brightness",
         )?;
-        normalized(level)
+        let level = normalized(level)?;
+        self.captured_display = Some(display);
+        Ok(level)
     }
 
     fn set(&mut self, level: f32) -> Result<()> {
         let level = normalized(level)?;
+        let display = self
+            .captured_display
+            .context("brightness must be captured before writing")?;
         // SAFETY: framework is alive and display ID comes from CoreGraphics.
         status(
-            unsafe { (self.set)(CGMainDisplayID(), level) },
+            unsafe { (self.set)(display, level) },
             "setting display brightness",
         )
     }
@@ -148,17 +159,22 @@ mod intel {
         ) -> i32;
     }
 
-    pub struct IoBrightness;
+    #[derive(Default)]
+    pub struct IoBrightness {
+        service: Option<u32>,
+    }
 
     impl Brightness for IoBrightness {
         fn get(&mut self) -> Result<f32> {
             let key = CFString::new("brightness");
             let mut level = 0.0;
+            // SAFETY: CoreGraphics supplies the borrowed IOKit display service port.
+            let service = unsafe { CGDisplayIOServicePort(CGMainDisplayID()) };
             // SAFETY: the borrowed service port and CFString remain valid during the call.
             status(
                 unsafe {
                     IODisplayGetFloatParameter(
-                        CGDisplayIOServicePort(CGMainDisplayID()),
+                        service,
                         0,
                         key.as_concrete_TypeRef().cast(),
                         &mut level,
@@ -166,21 +182,21 @@ mod intel {
                 },
                 "reading IODisplay brightness",
             )?;
-            normalized(level)
+            let level = normalized(level)?;
+            self.service = Some(service);
+            Ok(level)
         }
 
         fn set(&mut self, level: f32) -> Result<()> {
             let level = normalized(level)?;
+            let service = self
+                .service
+                .context("brightness must be captured before writing")?;
             let key = CFString::new("brightness");
             // SAFETY: same service port/key lifetime as get; level is finite.
             status(
                 unsafe {
-                    IODisplaySetFloatParameter(
-                        CGDisplayIOServicePort(CGMainDisplayID()),
-                        0,
-                        key.as_concrete_TypeRef().cast(),
-                        level,
-                    )
+                    IODisplaySetFloatParameter(service, 0, key.as_concrete_TypeRef().cast(), level)
                 },
                 "setting IODisplay brightness",
             )
@@ -326,7 +342,11 @@ fn volume_device() -> Result<(u32, bool)> {
     Ok((device, service))
 }
 
-struct CoreAudioVolume;
+#[derive(Default)]
+struct CoreAudioVolume {
+    // Retain the device whose level was captured, even when the default output changes.
+    captured: Option<(u32, bool)>,
+}
 
 impl Volume for CoreAudioVolume {
     fn get(&mut self) -> Result<f32> {
@@ -360,12 +380,16 @@ impl Volume for CoreAudioVolume {
             size == size_of::<f32>() as u32,
             "unexpected CoreAudio volume size"
         );
-        normalized(level)
+        let level = normalized(level)?;
+        self.captured = Some((device, service));
+        Ok(level)
     }
 
     fn set(&mut self, level: f32) -> Result<()> {
         let level = normalized(level)?;
-        let (device, service) = volume_device()?;
+        let (device, service) = self
+            .captured
+            .context("volume must be captured before writing")?;
         // SAFETY: input buffer and size match the Float32 property.
         let result = unsafe {
             if service {
@@ -392,21 +416,35 @@ impl Volume for CoreAudioVolume {
     }
 }
 
-struct AppleScriptVolume;
+#[derive(Default)]
+struct AppleScriptVolume {
+    captured: Option<u32>,
+}
 
 impl Volume for AppleScriptVolume {
     fn get(&mut self) -> Result<f32> {
         // Querying a device without software volume yields 'missing value', rejected below.
-        parse_volume(&command(
-            "osascript",
+        let device = output_device()?;
+        let level = parse_volume(&command(
+            "/usr/bin/osascript",
             &["-e", "output volume of (get volume settings)"],
-        )?)
+        )?)?;
+        ensure!(
+            output_device()? == device,
+            "audio output changed while reading volume"
+        );
+        self.captured = Some(device);
+        Ok(level)
     }
 
     fn set(&mut self, level: f32) -> Result<()> {
         let percent = (normalized(level)? * 100.0).round() as u8;
+        ensure!(
+            self.captured == Some(output_device()?),
+            "audio output changed; waiting to restore the captured output"
+        );
         command(
-            "osascript",
+            "/usr/bin/osascript",
             &["-e", &format!("set volume output volume {percent}")],
         )?;
         Ok(())
@@ -505,12 +543,12 @@ pub fn backends() -> Backends {
     }
     #[cfg(target_arch = "x86_64")]
     if brightness.is_none() {
-        let mut backend = intel::IoBrightness;
+        let mut backend = intel::IoBrightness::default();
         if backend.get().is_ok() {
             brightness = Some(Box::new(backend));
         }
     }
-    let mut native = CoreAudioVolume;
+    let mut native = CoreAudioVolume::default();
     let volume: Option<Box<dyn Volume>> = match native.get() {
         Ok(_) => Some(Box::new(native)),
         Err(error) => {
@@ -519,7 +557,7 @@ pub fn backends() -> Backends {
             if error.is::<VolumeUnavailable>() {
                 None
             } else {
-                let mut fallback = AppleScriptVolume;
+                let mut fallback = AppleScriptVolume::default();
                 fallback
                     .get()
                     .ok()
@@ -579,11 +617,147 @@ mod tests {
     use super::*;
 
     #[test]
+    fn primary_display_switch_does_not_redirect_brightness_restoration() -> Result<()> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static PRIMARY: AtomicU32 = AtomicU32::new(100);
+        static WRITTEN: AtomicU32 = AtomicU32::new(0);
+        unsafe extern "C" fn primary() -> u32 {
+            PRIMARY.load(Ordering::Relaxed)
+        }
+        unsafe extern "C" fn read(_display: u32, level: *mut f32) -> i32 {
+            // SAFETY: DisplayBrightness supplies a valid Float32 output pointer.
+            unsafe {
+                *level = 0.6;
+            }
+            0
+        }
+        unsafe extern "C" fn write(display: u32, _level: f32) -> i32 {
+            WRITTEN.store(display, Ordering::Relaxed);
+            0
+        }
+        let mut backend = DisplayBrightness::open()?;
+        backend.current_display = primary;
+        backend.get = read;
+        backend.set = write;
+        let original = backend.get()?;
+        PRIMARY.store(200, Ordering::Relaxed);
+        backend.set(original)?;
+        ensure!(
+            WRITTEN.load(Ordering::Relaxed) == 100,
+            "restoration wrote to the new primary display"
+        );
+        // A later fade captures the newly selected display.
+        backend.get()?;
+        backend.set(0.3)?;
+        ensure!(
+            WRITTEN.load(Ordering::Relaxed) == 200,
+            "a new fade did not capture the new display"
+        );
+        Ok(())
+    }
+
+    fn select_output(device: u32) -> Result<()> {
+        let address = AudioAddress {
+            selector: u32::from_be_bytes(*b"dOut"),
+            scope: u32::from_be_bytes(*b"glob"),
+            element: 0,
+        };
+        // SAFETY: the test supplies an existing audio object and a UInt32 buffer.
+        status(
+            unsafe {
+                AudioObjectSetPropertyData(
+                    1,
+                    &address,
+                    0,
+                    ptr::null(),
+                    4,
+                    (&device as *const u32).cast(),
+                )
+            },
+            "selecting test audio output",
+        )?;
+        for _ in 0..100 {
+            if output_device()? == device {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        anyhow::bail!("audio output did not change")
+    }
+
+    struct AudioRestore {
+        output: u32,
+        levels: Vec<(u32, f32)>,
+    }
+
+    impl Drop for AudioRestore {
+        fn drop(&mut self) {
+            for &(device, level) in &self.levels {
+                if select_output(device).is_ok() {
+                    let mut volume = CoreAudioVolume::default();
+                    if volume.get().is_ok() {
+                        let _ = volume.set(level);
+                    }
+                }
+            }
+            let _ = select_output(self.output);
+        }
+    }
+
+    #[test]
+    #[ignore = "temporarily switches real audio outputs; requires NIGHTCAP_QA_ALTERNATE_OUTPUT; run alone"]
+    fn output_switch_does_not_redirect_fade_or_restoration() -> Result<()> {
+        let alternate: u32 = std::env::var("NIGHTCAP_QA_ALTERNATE_OUTPUT")?.parse()?;
+        let original = output_device()?;
+        ensure!(alternate != original, "choose a different output");
+        let mut restore = AudioRestore {
+            output: original,
+            levels: Vec::new(),
+        };
+        for (native, mut captured) in [
+            (
+                true,
+                Box::new(CoreAudioVolume::default()) as Box<dyn Volume>,
+            ),
+            (
+                false,
+                Box::new(AppleScriptVolume::default()) as Box<dyn Volume>,
+            ),
+        ] {
+            select_output(original)?;
+            let baseline = captured.get()?;
+            restore.levels.push((original, baseline));
+            select_output(alternate)?;
+            let mut other = CoreAudioVolume::default();
+            let other_baseline = other.get()?;
+            restore.levels.push((alternate, other_baseline));
+            // Native restoration targets the captured device; the script fallback
+            // must reject the changed route because it cannot address a device.
+            let result = captured.set(baseline);
+            ensure!(
+                result.is_ok() == native,
+                "unexpected switched-route result: {result:?}"
+            );
+            let after = other.get()?;
+            ensure!(
+                (after - other_baseline).abs() < 0.001,
+                "restoration changed the new output from {other_baseline} to {after}"
+            );
+            select_output(original)?;
+            captured.set(baseline)?;
+            println!(
+                "output {original} restored to {baseline}; output {alternate} unchanged at {after}; switched-route write: {result:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "reads real macOS hardware; sets only the existing volume; never requests power actions"]
     fn platform_probe() -> Result<()> {
-        let mut native = CoreAudioVolume;
+        let mut native = CoreAudioVolume::default();
         println!("CoreAudio volume: {:?}", native.get());
-        let mut script = AppleScriptVolume;
+        let mut script = AppleScriptVolume::default();
         println!("AppleScript volume: {:?}", script.get());
         let mut controls = backends();
         match controls.brightness.as_mut() {

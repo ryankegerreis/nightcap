@@ -36,20 +36,22 @@ pub struct InsetGroup<'a> {
 }
 
 impl InsetGroup<'_> {
-    pub fn show(ui: &mut Ui, add: impl FnOnce(&mut InsetGroup<'_>)) {
-        let tokens = theme::tokens(ui.ctx());
-        let width = ui.available_width();
-        egui::Frame::NONE
-            .fill(tokens.group)
-            .stroke(Stroke::new(1.0, tokens.group_edge))
-            .corner_radius(CornerRadius::same(9))
-            .inner_margin(Margin::ZERO)
-            .show(ui, |ui| {
-                ui.set_min_width(width);
-                ui.spacing_mut().item_spacing = Vec2::ZERO;
-                let mut group = InsetGroup { ui, index: 0 };
-                add(&mut group);
-            });
+    pub fn show(ui: &mut Ui, id_salt: &str, add: impl FnOnce(&mut InsetGroup<'_>)) {
+        ui.push_id(id_salt, |ui| {
+            let tokens = theme::tokens(ui.ctx());
+            let width = ui.available_width();
+            egui::Frame::NONE
+                .fill(tokens.group)
+                .stroke(Stroke::new(1.0, tokens.group_edge))
+                .corner_radius(CornerRadius::same(9))
+                .inner_margin(Margin::ZERO)
+                .show(ui, |ui| {
+                    ui.set_min_width(width);
+                    ui.spacing_mut().item_spacing = Vec2::ZERO;
+                    let mut group = InsetGroup { ui, index: 0 };
+                    add(&mut group);
+                });
+        });
     }
 
     /// `enabled` fades the row and blocks input, matching a dependent settings row.
@@ -138,9 +140,12 @@ pub fn title_and_caption(ui: &mut Ui, title: &str, subtitle: &str) {
     });
 }
 
-pub fn toggle(ui: &mut Ui, id: Id, on: bool) -> Response {
+pub fn toggle(ui: &mut Ui, id: Id, on: bool, label: &str) -> Response {
     let tokens = theme::tokens(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(vec2(TOGGLE_W, TOGGLE_H), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), on, label)
+    });
     let t = ui.ctx().animate_bool_with_time(id, on, ANIM_FAST);
     let bg = tokens.fill_strong.lerp_to_gamma(tokens.accent, t);
     let painter = ui.painter();
@@ -220,7 +225,10 @@ pub fn paint_tabular_time(ui: &Ui, center: Pos2, text: &str, size: f32, color: C
         );
         x += width;
     }
-    Rect::from_center_size(center, vec2(total, height))
+    let rect = Rect::from_center_size(center, vec2(total, height));
+    ui.interact(rect, Id::new("nightcap-countdown"), Sense::hover())
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
+    rect
 }
 
 pub fn paint_moon(painter: &egui::Painter, center: Pos2, color: Color32, background: Color32) {
@@ -247,6 +255,9 @@ pub fn round_button(
             Sense::hover()
         },
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled && ui.is_enabled(), label)
+    });
     let pressed = enabled && response.is_pointer_button_down_on();
     let press = ui
         .ctx()
@@ -321,6 +332,14 @@ pub fn segmented(
                 vec2(cell, inner.height()),
             );
             let response = ui.interact(cell_rect, id.with(i), Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::RadioButton,
+                    ui.is_enabled(),
+                    i == selected,
+                    *label,
+                )
+            });
             ui.painter().text(
                 cell_rect.center(),
                 Align2::CENTER_CENTER,
@@ -357,6 +376,9 @@ pub fn popup_select<T: Copy + PartialEq>(
     });
     let width = text_width + 8.0 + 14.0 + 8.0;
     let (rect, response) = ui.allocate_exact_size(vec2(width.max(72.0), 24.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, ui.is_enabled(), current_label)
+    });
     let open = egui::Popup::is_id_open(ui.ctx(), response.id.with("popup"));
     let hover =
         ui.ctx()
@@ -414,6 +436,14 @@ fn menu_item(ui: &mut Ui, label: &str, selected: bool, enabled: bool) -> Respons
             Sense::hover()
         },
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::RadioButton,
+            enabled && ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
     let hover = ui
         .ctx()
         .animate_bool_with_time(response.id, response.hovered() && enabled, 0.08);
@@ -565,6 +595,20 @@ fn step_pair(ui: &mut Ui, id: Id) -> (bool, bool) {
     );
     let up_response = ui.interact(up, id.with("up"), Sense::click());
     let down_response = ui.interact(down, id.with("down"), Sense::click());
+    up_response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            "Increase minutes",
+        )
+    });
+    down_response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            "Decrease minutes",
+        )
+    });
     let painter = ui.painter();
     if up_response.is_pointer_button_down_on() {
         painter.rect_filled(up, CornerRadius::ZERO, tokens.fill_strong);
@@ -599,7 +643,11 @@ pub fn meter_slider(ui: &mut Ui, id: Id, value: &mut u8, kind: MeterKind) -> boo
         |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             paint_meter_icon(ui, kind, false);
-            changed = slider_track(ui, id, value, 0, 90, 5);
+            let label = match kind {
+                MeterKind::Brightness => "Dim to",
+                MeterKind::Volume => "Lower to",
+            };
+            changed = slider_track(ui, id, value, label, 0..=90, 5);
             paint_meter_icon(ui, kind, true);
             let percent = format!("{value}%");
             let (rect, _) = ui.allocate_exact_size(vec2(34.0, 18.0), Sense::hover());
@@ -615,9 +663,22 @@ pub fn meter_slider(ui: &mut Ui, id: Id, value: &mut u8, kind: MeterKind) -> boo
     changed
 }
 
-fn slider_track(ui: &mut Ui, id: Id, value: &mut u8, min: u8, max: u8, step: u8) -> bool {
+fn slider_track(
+    ui: &mut Ui,
+    id: Id,
+    value: &mut u8,
+    label: &str,
+    range: std::ops::RangeInclusive<u8>,
+    step: u8,
+) -> bool {
+    let min = *range.start();
+    let max = *range.end();
     let tokens = theme::tokens(ui.ctx());
-    let (rect, response) = ui.allocate_exact_size(vec2(150.0, 22.0), Sense::click_and_drag());
+    let (_, rect) = ui.allocate_space(vec2(150.0, 22.0));
+    let mut response = ui.interact(rect, id, Sense::click_and_drag());
+    if response.clicked() || response.dragged() {
+        response.request_focus();
+    }
     let mut changed = false;
     if let Some(pointer) = response.interact_pointer_pos() {
         let t = ((pointer.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
@@ -629,6 +690,65 @@ fn slider_track(ui: &mut Ui, id: Id, value: &mut u8, min: u8, max: u8, step: u8)
             changed = true;
         }
     }
+    if response.enabled() {
+        use egui::accesskit::{Action, ActionData};
+        let mut next = *value;
+        let focused = response.has_focus();
+        if focused {
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        ..Default::default()
+                    },
+                )
+            });
+        }
+        ui.input(|input| {
+            let mut increments =
+                input.num_accesskit_action_requests(response.id, Action::Increment);
+            let mut decrements =
+                input.num_accesskit_action_requests(response.id, Action::Decrement);
+            if focused {
+                increments += input.num_presses(egui::Key::ArrowRight);
+                decrements += input.num_presses(egui::Key::ArrowLeft);
+            }
+            next = (i64::from(next) + (increments as i64 - decrements as i64) * i64::from(step))
+                .clamp(i64::from(min), i64::from(max)) as u8;
+            for request in input.accesskit_action_requests(response.id, Action::SetValue) {
+                if let Some(ActionData::NumericValue(requested)) = request.data
+                    && requested.is_finite()
+                {
+                    next = ((requested / f64::from(step)).round() * f64::from(step))
+                        .clamp(f64::from(min), f64::from(max)) as u8;
+                }
+            }
+        });
+        if next != *value {
+            *value = next;
+            changed = true;
+        }
+    }
+    if changed {
+        response.mark_changed();
+    }
+    response.widget_info(|| egui::WidgetInfo::slider(ui.is_enabled(), f64::from(*value), label));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        use egui::accesskit::Action;
+        node.set_min_numeric_value(f64::from(min));
+        node.set_max_numeric_value(f64::from(max));
+        node.set_numeric_value_step(f64::from(step));
+        if response.enabled() {
+            node.add_action(Action::SetValue);
+            if *value < max {
+                node.add_action(Action::Increment);
+            }
+            if *value > min {
+                node.add_action(Action::Decrement);
+            }
+        }
+    });
     let clamped = (*value).clamp(min, max);
     let target = (f32::from(clamped) - f32::from(min)) / f32::from(max - min);
     let shown = if response.dragged() {
@@ -677,6 +797,9 @@ pub fn main_header(ui: &mut Ui) -> Response {
     header_drag(ui, drag);
     let button = Rect::from_center_size(pos2(bar.right() - 25.0, bar.center().y), vec2(30.0, 24.0));
     let response = ui.interact(button, Id::new("nightcap-settings-button"), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Settings")
+    });
     let hover = ui
         .ctx()
         .animate_bool_with_time(response.id, response.hovered(), ANIM_FAST);
@@ -843,5 +966,145 @@ fn header_drag(ui: &Ui, rect: Rect) {
         .drag_started()
     {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabling_one_settings_group_does_not_dim_another_group() {
+        let ctx = egui::Context::default();
+        let mut enabled_opacity = 0.0;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            InsetGroup::show(ui, "disabled", |group| group.row(false, |_| {}));
+            InsetGroup::show(ui, "enabled", |group| {
+                group.row(true, |ui| enabled_opacity = ui.opacity())
+            });
+        });
+        output.textures_delta.clear();
+        assert_eq!(
+            enabled_opacity, 1.0,
+            "an enabled group inherited the other group's fade"
+        );
+    }
+
+    #[test]
+    fn clicking_slider_focuses_it_for_keyboard_adjustment() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut value = 20;
+        let mut render = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    meter_slider(ui, Id::new("clicked-volume"), &mut value, MeterKind::Volume);
+                },
+            );
+            output.textures_delta.clear();
+            output.platform_output.accesskit_update.unwrap()
+        };
+        let update = render(vec![]);
+        let node = update
+            .nodes
+            .iter()
+            .find(|(_, n)| n.role() == egui::accesskit::Role::Slider)
+            .unwrap();
+        let bounds = node.1.bounds().unwrap();
+        let pos = pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let click = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(vec![egui::Event::PointerMoved(pos), click(true)]);
+        render(vec![click(false)]);
+        let update = render(vec![egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, n)| n.numeric_value() == Some(50.0))
+        );
+    }
+
+    #[test]
+    fn focused_slider_supports_arrows_and_accessibility_actions() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut value = 20;
+        let mut render = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    meter_slider(ui, Id::new("test-volume"), &mut value, MeterKind::Volume);
+                },
+            );
+            output.textures_delta.clear();
+            output.platform_output.accesskit_update.unwrap()
+        };
+        let update = render(vec![]);
+        let (node_id, _) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == egui::accesskit::Role::Slider)
+            .expect("volume slider must be exposed to assistive technology");
+        // Focus through the same accessibility action used by macOS.
+        let action = |action, data| {
+            egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+                action,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: *node_id,
+                data,
+            })
+        };
+        render(vec![action(egui::accesskit::Action::Focus, None)]);
+        let update = render(vec![egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, n)| n.numeric_value() == Some(25.0))
+        );
+        let update = render(vec![action(
+            egui::accesskit::Action::SetValue,
+            Some(egui::accesskit::ActionData::NumericValue(110.0)),
+        )]);
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, n)| n.numeric_value() == Some(90.0))
+        );
+        let update = render(vec![action(egui::accesskit::Action::Decrement, None)]);
+        assert!(
+            update
+                .nodes
+                .iter()
+                .any(|(_, n)| n.numeric_value() == Some(85.0))
+        );
     }
 }

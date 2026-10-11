@@ -227,7 +227,7 @@ fn options_group(
     idle: bool,
     outcome: &mut MainOutcome,
 ) {
-    widgets::InsetGroup::show(ui, |group| {
+    widgets::InsetGroup::show(ui, "timer-options", |group| {
         if custom {
             group.row(idle, |ui| {
                 widgets::split(
@@ -269,7 +269,13 @@ fn options_group(
                 ui,
                 |ui| widgets::title_and_caption(ui, "Dim screen", &subtitle),
                 |ui| {
-                    if widgets::toggle(ui, Id::new("nightcap-dim"), settings.dim.enabled).clicked()
+                    if widgets::toggle(
+                        ui,
+                        Id::new("nightcap-dim"),
+                        settings.dim.enabled,
+                        "Dim screen",
+                    )
+                    .clicked()
                     {
                         settings.dim.enabled = !settings.dim.enabled;
                         outcome.settings_changed = true;
@@ -283,8 +289,13 @@ fn options_group(
                 ui,
                 |ui| widgets::title_and_caption(ui, "Lower volume", &subtitle),
                 |ui| {
-                    if widgets::toggle(ui, Id::new("nightcap-volume"), settings.volume.enabled)
-                        .clicked()
+                    if widgets::toggle(
+                        ui,
+                        Id::new("nightcap-volume"),
+                        settings.volume.enabled,
+                        "Lower volume",
+                    )
+                    .clicked()
                     {
                         settings.volume.enabled = !settings.volume.enabled;
                         outcome.settings_changed = true;
@@ -668,6 +679,64 @@ mod tests {
             format_timer(Duration::from_secs(10) + Duration::from_millis(1)),
             "00:11"
         );
+    }
+
+    #[test]
+    fn main_controls_expose_accessible_names_roles_and_state() {
+        use egui::accesskit::{Role, Toggled};
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        theme::install_fonts(&ctx);
+        let mut settings = Settings::default();
+        let mut duration = 45;
+        let mut custom = false;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(340.0, 560.0))),
+                ..Default::default()
+            },
+            |ui| {
+                show(
+                    ui,
+                    MainView {
+                        snapshot: &Snapshot::default(),
+                        settings: &mut settings,
+                        duration_min: &mut duration,
+                        custom: &mut custom,
+                        notice: None,
+                    },
+                );
+            },
+        );
+        output.textures_delta.clear();
+        let nodes = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .unwrap()
+            .nodes;
+        for (label, role) in [
+            ("Start", Role::Button),
+            ("Settings", Role::Button),
+            ("Sleep", Role::ComboBox),
+            ("45 min", Role::RadioButton),
+            ("Dim screen", Role::CheckBox),
+            ("Lower volume", Role::CheckBox),
+        ] {
+            let node = nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap_or_else(|| panic!("missing accessible control: {label}"));
+            assert_eq!(node.1.role(), role, "{label}");
+            if matches!(role, Role::RadioButton | Role::CheckBox) {
+                assert_eq!(node.1.toggled(), Some(Toggled::True));
+            }
+        }
+        let cancel = nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Cancel"))
+            .unwrap();
+        assert!(cancel.1.is_disabled());
     }
 
     #[test]
