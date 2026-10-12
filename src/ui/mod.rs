@@ -241,6 +241,7 @@ impl eframe::App for NightcapApp {
             settings_window::show(
                 ui.ctx(),
                 &mut self.settings_open,
+                self.settings_focus_pending == 2,
                 &mut self.settings,
                 snapshot.brightness_supported,
                 snapshot.volume_supported,
@@ -304,6 +305,7 @@ impl eframe::App for NightcapApp {
         if settings_window::show(
             ui.ctx(),
             &mut self.settings_open,
+            self.settings_focus_pending == 2,
             &mut self.settings,
             snapshot.brightness_supported,
             snapshot.volume_supported,

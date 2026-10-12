@@ -9,6 +9,10 @@ readme = "README.md"
 keywords = ["sleep-timer", "brightness", "volume", "egui", "desktop"]
 categories = ["gui"]
 
+[[test]]
+name = "macos_settings_window"
+harness = false
+
 [dependencies]
 eframe = "0.36.2"
 serde = { version = "1.0.229", features = ["derive"] }
