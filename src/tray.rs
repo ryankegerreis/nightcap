@@ -119,10 +119,7 @@ struct Display {
 
 impl Display {
     fn new(snapshot: &Snapshot, show_time: bool) -> Self {
-        let seconds = snapshot
-            .remaining
-            .as_secs()
-            .saturating_add(u64::from(snapshot.remaining.subsec_nanos() != 0));
+        let seconds = snapshot.menu_seconds();
         Self {
             state: snapshot.state,
             time: if snapshot.state == TimerState::Idle {

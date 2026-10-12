@@ -2,7 +2,11 @@
 
 use std::{
     io,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime},
 };
@@ -120,6 +124,16 @@ pub struct Snapshot {
     pub last_error: Option<String>,
 }
 
+impl Snapshot {
+    /// Whole seconds shown in the menu bar. A partial second rounds up so the
+    /// title reaches zero only when the timer does.
+    pub(crate) fn menu_seconds(&self) -> u64 {
+        self.remaining
+            .as_secs()
+            .saturating_add(u64::from(self.remaining.subsec_nanos() != 0))
+    }
+}
+
 /// Cloning retains the worker; dropping the last handle shuts it down and joins it.
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -129,6 +143,7 @@ pub struct EngineHandle {
 struct HandleInner {
     sender: mpsc::Sender<Command>,
     snapshot: Arc<Mutex<Snapshot>>,
+    window_visible: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -157,6 +172,12 @@ impl EngineHandle {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    /// The root window's visibility. Hidden timers still run; the worker just
+    /// skips UI wakes that would not change the menu bar or the dimming overlay.
+    pub fn set_window_visible(&self, visible: bool) {
+        self.inner.window_visible.store(visible, Ordering::Relaxed);
     }
 }
 
@@ -207,6 +228,7 @@ pub struct Engine<C: Clock = SystemClock> {
     settings: Settings,
     snapshot: Snapshot,
     shared: Arc<Mutex<Snapshot>>,
+    window_visible: Arc<AtomicBool>,
     repaint: Box<dyn Fn() + Send>,
     last_time: ClockReading,
     brightness: FadeTrack,
@@ -234,22 +256,39 @@ impl<C: Clock + 'static> Engine<C> {
         let mut engine = Self::new(settings, backends, clock);
         engine.repaint = repaint;
         let snapshot = Arc::clone(&engine.shared);
+        let window_visible = Arc::clone(&engine.window_visible);
         let (sender, receiver) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("nightcap-timer".into())
             .spawn(move || {
                 loop {
-                    match receiver.recv_timeout(TICK_INTERVAL) {
-                        Ok(command) => {
+                    // An idle timer has nothing to advance and no wake to detect.
+                    // Block until a command arrives instead of polling four times a second.
+                    let incoming = if engine.needs_tick() {
+                        match receiver.recv_timeout(TICK_INTERVAL) {
+                            Ok(command) => Some(command),
+                            Err(mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                engine.command(Command::Shutdown);
+                                break;
+                            }
+                        }
+                    } else {
+                        match receiver.recv() {
+                            Ok(command) => Some(command),
+                            Err(mpsc::RecvError) => {
+                                engine.command(Command::Shutdown);
+                                break;
+                            }
+                        }
+                    };
+                    match incoming {
+                        Some(command) => {
                             if !engine.command(command) {
                                 break;
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Timeout) => engine.tick(),
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            engine.command(Command::Shutdown);
-                            break;
-                        }
+                        None => engine.tick(),
                     }
                 }
             })?;
@@ -257,6 +296,7 @@ impl<C: Clock + 'static> Engine<C> {
             inner: Arc::new(HandleInner {
                 sender,
                 snapshot,
+                window_visible,
                 worker: Mutex::new(Some(worker)),
             }),
         })
@@ -278,6 +318,7 @@ impl<C: Clock> Engine<C> {
             backends,
             settings,
             shared: Arc::new(Mutex::new(snapshot.clone())),
+            window_visible: Arc::new(AtomicBool::new(true)),
             snapshot,
             repaint: Box::new(|| {}),
             last_time,
@@ -343,6 +384,12 @@ impl<C: Clock> Engine<C> {
     pub fn tick(&mut self) {
         self.advance_time();
         self.evaluate();
+    }
+
+    /// Running, paused, and finishing timers watch the clock. So does a failed
+    /// restore, which retries on a later tick. Idle otherwise waits for a command.
+    fn needs_tick(&self) -> bool {
+        self.snapshot.state != TimerState::Idle || self.restore_after.is_some()
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -560,10 +607,24 @@ impl<C: Clock> Engine<C> {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if *shared != self.snapshot {
+            let wake = self.should_wake_ui(&shared);
             *shared = self.snapshot.clone();
             drop(shared);
-            (self.repaint)();
+            if wake {
+                (self.repaint)();
+            }
         }
+    }
+
+    /// A visible window tracks every snapshot change, including the progress ring.
+    /// A hidden one only needs a frame when the menu-bar title or overlay changes.
+    fn should_wake_ui(&self, previous: &Snapshot) -> bool {
+        if self.window_visible.load(Ordering::Relaxed) {
+            return true;
+        }
+        previous.state != self.snapshot.state
+            || previous.menu_seconds() != self.snapshot.menu_seconds()
+            || previous.overlay_alpha.to_bits() != self.snapshot.overlay_alpha.to_bits()
     }
 }
 
@@ -1253,6 +1314,68 @@ mod tests {
         for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(SpeedClock::new(clock.clone(), invalid).is_err());
         }
+    }
+
+    #[test]
+    fn idle_timer_waits_for_a_command_and_a_running_timer_keeps_ticking() {
+        let mut engine = Engine::new(
+            preferences(),
+            Backends {
+                brightness: None,
+                volume: None,
+                power: Box::new(MockPower::default()),
+                hibernate_supported: false,
+            },
+            SystemClock::default(),
+        );
+        assert!(!engine.needs_tick());
+        assert!(engine.command(Command::Start {
+            duration: Duration::from_secs(60),
+        }));
+        assert!(engine.needs_tick());
+        assert!(engine.command(Command::Pause));
+        assert!(engine.needs_tick());
+        assert!(engine.command(Command::Cancel));
+        assert!(!engine.needs_tick());
+    }
+
+    #[test]
+    fn hidden_window_skips_subsecond_updates_and_wakes_for_the_menu_bar_and_overlay() {
+        let mut engine = Engine::new(
+            preferences(),
+            Backends {
+                brightness: None,
+                volume: None,
+                power: Box::new(MockPower::default()),
+                hibernate_supported: false,
+            },
+            SystemClock::default(),
+        );
+        engine
+            .window_visible
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        engine.snapshot.state = TimerState::Running;
+        engine.snapshot.remaining = Duration::from_millis(10_500);
+        let previous = engine.snapshot.clone();
+
+        engine.snapshot.remaining = Duration::from_millis(10_200);
+        assert!(!engine.should_wake_ui(&previous));
+
+        engine.snapshot.remaining = Duration::from_millis(10_000);
+        assert!(engine.should_wake_ui(&previous));
+
+        engine.snapshot.remaining = previous.remaining;
+        engine.snapshot.overlay_alpha = 0.25;
+        assert!(engine.should_wake_ui(&previous));
+
+        engine.snapshot.overlay_alpha = previous.overlay_alpha;
+        engine.snapshot.brightness_percent = Some(40.0);
+        assert!(!engine.should_wake_ui(&previous));
+
+        engine
+            .window_visible
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(engine.should_wake_ui(&previous));
     }
 
     #[test]
