@@ -1,39 +1,51 @@
-# Builds Nightcap for macOS, Windows and Linux and publishes a GitHub release.
-# Runs when a tag like v0.1.0 is pushed. The tag must match Cargo.toml's version.
+# Versions and publishes Nightcap with release-please.
+#
+# On every push to master, release-please keeps a release PR open that bumps
+# Cargo.toml and CHANGELOG.md from the Conventional Commit titles merged since
+# the last release. Merging that PR tags the release and creates it as a draft;
+# the jobs below then build each platform, upload the assets and publish it.
 #
 # Asset names carry no version so that
 # https://github.com/ryankegerreis/nightcap/releases/latest/download/<asset>
 # always points at the newest build. The marketing site links to those URLs.
+# Drafts don't count as "latest", so those links keep serving the previous
+# release until every asset is uploaded.
 name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [master]
 
 permissions:
   contents: write
+  issues: write
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check-version:
+  release-please:
     runs-on: ubuntu-24.04
+    # Two pushes in quick succession must not both try to create the release.
+    concurrency:
+      group: release-please
+      cancel-in-progress: false
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: actions/checkout@v7
-      - name: Tag matches Cargo.toml
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
-            exit 1
-          fi
+      - uses: googleapis/release-please-action@v5
+        id: release
 
   macos:
-    needs: check-version
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -47,10 +59,13 @@ jobs:
           path: dist/*
 
   windows:
-    needs: check-version
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
@@ -68,11 +83,14 @@ jobs:
           path: dist/*
 
   linux:
-    needs: check-version
+    needs: release-please
+    if: needs.release-please.outputs.created == 'true'
     # The oldest supported runner, so the binary works on older glibc versions.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
       - name: Install egui system libraries
         run: |
           sudo apt-get update
@@ -92,20 +110,17 @@ jobs:
           path: dist/*
 
   publish:
-    needs: [macos, windows, linux]
+    needs: [release-please, macos, windows, linux]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
-      - name: Create release
+      - name: Upload assets and publish the draft
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag }}
         run: |
-          prerelease=""
-          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Nightcap ${GITHUB_REF_NAME#v}" \
-            --generate-notes $prerelease
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
