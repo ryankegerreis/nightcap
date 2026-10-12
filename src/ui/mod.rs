@@ -84,6 +84,7 @@ impl NightcapApp {
 
     fn open_window(&mut self, ctx: &egui::Context, focus: bool) {
         self.root_visible = true;
+        self.engine.set_window_visible(true);
         set_activation_policy(true);
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd_to(
@@ -98,6 +99,7 @@ impl NightcapApp {
 
     fn hide_window(&mut self, ctx: &egui::Context) {
         self.root_visible = false;
+        self.engine.set_window_visible(false);
         if self.settings_open {
             ctx.send_viewport_cmd_to(
                 settings_window::viewport_id(),
@@ -158,6 +160,7 @@ impl eframe::App for NightcapApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::install(ctx);
         self.ctx = Some(ctx.clone());
+        self.engine.set_window_visible(self.root_visible);
         self.flush_save();
         let snapshot = self.engine.snapshot();
         if snapshot.state != TimerState::Idle && snapshot.total != self.observed_total {
@@ -216,6 +219,7 @@ impl eframe::App for NightcapApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         theme::install(ui.ctx());
         self.ctx = Some(ui.ctx().clone());
+        self.engine.set_window_visible(self.root_visible);
         self.flush_save();
         if self
             .notice

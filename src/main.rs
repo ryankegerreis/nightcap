@@ -40,7 +40,7 @@ fn main() -> eframe::Result {
         })
         .unwrap_or(1.0);
     let clock = SpeedClock::new(SystemClock::default(), speed).expect("validated timer speed");
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: window_builder("Nightcap")
             .with_inner_size([340.0, 560.0])
             .with_min_inner_size([340.0, 480.0])
@@ -55,6 +55,7 @@ fn main() -> eframe::Result {
         })),
         ..Default::default()
     };
+    prefer_light_graphics(&mut options);
 
     eframe::run_native(
         "Nightcap",
@@ -89,4 +90,20 @@ fn main() -> eframe::Result {
             Ok(Box::new(NightcapApp::new(engine, settings, tray)))
         }),
     )
+}
+
+/// This window is a flat 2D panel that is usually hidden. Keep a single frame
+/// in flight and ask the allocator to stay small.
+fn prefer_light_graphics(options: &mut eframe::NativeOptions) {
+    options.wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY;
+    let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
+    else {
+        return;
+    };
+    let previous = Arc::clone(&setup.device_descriptor);
+    setup.device_descriptor = Arc::new(move |adapter| {
+        let mut descriptor = previous(adapter);
+        descriptor.memory_hints = eframe::wgpu::MemoryHints::MemoryUsage;
+        descriptor
+    });
 }

@@ -191,6 +191,12 @@ fn white_alpha(opacity: f32) -> Color32 {
     Color32::from_white_alpha(alpha(opacity))
 }
 
+/// One copy of the file for every face. egui otherwise clones owned bytes per
+/// face and copies them again into the shaper.
+fn shared_font(bytes: Vec<u8>) -> egui::FontData {
+    egui::FontData::from_static(Box::leak(bytes.into_boxed_slice()))
+}
+
 /// Read OS fonts at runtime; Apple fonts are never included in the binary.
 pub fn install_fonts(ctx: &egui::Context) {
     #[cfg(target_os = "macos")]
@@ -208,7 +214,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         .iter()
         .find_map(|path| std::fs::read(path).ok().map(|bytes| (*path, bytes)))
     {
-        let regular = egui::FontData::from_owned(bytes);
+        let regular = shared_font(bytes);
         let mut light = regular.clone();
         if let Some(weight) = light
             .variation_axes()
@@ -220,12 +226,12 @@ pub fn install_fonts(ctx: &egui::Context) {
             // Static light faces are used when the system font has no weight axis.
             #[cfg(target_os = "macos")]
             if let Ok(bytes) = std::fs::read("/System/Library/Fonts/HelveticaNeue.ttc") {
-                light = egui::FontData::from_owned(bytes);
+                light = shared_font(bytes);
                 light.index = 5; // HelveticaNeue-UltraLight
             }
             #[cfg(target_os = "windows")]
             if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeuil.ttf") {
-                light = egui::FontData::from_owned(bytes);
+                light = shared_font(bytes);
             }
         }
         definitions
