@@ -61,19 +61,20 @@ under the app that launched it (your terminal or editor). The icon source is
 
 ## Releasing
 
-Pushing a version tag builds and publishes a GitHub release
-(`.github/workflows/release.yml`):
+Releases are cut by [release-please](https://github.com/googleapis/release-please)
+(`.github/workflows/release.yml`). Pull requests are squash-merged and titled
+with [Conventional Commits](https://www.conventionalcommits.org/): `fix:` makes
+a patch release, `feat:` a minor one, and `feat!:` a breaking one (minor while
+the version is 0.x). `docs:`, `refactor:`, `test:`, `build:`, `ci:` and `chore:`
+make no release. [`AGENTS.md`](AGENTS.md) has the full rules, and the
+`PR title` check enforces the format.
 
-```sh
-# bump version in Cargo.toml, commit, then:
-git tag v0.1.0
-git push origin master v0.1.0
-```
-
-The workflow checks that the tag matches `Cargo.toml`, runs the tests on each
-platform, and uploads `Nightcap-macOS.dmg` (universal), `Nightcap-Windows-x64.zip`
-and `Nightcap-Linux-x86_64.tar.gz`. Tags with a hyphen (`v0.2.0-beta.1`) become
-prereleases. The asset names carry no version, so
+After each merge, release-please updates an open release PR that bumps
+`Cargo.toml` and `CHANGELOG.md`. Merge it to ship: the workflow tags the
+release, runs the tests on each platform, uploads `Nightcap-macOS.dmg`
+(universal), `Nightcap-Windows-x64.zip` and `Nightcap-Linux-x86_64.tar.gz` to a
+draft release, and publishes it once all three are attached. The asset names
+carry no version, so
 `https://github.com/ryankegerreis/nightcap/releases/latest/download/<asset>`
 always serves the newest build; the marketing site links there. Build the same
 DMG locally with `scripts/bundle-macos.sh --universal --dmg`.
