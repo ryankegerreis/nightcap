@@ -10,6 +10,7 @@ use super::widgets::{self, Choice, MeterKind};
 pub fn show(
     ctx: &egui::Context,
     open: &mut bool,
+    opening: &mut bool,
     settings: &mut Settings,
     brightness_supported: bool,
     volume_supported: bool,
@@ -17,7 +18,16 @@ pub fn show(
 ) -> bool {
     // Register at launch, even while hidden. eframe cannot create an immediate
     // viewport in every event-loop phase used to reopen the root from the tray.
-    let visible = *open;
+    let requested = *open;
+    if requested && !native_window_registered() {
+        *opening = true;
+    }
+    // winit's Visible(true) calls makeKeyAndOrderFront on macOS. Move and
+    // configure the precreated window before that command can switch Spaces.
+    let prepared = !requested || !*opening || prepare_open();
+    // A missing/recreated native window must be created hidden first. Keep the
+    // request pending and try preparation again on the next root frame.
+    let visible = requested && prepared;
     let mut changed = false;
     let mut close = false;
     ctx.show_viewport_immediate(
@@ -31,6 +41,7 @@ pub fn show(
             if !visible {
                 return;
             }
+            finish_open();
             if ui.input(|input| input.viewport().close_requested())
                 || ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
             {
@@ -55,8 +66,14 @@ pub fn show(
                 });
         },
     );
+    if prepared {
+        *opening = false;
+    } else {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
     if close {
         *open = false;
+        *opening = false;
     }
     changed
 }
@@ -374,10 +391,166 @@ pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("nightcap-settings")
 }
 
+/// Prepare the existing native settings window before it is shown or focused.
+fn prepare_open() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::{
+            NSApplication, NSScreen, NSWindowCollectionBehavior, NSWindowOrderingMode,
+        };
+
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
+        // eframe exposes only the root's native handle, so find our two unique
+        // window titles in this process. The dimming overlay is never selected.
+        let windows = NSApplication::sharedApplication(mtm).windows();
+        let Some(settings) = windows
+            .iter()
+            .find(|window| window.title().to_string() == "Settings")
+        else {
+            return false;
+        };
+        let Some(main) = windows
+            .iter()
+            .find(|window| window.title().to_string() == "Nightcap")
+        else {
+            return false;
+        };
+        let mut behavior = settings.collectionBehavior();
+        // Target Nightcap's Space, not whichever Space happens to be active
+        // when a tray request is received. A temporary parent link places it.
+        behavior.remove(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::MoveToActiveSpace,
+        );
+        settings.setCollectionBehavior(behavior);
+        // SAFETY: distinct, live AppKit windows on the main thread. Settings is
+        // attached only to the root, so no parent/child cycle can be introduced.
+        // finish_open detaches it as soon as it is ordered in, before dragging.
+        if settings.parentWindow().as_deref() != Some(&*main) {
+            unsafe { main.addChildWindow_ordered(&settings, NSWindowOrderingMode::Above) };
+        }
+        // Screen lookup only affects placement, never the Space relationship.
+        // Ordered-out/offscreen windows can lack a screen; use their saved frame.
+        let screen = main.screen().or_else(|| {
+            NSScreen::screens(mtm).iter().min_by(|a, b| {
+                screen_distance_squared(main.frame(), a.frame())
+                    .total_cmp(&screen_distance_squared(main.frame(), b.frame()))
+            })
+        });
+        if let Some(screen) = screen {
+            settings.setFrameOrigin(opening_origin(
+                main.frame(),
+                settings.frame().size,
+                screen.visibleFrame(),
+            ));
+        }
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+fn native_window_registered() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        native_settings_window().is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn native_settings_window() -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+    let mtm = objc2::MainThreadMarker::new()?;
+    objc2_app_kit::NSApplication::sharedApplication(mtm)
+        .windows()
+        .iter()
+        .find(|window| window.title().to_string() == "Settings")
+}
+
+fn finish_open() {
+    #[cfg(target_os = "macos")]
+    if let Some(settings) = native_settings_window()
+        && settings.isVisible()
+        && let Some(parent) = settings.parentWindow()
+    {
+        // Existing viewport visibility changes are applied after its callback.
+        // Keep the link until the next callback observes it actually ordered in.
+        parent.removeChildWindow(&settings);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn screen_distance_squared(
+    root: objc2_foundation::NSRect,
+    screen: objc2_foundation::NSRect,
+) -> f64 {
+    let x = root.origin.x + root.size.width / 2.0;
+    let y = root.origin.y + root.size.height / 2.0;
+    let dx = x - x.clamp(screen.origin.x, screen.origin.x + screen.size.width);
+    let dy = y - y.clamp(screen.origin.y, screen.origin.y + screen.size.height);
+    dx * dx + dy * dy
+}
+
+#[cfg(target_os = "macos")]
+fn opening_origin(
+    root: objc2_foundation::NSRect,
+    size: objc2_foundation::NSSize,
+    visible: objc2_foundation::NSRect,
+) -> objc2_foundation::NSPoint {
+    let x = (root.origin.x + (root.size.width - size.width) / 2.0).clamp(
+        visible.origin.x,
+        visible.origin.x + (visible.size.width - size.width).max(0.0),
+    );
+    // Keep the title bar reachable even if Settings is taller than the screen.
+    let top_aligned_y = visible.origin.y + visible.size.height - size.height;
+    let y = (root.origin.y + (root.size.height - size.height) / 2.0)
+        .clamp(visible.origin.y.min(top_aligned_y), top_aligned_y);
+    objc2_foundation::NSPoint::new(x, y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::settings::EndAction;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn settings_placement_uses_the_main_display_coordinates_and_keeps_the_title_bar_reachable() {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        for (root_origin, visible, settings_size, expected) in [
+            (
+                NSPoint::new(-1800.0, 150.0),
+                NSRect::new(NSPoint::new(-1920.0, 0.0), NSSize::new(1920.0, 1050.0)),
+                NSSize::new(460.0, 700.0),
+                NSPoint::new(-1860.0, 80.0),
+            ),
+            (
+                NSPoint::new(100.0, 1300.0),
+                NSRect::new(NSPoint::new(0.0, 1080.0), NSSize::new(1920.0, 1000.0)),
+                NSSize::new(460.0, 700.0),
+                NSPoint::new(40.0, 1230.0),
+            ),
+            (
+                NSPoint::new(20.0, 20.0),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(800.0, 500.0)),
+                NSSize::new(900.0, 700.0),
+                NSPoint::new(0.0, -200.0),
+            ),
+        ] {
+            assert_eq!(
+                opening_origin(
+                    NSRect::new(root_origin, NSSize::new(340.0, 560.0)),
+                    settings_size,
+                    visible
+                ),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn end_action_menu_only_offers_hibernate_when_available() {

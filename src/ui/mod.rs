@@ -31,6 +31,7 @@ pub struct NightcapApp {
     duration_min: u32,
     custom_duration: bool,
     settings_open: bool,
+    settings_opening_pending: bool,
     settings_focus_pending: u8,
     save_after: Option<Instant>,
     notice: Option<StatusNote>,
@@ -63,6 +64,7 @@ impl NightcapApp {
             duration_min,
             custom_duration,
             settings_open: false,
+            settings_opening_pending: false,
             settings_focus_pending: 0,
             save_after: None,
             notice: None,
@@ -72,6 +74,7 @@ impl NightcapApp {
 
     pub fn open_settings(&mut self) {
         self.settings_open = true;
+        self.settings_opening_pending = true;
         self.settings_focus_pending = 2;
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -241,6 +244,7 @@ impl eframe::App for NightcapApp {
             settings_window::show(
                 ui.ctx(),
                 &mut self.settings_open,
+                &mut self.settings_opening_pending,
                 &mut self.settings,
                 snapshot.brightness_supported,
                 snapshot.volume_supported,
@@ -304,6 +308,7 @@ impl eframe::App for NightcapApp {
         if settings_window::show(
             ui.ctx(),
             &mut self.settings_open,
+            &mut self.settings_opening_pending,
             &mut self.settings,
             snapshot.brightness_supported,
             snapshot.volume_supported,
@@ -311,7 +316,7 @@ impl eframe::App for NightcapApp {
         ) {
             settings_changed = true;
         }
-        if self.settings_focus_pending > 0 && self.settings_open {
+        if self.settings_focus_pending > 0 && self.settings_open && !self.settings_opening_pending {
             // The immediate child's creation frame can still carry root window
             // commands. Focus on the following frame, once those have drained.
             self.settings_focus_pending -= 1;
