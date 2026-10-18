@@ -95,6 +95,10 @@ fn main() -> eframe::Result {
 /// This window is a flat 2D panel that is usually hidden. Keep a single frame
 /// in flight and ask the allocator to stay small.
 fn prefer_light_graphics(options: &mut eframe::NativeOptions) {
+    #[cfg(target_os = "windows")]
+    {
+        options.renderer = eframe::Renderer::Glow;
+    }
     options.wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY;
     let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup
     else {
@@ -106,4 +110,14 @@ fn prefer_light_graphics(options: &mut eframe::NativeOptions) {
         descriptor.memory_hints = eframe::wgpu::MemoryHints::MemoryUsage;
         descriptor
     });
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    #[test]
+    fn windows_renderer_supports_transparent_hidden_viewports() {
+        let mut options = eframe::NativeOptions::default();
+        super::prefer_light_graphics(&mut options);
+        assert!(matches!(options.renderer, eframe::Renderer::Glow));
+    }
 }

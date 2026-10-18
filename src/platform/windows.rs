@@ -1,7 +1,10 @@
 //! Native Windows controls. COM interfaces live only inside individual calls,
 //! so constructing a backend on the UI thread and moving it to the engine is safe.
 
-use std::{collections::BTreeMap, ptr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ptr,
+};
 
 use anyhow::{Context, Result, ensure};
 use windows::{
@@ -16,8 +19,8 @@ use windows::{
         },
         Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
         Media::Audio::{
-            Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole,
-            eRender,
+            Endpoints::IAudioEndpointVolume, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
+            eConsole, eRender,
         },
         Security::{
             AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
@@ -27,8 +30,9 @@ use windows::{
         System::{
             Com::{
                 CLSCTX_ALL, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance,
-                CoInitializeEx, CoInitializeSecurity, CoSetProxyBlanket, CoUninitialize, EOAC_NONE,
-                RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+                CoInitializeEx, CoInitializeSecurity, CoSetProxyBlanket, CoTaskMemFree,
+                CoUninitialize, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_AUTHN_LEVEL_DEFAULT,
+                RPC_C_IMP_LEVEL_IMPERSONATE,
             },
             Power::{GetPwrCapabilities, SYSTEM_POWER_CAPABILITIES, SetSuspendState},
             Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE},
@@ -46,7 +50,7 @@ use windows::{
             },
         },
     },
-    core::{BOOL, BSTR, PCWSTR, w},
+    core::{BOOL, BSTR, PCWSTR, PWSTR, w},
 };
 
 use super::{Backends, Brightness, Power, Volume};
@@ -83,40 +87,95 @@ impl Drop for ComApartment {
     }
 }
 
-struct WindowsVolume;
+fn com_call<T>(call: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _apartment = ComApartment::enter()?;
+    call().map_err(|error| anyhow::anyhow!("{error:#}"))
+}
 
-fn endpoint() -> Result<IAudioEndpointVolume> {
+#[derive(Default)]
+struct WindowsVolume {
+    endpoint_id: Option<Vec<u16>>,
+}
+
+struct AudioEndpointId(PWSTR);
+
+impl Drop for AudioEndpointId {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(Some(self.0.0.cast())) };
+    }
+}
+
+fn endpoint(id: Option<&[u16]>) -> Result<(IMMDevice, IAudioEndpointVolume)> {
     // SAFETY: caller holds a ComApartment, and all interfaces are dropped before it.
     unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                 .context("creating audio device enumerator")?;
-        let device = enumerator
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .context("finding default render endpoint")?;
-        device
+        let device = match id {
+            Some(id) => enumerator
+                .GetDevice(PCWSTR(id.as_ptr()))
+                .context("reopening captured render endpoint")?,
+            None => enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .context("finding default render endpoint")?,
+        };
+        let volume = device
             .Activate(CLSCTX_ALL, None)
-            .context("activating audio endpoint volume")
+            .context("activating audio endpoint volume")?;
+        Ok((device, volume))
+    }
+}
+
+impl WindowsVolume {
+    fn get_with(&mut self, read: impl FnOnce() -> Result<(Vec<u16>, f32)>) -> Result<f32> {
+        let (id, level) = read()?;
+        let level = normalized(level)?;
+        self.endpoint_id = Some(id);
+        Ok(level)
+    }
+
+    fn set_with(
+        &mut self,
+        level: f32,
+        write: impl FnOnce(Option<&[u16]>, f32) -> Result<()>,
+    ) -> Result<()> {
+        let level = normalized(level)?;
+        let id = self
+            .endpoint_id
+            .as_deref()
+            .context("volume has no captured endpoint")?;
+        write(Some(id), level)
     }
 }
 
 impl Volume for WindowsVolume {
     fn get(&mut self) -> Result<f32> {
-        let _apartment = ComApartment::enter()?;
-        let endpoint = endpoint()?;
-        // SAFETY: interface belongs to this thread's active COM apartment.
-        normalized(
-            unsafe { endpoint.GetMasterVolumeLevelScalar() }.context("reading endpoint volume")?,
-        )
+        self.get_with(|| {
+            com_call(|| {
+                let (device, endpoint) = endpoint(None)?;
+                let id = AudioEndpointId(
+                    unsafe { device.GetId() }.context("reading audio endpoint ID")?,
+                );
+                let id = unsafe { id.0.as_wide() }
+                    .iter()
+                    .copied()
+                    .chain([0])
+                    .collect();
+                let level = unsafe { endpoint.GetMasterVolumeLevelScalar() }
+                    .context("reading endpoint volume")?;
+                Ok((id, level))
+            })
+        })
     }
 
     fn set(&mut self, level: f32) -> Result<()> {
-        let level = normalized(level)?;
-        let _apartment = ComApartment::enter()?;
-        let endpoint = endpoint()?;
-        // SAFETY: valid scalar and interface; null event GUID is supported.
-        unsafe { endpoint.SetMasterVolumeLevelScalar(level, ptr::null()) }
-            .context("setting endpoint volume")
+        self.set_with(level, |id, level| {
+            com_call(|| {
+                let (_device, endpoint) = endpoint(id)?;
+                unsafe { endpoint.SetMasterVolumeLevelScalar(level, ptr::null()) }
+                    .context("setting endpoint volume")
+            })
+        })
     }
 }
 
@@ -217,22 +276,24 @@ fn wmi_query(services: &IWbemServices, query: &str) -> Result<Vec<IWbemClassObje
 }
 
 fn wmi_levels() -> Result<BTreeMap<String, f32>> {
-    let _apartment = ComApartment::enter()?;
-    let services = wmi_services()?;
-    let monitors = wmi_query(
-        &services,
-        "SELECT InstanceName, CurrentBrightness FROM WmiMonitorBrightness WHERE Active = TRUE",
-    )?;
-    let mut levels = BTreeMap::new();
-    for monitor in monitors {
-        let value = property(&monitor, w!("CurrentBrightness"))?;
-        // SAFETY: VARIANT came from WMI and remains owned until conversion returns.
-        let percent = unsafe { VariantToUInt32(&value.0) }.context("converting WMI brightness")?;
-        ensure!(percent <= 100, "WMI returned brightness above 100%");
-        levels.insert(wmi_instance_name(&monitor)?, percent as f32 / 100.0);
-    }
-    ensure!(!levels.is_empty(), "no active WMI brightness panels");
-    Ok(levels)
+    com_call(|| {
+        let services = wmi_services()?;
+        let monitors = wmi_query(
+            &services,
+            "SELECT InstanceName, CurrentBrightness FROM WmiMonitorBrightness WHERE Active = TRUE",
+        )?;
+        let mut levels = BTreeMap::new();
+        for monitor in monitors {
+            let value = property(&monitor, w!("CurrentBrightness"))?;
+            // SAFETY: VARIANT came from WMI and remains owned until conversion returns.
+            let percent =
+                unsafe { VariantToUInt32(&value.0) }.context("converting WMI brightness")?;
+            ensure!(percent <= 100, "WMI returned brightness above 100%");
+            levels.insert(wmi_instance_name(&monitor)?, percent as f32 / 100.0);
+        }
+        ensure!(!levels.is_empty(), "no active WMI brightness panels");
+        Ok(levels)
+    })
 }
 
 fn wmi_instance_name(monitor: &IWbemClassObject) -> Result<String> {
@@ -247,95 +308,142 @@ fn wmi_instance_name(monitor: &IWbemClassObject) -> Result<String> {
     String::from_utf16(&text[..end]).context("decoding WMI instance name")
 }
 
-fn wmi_set(baselines: &BTreeMap<String, f32>, reference: f32, level: f32) -> Result<()> {
-    let _apartment = ComApartment::enter()?;
-    let services = wmi_services()?;
-    let monitors = wmi_query(
-        &services,
-        "SELECT * FROM WmiMonitorBrightnessMethods WHERE Active = TRUE",
-    )?;
-    ensure!(!monitors.is_empty(), "no active WMI brightness methods");
-    let mut class = None;
-    let mut signature = None;
-    let mut output_signature = None;
-    // SAFETY: GetMethod requires a class definition, not a queried CIM instance.
-    unsafe {
-        services
-            .GetObject(
-                &BSTR::from("WmiMonitorBrightnessMethods"),
-                WBEM_GENERIC_FLAG_TYPE(0),
-                None,
-                Some(&mut class),
-                None,
+fn set_wmi_monitors<T>(
+    baselines: &BTreeMap<String, f32>,
+    reference: f32,
+    level: f32,
+    monitors: impl IntoIterator<Item = Result<(String, T)>>,
+    mut write: impl FnMut(T, f32) -> Result<()>,
+) -> Result<()> {
+    let mut missing: BTreeSet<_> = baselines.keys().cloned().collect();
+    let writes = attempt_all(monitors.into_iter().map(|monitor| {
+        let (name, monitor) = monitor?;
+        if let Some(baseline) = baselines.get(&name) {
+            missing.remove(&name);
+            write(
+                monitor,
+                super::scaled_brightness(*baseline, reference, level),
             )
-            .context("loading WMI brightness methods class")?;
-        class
-            .context("missing WMI brightness methods class")?
-            .GetMethod(
-                w!("WmiSetBrightness"),
-                0,
-                &mut signature,
-                &mut output_signature,
-            )
-            .context("reading WmiSetBrightness signature")?;
-    }
-    let signature = signature.context("missing WmiSetBrightness input signature")?;
-    for monitor in monitors {
-        let name = wmi_instance_name(&monitor)?;
-        let Some(baseline) = baselines.get(&name) else {
-            continue;
-        };
-        let percent = (super::scaled_brightness(*baseline, reference, level) * 100.0).round() as u8;
-        let path = property(&monitor, w!("__PATH"))?;
-        let mut path_text = [0u16; 4096];
-        // SAFETY: buffer sizes and interface lifetimes are valid within this apartment.
-        unsafe {
-            VariantToString(&path.0, &mut path_text).context("converting WMI monitor path")?;
+            .with_context(|| format!("setting captured WMI panel {name}"))?;
         }
-        let end = path_text
-            .iter()
-            .position(|&c| c == 0)
-            .context("unterminated WMI path")?;
-        let path = BSTR::from(String::from_utf16(&path_text[..end]).context("decoding WMI path")?);
-        // SAFETY: signature is returned by WMI; the new instance is local to this call.
-        let input = unsafe { signature.SpawnInstance(0) }
-            .context("creating WmiSetBrightness parameters")?;
-        let mut timeout = OwnedVariant::default();
-        let mut brightness = OwnedVariant::default();
-        // SAFETY: assign matching scalar tags and union members; neither allocates.
+        Ok(())
+    }));
+    let missing = if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "captured WMI panels are unavailable: {}",
+            missing.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+    };
+    attempt_all([writes, missing])
+}
+
+fn attempt_all(attempts: impl IntoIterator<Item = Result<()>>) -> Result<()> {
+    let errors: Vec<_> = attempts
+        .into_iter()
+        .filter_map(|result| result.err().map(|error| format!("{error:#}")))
+        .collect();
+    ensure!(errors.is_empty(), "{}", errors.join("; "));
+    Ok(())
+}
+
+fn wmi_set(baselines: &BTreeMap<String, f32>, reference: f32, level: f32) -> Result<()> {
+    com_call(|| {
+        let services = wmi_services()?;
+        let monitors = wmi_query(
+            &services,
+            "SELECT * FROM WmiMonitorBrightnessMethods WHERE Active = TRUE",
+        )?;
+        ensure!(!monitors.is_empty(), "no active WMI brightness methods");
+        let mut class = None;
+        let mut signature = None;
+        let mut output_signature = None;
+        // SAFETY: GetMethod requires a class definition, not a queried CIM instance.
         unsafe {
-            (*timeout.0.Anonymous.Anonymous).vt = VT_I4;
-            (*timeout.0.Anonymous.Anonymous).Anonymous.lVal = 0;
-            (*brightness.0.Anonymous.Anonymous).vt = VT_UI1;
-            (*brightness.0.Anonymous.Anonymous).Anonymous.bVal = percent;
-            input
-                .Put(w!("Timeout"), 0, &timeout.0, 0)
-                .context("setting WMI timeout parameter")?;
-            input
-                .Put(w!("Brightness"), 0, &brightness.0, 0)
-                .context("setting WMI brightness parameter")?;
-            let mut output = None;
             services
-                .ExecMethod(
-                    &path,
-                    &BSTR::from("WmiSetBrightness"),
+                .GetObject(
+                    &BSTR::from("WmiMonitorBrightnessMethods"),
                     WBEM_GENERIC_FLAG_TYPE(0),
                     None,
-                    &input,
-                    Some(&mut output),
+                    Some(&mut class),
                     None,
                 )
-                .context("calling WmiSetBrightness")?;
-            let returned = property(
-                &output.context("WmiSetBrightness returned no result")?,
-                w!("ReturnValue"),
-            )?;
-            let code =
-                VariantToUInt32(&returned.0).context("reading WmiSetBrightness return value")?;
-            ensure!(code == 0, "WmiSetBrightness returned {code}");
+                .context("loading WMI brightness methods class")?;
+            class
+                .context("missing WMI brightness methods class")?
+                .GetMethod(
+                    w!("WmiSetBrightness"),
+                    0,
+                    &mut signature,
+                    &mut output_signature,
+                )
+                .context("reading WmiSetBrightness signature")?;
         }
-    }
-    Ok(())
+        let signature = signature.context("missing WmiSetBrightness input signature")?;
+        set_wmi_monitors(
+            baselines,
+            reference,
+            level,
+            monitors
+                .into_iter()
+                .map(|monitor| wmi_instance_name(&monitor).map(|name| (name, monitor))),
+            |monitor, level| {
+                let percent = (level * 100.0).round() as u8;
+                let path = property(&monitor, w!("__PATH"))?;
+                let mut path_text = [0u16; 4096];
+                // SAFETY: buffer sizes and interface lifetimes are valid within this apartment.
+                unsafe {
+                    VariantToString(&path.0, &mut path_text)
+                        .context("converting WMI monitor path")?;
+                }
+                let end = path_text
+                    .iter()
+                    .position(|&c| c == 0)
+                    .context("unterminated WMI path")?;
+                let path =
+                    BSTR::from(String::from_utf16(&path_text[..end]).context("decoding WMI path")?);
+                // SAFETY: signature is returned by WMI; the new instance is local to this call.
+                let input = unsafe { signature.SpawnInstance(0) }
+                    .context("creating WmiSetBrightness parameters")?;
+                let mut timeout = OwnedVariant::default();
+                let mut brightness = OwnedVariant::default();
+                // SAFETY: assign matching scalar tags and union members; neither allocates.
+                unsafe {
+                    (*timeout.0.Anonymous.Anonymous).vt = VT_I4;
+                    (*timeout.0.Anonymous.Anonymous).Anonymous.lVal = 0;
+                    (*brightness.0.Anonymous.Anonymous).vt = VT_UI1;
+                    (*brightness.0.Anonymous.Anonymous).Anonymous.bVal = percent;
+                    input
+                        .Put(w!("Timeout"), 0, &timeout.0, 0)
+                        .context("setting WMI timeout parameter")?;
+                    input
+                        .Put(w!("Brightness"), 0, &brightness.0, 0)
+                        .context("setting WMI brightness parameter")?;
+                    let mut output = None;
+                    services
+                        .ExecMethod(
+                            &path,
+                            &BSTR::from("WmiSetBrightness"),
+                            WBEM_GENERIC_FLAG_TYPE(0),
+                            None,
+                            &input,
+                            Some(&mut output),
+                            None,
+                        )
+                        .context("calling WmiSetBrightness")?;
+                    let returned = property(
+                        &output.context("WmiSetBrightness returned no result")?,
+                        w!("ReturnValue"),
+                    )?;
+                    let code = VariantToUInt32(&returned.0)
+                        .context("reading WmiSetBrightness return value")?;
+                    ensure!(code == 0, "WmiSetBrightness returned {code}");
+                }
+                Ok(())
+            },
+        )
+    })
 }
 
 struct PhysicalMonitors(Vec<PHYSICAL_MONITOR>);
@@ -420,6 +528,26 @@ struct DdcBaselines {
     levels: Vec<(usize, f32, u32, u32)>,
 }
 
+fn write_ddc(
+    value: u32,
+    write: impl FnOnce(u32) -> Result<()>,
+    mut read: impl FnMut() -> Result<(u32, u32, u32)>,
+) -> Result<()> {
+    write(value)?;
+    let matches = |(min, current, max): (u32, u32, u32)| {
+        current.abs_diff(value) <= ((max - min) / 100).max(1)
+    };
+    if matches(read()?) {
+        return Ok(());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    ensure!(
+        matches(read()?),
+        "DDC/CI brightness did not reach the requested level {value}"
+    );
+    Ok(())
+}
+
 impl DdcBaselines {
     fn capture() -> Result<Self> {
         let monitors = physical_monitors()?;
@@ -438,67 +566,95 @@ impl DdcBaselines {
     }
 
     fn set(&self, reference: f32, level: f32) -> Result<()> {
-        for &(index, baseline, min, max) in &self.levels {
+        self.set_with(reference, level, |index, value| {
+            let monitor = &self.monitors.0[index];
+            write_ddc(
+                value,
+                |value| {
+                    ensure!(
+                        unsafe { SetMonitorBrightness(monitor.hPhysicalMonitor, value) } != 0,
+                        "setting DDC/CI brightness: {}",
+                        windows::core::Error::from_thread()
+                    );
+                    Ok(())
+                },
+                || ddc_range(monitor),
+            )
+        })
+    }
+
+    fn set_with(
+        &self,
+        reference: f32,
+        level: f32,
+        mut write: impl FnMut(usize, u32) -> Result<()>,
+    ) -> Result<()> {
+        attempt_all(self.levels.iter().map(|&(index, baseline, min, max)| {
             let scaled = super::scaled_brightness(baseline, reference, level);
             let value = (f64::from(min) + f64::from(scaled) * f64::from(max - min)).round() as u32;
-            // SAFETY: retained live handle and value within its captured native range.
-            ensure!(
-                unsafe { SetMonitorBrightness(self.monitors.0[index].hPhysicalMonitor, value) }
-                    != 0,
-                "setting DDC/CI brightness: {}",
-                windows::core::Error::from_thread()
-            );
-        }
-        Ok(())
+            write(index, value)
+        }))
     }
 }
 
+#[derive(Default)]
 struct WindowsBrightness {
-    wmi: bool,
-    ddc: bool,
     wmi_baselines: BTreeMap<String, f32>,
     ddc_baselines: Option<DdcBaselines>,
     reference: f32,
 }
 
-impl Brightness for WindowsBrightness {
-    fn get(&mut self) -> Result<f32> {
-        let wmi = if self.wmi {
-            wmi_levels()?
-        } else {
-            BTreeMap::new()
-        };
-        let ddc = if self.ddc {
-            Some(DdcBaselines::capture()?)
-        } else {
-            None
-        };
-        let levels: Vec<_> = wmi
+impl WindowsBrightness {
+    fn capture(
+        &mut self,
+        wmi: Result<BTreeMap<String, f32>>,
+        ddc: Result<DdcBaselines>,
+    ) -> Result<f32> {
+        self.wmi_baselines = wmi.unwrap_or_default();
+        self.ddc_baselines = ddc.ok();
+        self.reference = 0.0;
+        let levels: Vec<_> = self
+            .wmi_baselines
             .values()
             .copied()
             .chain(
-                ddc.iter()
+                self.ddc_baselines
+                    .iter()
                     .flat_map(|d| d.levels.iter().map(|&(_, level, _, _)| level)),
             )
             .collect();
         ensure!(!levels.is_empty(), "no supported brightness monitors");
         self.reference = levels.into_iter().fold(0.0, f32::max);
-        self.wmi_baselines = wmi;
-        self.ddc_baselines = ddc;
         Ok(self.reference)
     }
 
-    fn set(&mut self, level: f32) -> Result<()> {
+    fn set_with(
+        &mut self,
+        level: f32,
+        wmi: impl FnOnce(&BTreeMap<String, f32>, f32, f32) -> Result<()>,
+        ddc: impl FnOnce(&DdcBaselines, f32, f32) -> Result<()>,
+    ) -> Result<()> {
         let level = normalized(level)?;
         if self.reference > 0.0 {
-            if self.wmi {
-                wmi_set(&self.wmi_baselines, self.reference, level)?;
-            }
-            if let Some(ddc) = &self.ddc_baselines {
-                ddc.set(self.reference, level)?;
-            }
+            let wmi = (!self.wmi_baselines.is_empty())
+                .then(|| wmi(&self.wmi_baselines, self.reference, level));
+            let ddc = self
+                .ddc_baselines
+                .as_ref()
+                .map(|baselines| ddc(baselines, self.reference, level));
+            attempt_all(wmi.into_iter().chain(ddc))?;
         }
         Ok(())
+    }
+}
+
+impl Brightness for WindowsBrightness {
+    fn get(&mut self) -> Result<f32> {
+        self.capture(wmi_levels(), DdcBaselines::capture())
+    }
+
+    fn set(&mut self, level: f32) -> Result<()> {
+        self.set_with(level, wmi_set, DdcBaselines::set)
     }
 }
 
@@ -524,6 +680,7 @@ impl ShutdownPrivilege {
             previous: TOKEN_PRIVILEGES::default(),
         };
         let mut luid = LUID::default();
+        let mut return_length = 0;
         // SAFETY: valid token and single-entry privilege structure; capture previous state.
         unsafe {
             LookupPrivilegeValueW(None, SE_SHUTDOWN_NAME, &mut luid)
@@ -542,7 +699,7 @@ impl ShutdownPrivilege {
                 Some(&request),
                 size_of::<TOKEN_PRIVILEGES>() as u32,
                 Some(&mut guard.previous),
-                None,
+                Some(&mut return_length),
             )
             .context("enabling SeShutdownPrivilege")?;
             ensure!(
@@ -623,18 +780,12 @@ impl Power for WindowsPower {
 }
 
 pub fn backends() -> Backends {
-    let mut brightness = WindowsBrightness {
-        wmi: wmi_levels().is_ok(),
-        ddc: DdcBaselines::capture().is_ok(),
-        wmi_baselines: BTreeMap::new(),
-        ddc_baselines: None,
-        reference: 0.0,
-    };
+    let mut brightness = WindowsBrightness::default();
     let brightness = brightness
         .get()
         .ok()
         .map(|_| Box::new(brightness) as Box<dyn Brightness>);
-    let mut volume = WindowsVolume;
+    let mut volume = WindowsVolume::default();
     let volume = volume
         .get()
         .ok()
@@ -650,7 +801,431 @@ pub fn backends() -> Backends {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ddc_ignoring_successful_writes_reports_failure_for_overlay_fallback() {
+        let mut written = None;
+        let result = write_ddc(
+            5,
+            |value| {
+                written = Some(value);
+                Ok(())
+            },
+            || Ok((0, 10, 100)),
+        );
+        assert_eq!(written, Some(5));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ddc_accepts_applied_or_single_step_rounded_writes() {
+        for actual in [4, 5, 6] {
+            write_ddc(5, |_| Ok(()), || Ok((0, actual, 100))).unwrap();
+        }
+    }
+    use windows::Win32::Security::{GetTokenInformation, TokenPrivileges};
     use windows::Win32::System::SystemServices::{HIBERFILE_TYPE_NONE, HIBERFILE_TYPE_REDUCED};
+
+    #[derive(Debug)]
+    struct ApartmentBoundFailure(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl std::fmt::Display for ApartmentBoundFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("apartment-bound failure")
+        }
+    }
+
+    impl std::error::Error for ApartmentBoundFailure {}
+
+    impl Drop for ApartmentBoundFailure {
+        fn drop(&mut self) {
+            use windows::Win32::System::Com::{APTTYPE, APTTYPEQUALIFIER, CoGetApartmentType};
+            let mut apartment = APTTYPE::default();
+            let mut qualifier = APTTYPEQUALIFIER::default();
+            let active = unsafe { CoGetApartmentType(&mut apartment, &mut qualifier) }.is_ok();
+            self.0.store(active, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn com_errors_are_released_before_the_call_apartment_is_closed() {
+        std::thread::spawn(|| {
+            let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let error =
+                com_call::<()>(|| Err(ApartmentBoundFailure(released.clone()).into())).unwrap_err();
+            assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(error.to_string().contains("apartment-bound failure"));
+            drop(error);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn wmi_error_can_be_reported_after_a_fresh_mta_is_closed() {
+        std::thread::spawn(|| {
+            let error = com_call(|| {
+                let services = wmi_services()?;
+                wmi_query(&services, "SELECT * FROM NightcapMissingBrightnessClass")?;
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(!error.to_string().is_empty());
+            drop(error);
+        })
+        .join()
+        .unwrap();
+    }
+
+    fn shutdown_privilege_attributes() -> Option<u32> {
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.unwrap();
+        let mut luid = LUID::default();
+        let mut length = 0;
+        let result = (|| -> Result<Option<u32>> {
+            unsafe { LookupPrivilegeValueW(None, SE_SHUTDOWN_NAME, &mut luid) }?;
+            let _ = unsafe { GetTokenInformation(token, TokenPrivileges, None, 0, &mut length) };
+            let mut buffer = vec![0u32; (length as usize).div_ceil(size_of::<u32>())];
+            unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenPrivileges,
+                    Some(buffer.as_mut_ptr().cast()),
+                    length,
+                    &mut length,
+                )?;
+                let privileges = &*buffer.as_ptr().cast::<TOKEN_PRIVILEGES>();
+                let entries = std::slice::from_raw_parts(
+                    privileges.Privileges.as_ptr(),
+                    privileges.PrivilegeCount as usize,
+                );
+                Ok(entries
+                    .iter()
+                    .find(|entry| {
+                        entry.Luid.LowPart == luid.LowPart && entry.Luid.HighPart == luid.HighPart
+                    })
+                    .map(|entry| entry.Attributes.0))
+            }
+        })();
+        unsafe { CloseHandle(token) }.unwrap();
+        result.unwrap()
+    }
+
+    #[test]
+    fn shutdown_privilege_guard_restores_the_process_token() {
+        let before = shutdown_privilege_attributes();
+        if before.is_none() {
+            assert!(ShutdownPrivilege::enable().is_err());
+            return;
+        }
+        let guard =
+            ShutdownPrivilege::enable().expect("acquire shutdown privilege without a power action");
+        assert_ne!(
+            shutdown_privilege_attributes().unwrap() & SE_PRIVILEGE_ENABLED.0,
+            0
+        );
+        drop(guard);
+        assert_eq!(shutdown_privilege_attributes(), before);
+    }
+
+    fn endpoint_id(name: &str) -> Vec<u16> {
+        name.encode_utf16().chain([0]).collect()
+    }
+
+    #[derive(Default)]
+    struct AudioDevices {
+        default: String,
+        levels: BTreeMap<String, f32>,
+        writes: Vec<(String, f32)>,
+    }
+
+    impl AudioDevices {
+        fn read(&self) -> Result<(Vec<u16>, f32)> {
+            let level = self
+                .levels
+                .get(&self.default)
+                .context("default disconnected")?;
+            Ok((endpoint_id(&self.default), *level))
+        }
+
+        fn write(&mut self, id: Option<&[u16]>, level: f32) -> Result<()> {
+            let name = match id {
+                Some(id) => String::from_utf16(&id[..id.len() - 1])?,
+                None => self.default.clone(),
+            };
+            *self
+                .levels
+                .get_mut(&name)
+                .context("endpoint disconnected")? = level;
+            self.writes.push((name, level));
+            Ok(())
+        }
+    }
+
+    fn audio_devices() -> AudioDevices {
+        AudioDevices {
+            default: "speakers".into(),
+            levels: BTreeMap::from([("speakers".into(), 0.8), ("headphones".into(), 0.4)]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn volume_rejects_writes_before_a_successful_capture() {
+        let mut volume = WindowsVolume::default();
+        let mut devices = audio_devices();
+        assert!(
+            volume
+                .set_with(0.2, |id, level| devices.write(id, level))
+                .is_err()
+        );
+        assert!(devices.writes.is_empty());
+        assert!(
+            volume
+                .get_with(|| Ok((endpoint_id("speakers"), f32::NAN)))
+                .is_err()
+        );
+        assert!(
+            volume
+                .set_with(0.2, |id, level| devices.write(id, level))
+                .is_err()
+        );
+        assert!(devices.writes.is_empty());
+    }
+
+    #[test]
+    fn volume_keeps_the_captured_device_when_the_default_changes() {
+        let mut volume = WindowsVolume::default();
+        let mut devices = audio_devices();
+        let baseline = volume.get_with(|| devices.read()).unwrap();
+        devices.default = "headphones".into();
+        volume
+            .set_with(0.2, |id, level| devices.write(id, level))
+            .unwrap();
+        volume
+            .set_with(baseline, |id, level| devices.write(id, level))
+            .unwrap();
+        assert_eq!(
+            devices.writes,
+            [("speakers".into(), 0.2), ("speakers".into(), 0.8)]
+        );
+        assert_eq!(devices.levels["headphones"], 0.4);
+        assert_eq!(volume.get_with(|| devices.read()).unwrap(), 0.4);
+        volume
+            .set_with(0.1, |id, level| devices.write(id, level))
+            .unwrap();
+        assert_eq!(devices.levels["headphones"], 0.1);
+        assert_eq!(devices.levels["speakers"], 0.8);
+    }
+
+    #[test]
+    fn volume_retries_a_disconnected_capture_without_writing_the_new_default() {
+        let mut volume = WindowsVolume::default();
+        let mut devices = audio_devices();
+        let baseline = volume.get_with(|| devices.read()).unwrap();
+        devices.default = "headphones".into();
+        devices.levels.remove("speakers");
+        assert!(
+            volume
+                .set_with(baseline, |id, level| devices.write(id, level))
+                .is_err()
+        );
+        assert!(devices.writes.is_empty());
+        assert!(volume.get_with(|| anyhow::bail!("capture failed")).is_err());
+        assert!(
+            volume
+                .get_with(|| Ok((endpoint_id("headphones"), f32::NAN)))
+                .is_err()
+        );
+        devices.levels.insert("speakers".into(), 0.1);
+        volume
+            .set_with(baseline, |id, level| devices.write(id, level))
+            .unwrap();
+        assert_eq!(devices.writes, [("speakers".into(), 0.8)]);
+        assert_eq!(devices.levels["headphones"], 0.4);
+    }
+
+    fn ddc_baselines() -> DdcBaselines {
+        DdcBaselines {
+            monitors: PhysicalMonitors(Vec::new()),
+            levels: vec![(0, 0.8, 10, 110), (1, 0.4, 20, 220)],
+        }
+    }
+
+    fn brightness() -> WindowsBrightness {
+        WindowsBrightness::default()
+    }
+
+    #[test]
+    fn brightness_capture_survives_either_provider_becoming_unavailable() {
+        let mut brightness = brightness();
+        let wmi = BTreeMap::from([("panel".into(), 0.6)]);
+        assert_eq!(
+            brightness
+                .capture(Ok(wmi.clone()), Ok(ddc_baselines()))
+                .unwrap(),
+            0.8
+        );
+        assert_eq!(
+            brightness
+                .capture(Ok(wmi), Err(anyhow::anyhow!("DDC unavailable")))
+                .unwrap(),
+            0.6
+        );
+        assert!(brightness.ddc_baselines.is_none());
+        assert_eq!(
+            brightness
+                .capture(Err(anyhow::anyhow!("WMI unavailable")), Ok(ddc_baselines()))
+                .unwrap(),
+            0.8
+        );
+        assert!(brightness.wmi_baselines.is_empty());
+    }
+
+    #[test]
+    fn brightness_failed_capture_does_not_reuse_old_provider_baselines() {
+        let mut brightness = brightness();
+        brightness
+            .capture(
+                Ok(BTreeMap::from([("panel".into(), 0.6)])),
+                Ok(ddc_baselines()),
+            )
+            .unwrap();
+        assert!(
+            brightness
+                .capture(
+                    Err(anyhow::anyhow!("WMI unavailable")),
+                    Err(anyhow::anyhow!("DDC unavailable"))
+                )
+                .is_err()
+        );
+        assert!(brightness.wmi_baselines.is_empty());
+        assert!(brightness.ddc_baselines.is_none());
+        let mut writes = Vec::new();
+        brightness
+            .set_with(
+                0.5,
+                |_, _, _| {
+                    writes.push("WMI");
+                    Ok(())
+                },
+                |_, _, _| anyhow::bail!("stale DDC write"),
+            )
+            .unwrap();
+        assert!(writes.is_empty());
+    }
+
+    #[test]
+    fn brightness_restores_ddc_even_when_wmi_restore_fails() {
+        let mut brightness = brightness();
+        brightness
+            .capture(
+                Ok(BTreeMap::from([("panel".into(), 0.6)])),
+                Ok(ddc_baselines()),
+            )
+            .unwrap();
+        let mut restored = Vec::new();
+        assert!(
+            brightness
+                .set_with(
+                    0.8,
+                    |_, _, _| anyhow::bail!("WMI disconnected"),
+                    |ddc, reference, level| ddc.set_with(reference, level, |index, value| {
+                        restored.push((index, value));
+                        Ok(())
+                    }),
+                )
+                .is_err()
+        );
+        assert_eq!(restored, [(0, 90), (1, 100)]);
+    }
+
+    #[test]
+    fn brightness_skips_providers_without_current_baselines() {
+        let mut brightness = brightness();
+        brightness
+            .capture(Err(anyhow::anyhow!("WMI unavailable")), Ok(ddc_baselines()))
+            .unwrap();
+        let mut restored = Vec::new();
+        brightness
+            .set_with(
+                0.8,
+                |_, _, _| anyhow::bail!("uncaptured WMI provider"),
+                |ddc, reference, level| {
+                    ddc.set_with(reference, level, |index, value| {
+                        restored.push((index, value));
+                        Ok(())
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(restored, [(0, 90), (1, 100)]);
+    }
+
+    #[test]
+    fn ddc_restore_attempts_healthy_monitors_after_a_failure_and_retries() {
+        let ddc = ddc_baselines();
+        let mut restored = BTreeMap::from([(0, 0), (1, 0), (2, 77)]);
+        assert!(
+            ddc.set_with(0.8, 0.8, |index, value| {
+                ensure!(index != 0, "monitor disconnected");
+                restored.insert(index, value);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(restored, BTreeMap::from([(0, 0), (1, 100), (2, 77)]));
+        ddc.set_with(0.8, 0.8, |index, value| {
+            restored.insert(index, value);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(restored, BTreeMap::from([(0, 90), (1, 100), (2, 77)]));
+    }
+
+    #[test]
+    fn wmi_restore_reports_missing_captured_panels_and_restores_present_panels() {
+        let baselines = BTreeMap::from([("missing".into(), 0.8), ("present".into(), 0.4)]);
+        let mut restored = BTreeMap::from([(1, 0.1), (2, 0.7)]);
+        let result = set_wmi_monitors(
+            &baselines,
+            0.8,
+            0.8,
+            [Ok(("present".into(), 1)), Ok(("uncaptured".into(), 2))],
+            |monitor, level| {
+                restored.insert(monitor, level);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!((restored[&1] - 0.4).abs() < 0.000001);
+        assert_eq!(restored[&2], 0.7);
+    }
+
+    #[test]
+    fn wmi_restore_continues_after_a_monitor_write_or_identity_failure() {
+        let baselines = BTreeMap::from([("broken".into(), 0.8), ("healthy".into(), 0.4)]);
+        let mut restored = BTreeMap::from([(0, 0.1), (1, 0.1), (2, 0.7)]);
+        let result = set_wmi_monitors(
+            &baselines,
+            0.8,
+            0.8,
+            [
+                Ok(("broken".into(), 0)),
+                Err(anyhow::anyhow!("unreadable monitor identity")),
+                Ok(("healthy".into(), 1)),
+                Ok(("uncaptured".into(), 2)),
+            ],
+            |monitor, level| {
+                ensure!(monitor != 0, "monitor write failed");
+                restored.insert(monitor, level);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(restored[&0], 0.1);
+        assert!((restored[&1] - 0.4).abs() < 0.000001);
+        assert_eq!(restored[&2], 0.7);
+    }
 
     #[test]
     fn hibernate_requires_s4_and_a_full_hibernation_file() {

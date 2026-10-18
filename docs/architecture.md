@@ -3,6 +3,7 @@
 Nightcap is a single Rust binary (eframe/egui 0.36). The design source of truth is
 `docs/design/mockup.html` (open it, read its CSS/JS) plus `docs/design/*.png`.
 Follow the system light/dark appearance, as the mockup does.
+Windows selects eframe's OpenGL renderer for transparent and hidden viewports.
 
 ## Modules (one owner per file during parallel work)
 
@@ -61,6 +62,8 @@ window is hidden and egui is not repainting. It owns the platform backends.
   gap over 5 s while Finishing (30 s while Running/Paused), plus native macOS workspace wake notifications).
 - If hardware brightness is unsupported, the dim fade drives `overlay_alpha` instead
   (max alpha 0.9 at target 0 %, mapped linearly).
+  A failed native write rebases overlay opacity against the last successful native
+  level, avoiding an abrupt absolute-brightness jump while retaining restoration.
 - Calls a `repaint: Box<dyn Fn() + Send>` hook after each snapshot change so the UI and
   tray refresh.
 

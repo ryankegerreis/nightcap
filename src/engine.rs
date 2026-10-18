@@ -201,6 +201,7 @@ struct FadeTrack {
     from: Option<f32>,
     last: Option<f32>,
     overlay: bool,
+    overlay_reference: Option<f32>,
     unavailable: bool,
 }
 
@@ -499,9 +500,16 @@ impl<C: Clock> Engine<C> {
             self.report_error("setting brightness", error);
             self.snapshot.brightness_supported = false;
             self.brightness.overlay = true;
+            self.brightness.overlay_reference = self.brightness.last;
         }
         if self.brightness.overlay {
-            self.snapshot.overlay_alpha = 0.9 * (1.0 - level);
+            let reference = self.brightness.overlay_reference.unwrap_or(1.0);
+            let relative = if reference > 0.0 {
+                level / reference
+            } else {
+                1.0
+            };
+            self.snapshot.overlay_alpha = 0.9 * (1.0 - relative.clamp(0.0, 1.0));
         }
         self.brightness.last = Some(level);
         self.snapshot.brightness_percent = Some(level * 100.0);
@@ -1206,6 +1214,25 @@ mod tests {
         h.engine.command(Command::Cancel);
         assert!(h.volume.state.lock().unwrap().set_calls.is_empty());
         close(h.brightness(), 0.8);
+    }
+
+    #[test]
+    fn native_brightness_failure_rebases_overlay_without_an_absolute_level_jump() {
+        let mut settings = preferences();
+        settings.dim.target_percent = 0;
+        let mut h = Harness::new(settings, true);
+        h.brightness.state.lock().unwrap().level = 0.1;
+        h.brightness.state.lock().unwrap().fail_set = true;
+        h.start();
+        h.advance(61);
+        close(h.brightness(), 0.1);
+        close(h.engine.snapshot().overlay_alpha, 0.015);
+        h.advance(29);
+        close(h.engine.snapshot().overlay_alpha, 0.45);
+        h.brightness.state.lock().unwrap().fail_set = false;
+        h.engine.command(Command::Cancel);
+        close(h.brightness(), 0.1);
+        close(h.engine.snapshot().overlay_alpha, 0.0);
     }
 
     #[test]
