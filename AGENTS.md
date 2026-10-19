@@ -2,6 +2,38 @@
 
 Architecture and module ownership: [`docs/architecture.md`](docs/architecture.md).
 
+## Required cross-model code review
+
+Before declaring any implementation task complete or handing it back to the
+user, obtain an independent review of the final changes, including documentation
+and configuration changes, from a different agent in the other model family:
+
+- GPT / Codex implements → Claude reviews.
+- Claude implements → GPT / Codex reviews.
+
+Use an available model from the required family; a different model in the same
+family or a self-review does not satisfy this requirement. In T3 Code, discover
+providers and models with `orchestrator_capabilities` and use `delegate_task`
+with an explicit provider and model for cross-provider review. Review the current
+changes, including uncommitted edits; a separate worktree will not include those
+edits unless they are explicitly supplied to the reviewer.
+
+Give the reviewer the user's requirements, the exact diff or commit range, and
+relevant validation results. The reviewer must inspect correctness, regressions,
+missing requirements, and test coverage, and return actionable findings with
+file references and severity (critical, important, or minor), or explicitly state
+that no issues were found. Reviewers must remain read-only and must not delegate
+further reviews. The review requirement applies only to the implementing agent;
+review tasks do not trigger further reviews.
+
+Resolve critical and important findings, run the relevant checks, and obtain
+another review of those fixes before declaring completion. Explain any finding
+you decline to change. In the final response, identify the reviewer model,
+summarize the review outcome and validation, and disclose unresolved findings.
+If the required reviewer is unavailable or fails, report that review is blocked
+and the work is awaiting review; do not silently substitute a same-family agent
+or claim the task is fully complete.
+
 ## Pull request titles set the version
 
 Pull requests are squash-merged, and the PR title becomes the commit on
