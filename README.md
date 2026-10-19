@@ -4,7 +4,7 @@ A sleep timer for your computer, like the one on a TV. Set a time, and Nightcap 
 
 Nightcap is built in Rust with [egui](https://github.com/emilk/egui) and runs on macOS, Windows and Linux. It works offline and needs no account.
 
-> **Status:** working desktop app. Timer, fades, menu bar/tray controls, Settings, and overlay fallback are integrated. macOS has been exercised with real brightness and volume fades; Windows has native UI, volume, restoration and overlay checks. Linux is compile-checked. See the platform hardening reports for coverage and limitations.
+> **Status:** working desktop app. Timer, fades, menu bar/tray controls, Settings, and overlay fallback are integrated. macOS has been exercised with real brightness and volume fades; Windows has native UI, volume, restoration and overlay checks. Linux has native engine and isolated X11/tray checks, with unresolved overlay input and Settings issues. See the platform hardening reports for coverage and limitations.
 
 ![Nightcap main window in light and dark appearance](docs/design/main-window.png)
 
@@ -189,3 +189,18 @@ Keep the connected displays and selected audio output unchanged during this test
 It does not test actual suspend, hibernation, shutdown, or physical reconnection.
 The [Windows hardening report](docs/windows-hardening.md) records the native test
 run, reproduced issues and remaining limitations.
+
+Linux native discovery runs in `cargo test`. Linux CI currently runs at release
+time; there is no Linux pull-request test job. To exercise available brightness
+and volume controls, close other Nightcap instances and run this opt-in test
+alone with stable devices:
+
+```sh
+cargo test --locked --test linux_runtime -- --ignored --nocapture --test-threads=1
+```
+
+Power actions are always dry-run, and the test attempts to restore captured
+levels on exit. The test refuses raw PipeWire/PulseAudio volume above 100%, which
+the normalized backend cannot restore faithfully. The
+[Linux verification report](docs/linux-hardening.md) records
+the Ubuntu run, unresolved desktop issues and hardware coverage limits.
