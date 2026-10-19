@@ -31,16 +31,24 @@ monitor brightness at 10%; both were verified restored after hardware tests.
   its endpoint ID; subsequent writes and restore retries reopen that endpoint.
   Injected-device tests verify switching, disconnect failure, retry and the
   next capture selecting the new default without changing real OS routing.
+  A captured output that is no longer present or active is reported as
+  disconnected. The engine then drops its restore instead of retrying it, so
+  the next timer captures and fades the new default output.
 - **Partial display failures:** capture no longer requires both WMI and DDC
-  to remain available. Restoration attempts all captured providers and monitors
-  even after a failure, and missing WMI identities keep restoration pending.
-  Deterministic tests cover missing/failed devices and untouched new devices.
+  to remain available. Each display records the value Nightcap last wrote.
+  A display that fails sits out the rest of the fade while the others keep
+  fading natively. Only a failure on every display switches to the overlay.
+  Restoration retries the displays that failed and skips displays that are
+  already restored, so a retry does not overwrite a display the user has
+  adjusted since. Missing WMI identities keep restoration pending. Retries
+  stop after about two minutes. Deterministic tests cover missing/failed
+  devices and untouched new devices.
 - **Silently ignored brightness writes:** this MSI display reported brightness
   range 0–100 and current 10. Both high-level DDC and VCP writes to 5 returned
   success, but read-back remained 10, including after a one-second delay; a
   request for zero was also ignored. DDC writes now verify read-back, allow
-  one native step or 1% tolerance, retry once after 100 ms, then report failure
-  so the engine uses the overlay. The original level remains available for
+  one native step or 1% tolerance, retry once after 100 ms (also when the
+  first read-back fails), then report failure so the engine uses the overlay. The original level remains available for
   restoration. Working native hardware dimming was not established on this host.
 - **Fallback continuity:** native failure originally converted a roughly 10%
   hardware level directly into an approximately 83% opaque overlay. A failing

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
 
-use super::{Backends, Brightness, Power, Volume};
+use super::{Backends, Brightness, Disconnected, Partial, Power, Volume};
 use crate::settings::EndAction;
 
 pub struct UnsupportedPower;
@@ -31,6 +31,10 @@ pub struct MockLevelState {
     pub set_calls: Vec<f32>,
     pub fail_get: bool,
     pub fail_set: bool,
+    /// Writes still apply but report that some displays failed.
+    pub partial_set: bool,
+    /// Writes fail because the captured device is gone.
+    pub disconnected: bool,
 }
 
 macro_rules! mock_level {
@@ -64,10 +68,16 @@ macro_rules! mock_level {
             fn set(&mut self, level: f32) -> Result<()> {
                 let mut state = self.state.lock().unwrap();
                 state.set_calls.push(level);
+                if state.disconnected {
+                    return Err(Disconnected("mock device disconnected".into()).into());
+                }
                 if state.fail_set {
                     bail!("mock set failed");
                 }
                 state.level = level;
+                if state.partial_set {
+                    return Err(Partial("mock display failed".into()).into());
+                }
                 Ok(())
             }
         }

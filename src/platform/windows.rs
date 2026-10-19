@@ -1,10 +1,7 @@
 //! Native Windows controls. COM interfaces live only inside individual calls,
 //! so constructing a backend on the UI thread and moving it to the engine is safe.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ptr,
-};
+use std::{collections::BTreeMap, ptr};
 
 use anyhow::{Context, Result, ensure};
 use windows::{
@@ -14,13 +11,13 @@ use windows::{
             GetPhysicalMonitorsFromHMONITOR, PHYSICAL_MONITOR, SetMonitorBrightness,
         },
         Foundation::{
-            CloseHandle, ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError, HANDLE, LPARAM, LUID,
-            RECT, RPC_E_CHANGED_MODE, RPC_E_TOO_LATE, SetLastError,
+            CloseHandle, ERROR_NOT_ALL_ASSIGNED, ERROR_NOT_FOUND, ERROR_SUCCESS, GetLastError,
+            HANDLE, LPARAM, LUID, RECT, RPC_E_CHANGED_MODE, RPC_E_TOO_LATE, SetLastError,
         },
         Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
         Media::Audio::{
-            Endpoints::IAudioEndpointVolume, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator,
-            eConsole, eRender,
+            AUDCLNT_E_DEVICE_INVALIDATED, DEVICE_STATE_ACTIVE, Endpoints::IAudioEndpointVolume,
+            IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
         },
         Security::{
             AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
@@ -50,10 +47,10 @@ use windows::{
             },
         },
     },
-    core::{BOOL, BSTR, PCWSTR, PWSTR, w},
+    core::{BOOL, BSTR, HRESULT, PCWSTR, PWSTR, w},
 };
 
-use super::{Backends, Brightness, Power, Volume};
+use super::{Backends, Brightness, Disconnected, Partial, Power, Volume};
 use crate::settings::EndAction;
 
 fn normalized(level: f32) -> Result<f32> {
@@ -89,7 +86,15 @@ impl Drop for ComApartment {
 
 fn com_call<T>(call: impl FnOnce() -> Result<T>) -> Result<T> {
     let _apartment = ComApartment::enter()?;
-    call().map_err(|error| anyhow::anyhow!("{error:#}"))
+    call().map_err(|error| {
+        let message = format!("{error:#}");
+        // Keep the kind the engine acts on; drop any apartment-bound error source.
+        if error.is::<Disconnected>() {
+            Disconnected(message).into()
+        } else {
+            anyhow::anyhow!(message)
+        }
+    })
 }
 
 #[derive(Default)]
@@ -112,17 +117,47 @@ fn endpoint(id: Option<&[u16]>) -> Result<(IMMDevice, IAudioEndpointVolume)> {
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                 .context("creating audio device enumerator")?;
         let device = match id {
-            Some(id) => enumerator
-                .GetDevice(PCWSTR(id.as_ptr()))
-                .context("reopening captured render endpoint")?,
+            Some(id) => {
+                let device = enumerator
+                    .GetDevice(PCWSTR(id.as_ptr()))
+                    .map_err(endpoint_error)
+                    .context("reopening captured render endpoint")?;
+                // Unplugged and disabled outputs stay enumerable but cannot take a level.
+                if device
+                    .GetState()
+                    .context("reading captured endpoint state")?
+                    != DEVICE_STATE_ACTIVE
+                {
+                    return Err(disconnected_endpoint());
+                }
+                device
+            }
             None => enumerator
                 .GetDefaultAudioEndpoint(eRender, eConsole)
                 .context("finding default render endpoint")?,
         };
         let volume = device
             .Activate(CLSCTX_ALL, None)
+            .map_err(endpoint_error)
             .context("activating audio endpoint volume")?;
         Ok((device, volume))
+    }
+}
+
+fn disconnected_endpoint() -> anyhow::Error {
+    Disconnected("the captured audio output is disconnected".into()).into()
+}
+
+fn endpoint_error(error: windows::core::Error) -> anyhow::Error {
+    if [
+        HRESULT::from_win32(ERROR_NOT_FOUND.0),
+        AUDCLNT_E_DEVICE_INVALIDATED,
+    ]
+    .contains(&error.code())
+    {
+        disconnected_endpoint()
+    } else {
+        error.into()
     }
 }
 
@@ -173,6 +208,7 @@ impl Volume for WindowsVolume {
             com_call(|| {
                 let (_device, endpoint) = endpoint(id)?;
                 unsafe { endpoint.SetMasterVolumeLevelScalar(level, ptr::null()) }
+                    .map_err(endpoint_error)
                     .context("setting endpoint volume")
             })
         })
@@ -308,54 +344,99 @@ fn wmi_instance_name(monitor: &IWbemClassObject) -> Result<String> {
     String::from_utf16(&text[..end]).context("decoding WMI instance name")
 }
 
-fn set_wmi_monitors<T>(
-    baselines: &BTreeMap<String, f32>,
+/// One captured display: its baseline, native range and the value Nightcap last
+/// wrote. A display that fails sits out the rest of the fade; restore retries it.
+#[derive(Clone, Copy, Debug)]
+struct Display {
+    baseline: f32,
+    min: u32,
+    max: u32,
+    written: Option<u32>,
+    failed: bool,
+}
+
+impl Display {
+    fn new(baseline: f32, min: u32, max: u32) -> Self {
+        Self {
+            baseline,
+            min,
+            max,
+            written: None,
+            failed: false,
+        }
+    }
+
+    fn value(&self, request: Request) -> u32 {
+        let scaled = super::scaled_brightness(self.baseline, request.reference, request.level);
+        (f64::from(self.min) + f64::from(scaled) * f64::from(self.max - self.min)).round() as u32
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Request {
     reference: f32,
     level: f32,
-    monitors: impl IntoIterator<Item = Result<(String, T)>>,
-    mut write: impl FnMut(T, f32) -> Result<()>,
-) -> Result<()> {
-    let mut missing: BTreeSet<_> = baselines.keys().cloned().collect();
-    let writes = attempt_all(monitors.into_iter().map(|monitor| {
-        let (name, monitor) = monitor?;
-        if let Some(baseline) = baselines.get(&name) {
-            missing.remove(&name);
-            write(
-                monitor,
-                super::scaled_brightness(*baseline, reference, level),
-            )
-            .with_context(|| format!("setting captured WMI panel {name}"))?;
+    restoring: bool,
+}
+
+#[derive(Default)]
+struct Writes {
+    applied: usize,
+    errors: Vec<String>,
+}
+
+impl Writes {
+    /// Healthy displays keep fading when others fail; only a total failure is fatal.
+    fn finish(self) -> Result<()> {
+        let message = self.errors.join("; ");
+        match (self.applied, self.errors.is_empty()) {
+            (0, true) => anyhow::bail!("no captured display accepts brightness changes"),
+            (_, true) => Ok(()),
+            (0, false) => Err(anyhow::anyhow!(message)),
+            _ => Err(Partial(message).into()),
         }
-        Ok(())
-    }));
-    let missing = if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "captured WMI panels are unavailable: {}",
-            missing.into_iter().collect::<Vec<_>>().join(", ")
-        ))
-    };
-    attempt_all([writes, missing])
+    }
 }
 
-fn attempt_all(attempts: impl IntoIterator<Item = Result<()>>) -> Result<()> {
-    let errors: Vec<_> = attempts
-        .into_iter()
-        .filter_map(|result| result.err().map(|error| format!("{error:#}")))
-        .collect();
-    ensure!(errors.is_empty(), "{}", errors.join("; "));
-    Ok(())
+/// Skips displays that already hold their value, so a retried restore leaves
+/// displays that were restored (and perhaps adjusted since) alone.
+fn set_displays<'a, K>(
+    displays: impl IntoIterator<Item = (K, &'a mut Display)>,
+    request: Request,
+    writes: &mut Writes,
+    mut write: impl FnMut(K, u32) -> Result<()>,
+) {
+    for (key, display) in displays {
+        if display.failed && !request.restoring {
+            continue;
+        }
+        let value = display.value(request);
+        if display.written != Some(value) {
+            if let Err(error) = write(key, value) {
+                display.failed = true;
+                writes.errors.push(format!("{error:#}"));
+                continue;
+            }
+            display.written = Some(value);
+        }
+        display.failed = false;
+        writes.applied += 1;
+    }
 }
 
-fn wmi_set(baselines: &BTreeMap<String, f32>, reference: f32, level: f32) -> Result<()> {
-    com_call(|| {
+struct WmiSession {
+    services: IWbemServices,
+    signature: IWbemClassObject,
+    panels: BTreeMap<String, IWbemClassObject>,
+}
+
+impl WmiSession {
+    fn open() -> Result<Self> {
         let services = wmi_services()?;
         let monitors = wmi_query(
             &services,
             "SELECT * FROM WmiMonitorBrightnessMethods WHERE Active = TRUE",
         )?;
-        ensure!(!monitors.is_empty(), "no active WMI brightness methods");
         let mut class = None;
         let mut signature = None;
         let mut output_signature = None;
@@ -380,70 +461,98 @@ fn wmi_set(baselines: &BTreeMap<String, f32>, reference: f32, level: f32) -> Res
                 )
                 .context("reading WmiSetBrightness signature")?;
         }
-        let signature = signature.context("missing WmiSetBrightness input signature")?;
-        set_wmi_monitors(
-            baselines,
-            reference,
-            level,
-            monitors
-                .into_iter()
-                .map(|monitor| wmi_instance_name(&monitor).map(|name| (name, monitor))),
-            |monitor, level| {
-                let percent = (level * 100.0).round() as u8;
-                let path = property(&monitor, w!("__PATH"))?;
-                let mut path_text = [0u16; 4096];
-                // SAFETY: buffer sizes and interface lifetimes are valid within this apartment.
-                unsafe {
-                    VariantToString(&path.0, &mut path_text)
-                        .context("converting WMI monitor path")?;
-                }
-                let end = path_text
-                    .iter()
-                    .position(|&c| c == 0)
-                    .context("unterminated WMI path")?;
-                let path =
-                    BSTR::from(String::from_utf16(&path_text[..end]).context("decoding WMI path")?);
-                // SAFETY: signature is returned by WMI; the new instance is local to this call.
-                let input = unsafe { signature.SpawnInstance(0) }
-                    .context("creating WmiSetBrightness parameters")?;
-                let mut timeout = OwnedVariant::default();
-                let mut brightness = OwnedVariant::default();
-                // SAFETY: assign matching scalar tags and union members; neither allocates.
-                unsafe {
-                    (*timeout.0.Anonymous.Anonymous).vt = VT_I4;
-                    (*timeout.0.Anonymous.Anonymous).Anonymous.lVal = 0;
-                    (*brightness.0.Anonymous.Anonymous).vt = VT_UI1;
-                    (*brightness.0.Anonymous.Anonymous).Anonymous.bVal = percent;
-                    input
-                        .Put(w!("Timeout"), 0, &timeout.0, 0)
-                        .context("setting WMI timeout parameter")?;
-                    input
-                        .Put(w!("Brightness"), 0, &brightness.0, 0)
-                        .context("setting WMI brightness parameter")?;
-                    let mut output = None;
-                    services
-                        .ExecMethod(
-                            &path,
-                            &BSTR::from("WmiSetBrightness"),
-                            WBEM_GENERIC_FLAG_TYPE(0),
-                            None,
-                            &input,
-                            Some(&mut output),
-                            None,
-                        )
-                        .context("calling WmiSetBrightness")?;
-                    let returned = property(
-                        &output.context("WmiSetBrightness returned no result")?,
-                        w!("ReturnValue"),
-                    )?;
-                    let code = VariantToUInt32(&returned.0)
-                        .context("reading WmiSetBrightness return value")?;
-                    ensure!(code == 0, "WmiSetBrightness returned {code}");
-                }
-                Ok(())
+        // A panel whose identity cannot be read is reported as unavailable when written.
+        let panels = monitors
+            .into_iter()
+            .filter_map(|monitor| Some((wmi_instance_name(&monitor).ok()?, monitor)))
+            .collect();
+        Ok(Self {
+            services,
+            signature: signature.context("missing WmiSetBrightness input signature")?,
+            panels,
+        })
+    }
+
+    fn set(&self, name: &str, percent: u32) -> Result<()> {
+        let monitor = self
+            .panels
+            .get(name)
+            .with_context(|| format!("captured WMI panel {name} is unavailable"))?;
+        let percent = u8::try_from(percent).context("WMI brightness above 100%")?;
+        let path = property(monitor, w!("__PATH"))?;
+        let mut path_text = [0u16; 4096];
+        // SAFETY: buffer sizes and interface lifetimes are valid within this apartment.
+        unsafe {
+            VariantToString(&path.0, &mut path_text).context("converting WMI monitor path")?;
+        }
+        let end = path_text
+            .iter()
+            .position(|&c| c == 0)
+            .context("unterminated WMI path")?;
+        let path = BSTR::from(String::from_utf16(&path_text[..end]).context("decoding WMI path")?);
+        // SAFETY: signature is returned by WMI; the new instance is local to this call.
+        let input = unsafe { self.signature.SpawnInstance(0) }
+            .context("creating WmiSetBrightness parameters")?;
+        let mut timeout = OwnedVariant::default();
+        let mut brightness = OwnedVariant::default();
+        // SAFETY: assign matching scalar tags and union members; neither allocates.
+        unsafe {
+            (*timeout.0.Anonymous.Anonymous).vt = VT_I4;
+            (*timeout.0.Anonymous.Anonymous).Anonymous.lVal = 0;
+            (*brightness.0.Anonymous.Anonymous).vt = VT_UI1;
+            (*brightness.0.Anonymous.Anonymous).Anonymous.bVal = percent;
+            input
+                .Put(w!("Timeout"), 0, &timeout.0, 0)
+                .context("setting WMI timeout parameter")?;
+            input
+                .Put(w!("Brightness"), 0, &brightness.0, 0)
+                .context("setting WMI brightness parameter")?;
+            let mut output = None;
+            self.services
+                .ExecMethod(
+                    &path,
+                    &BSTR::from("WmiSetBrightness"),
+                    WBEM_GENERIC_FLAG_TYPE(0),
+                    None,
+                    &input,
+                    Some(&mut output),
+                    None,
+                )
+                .with_context(|| format!("calling WmiSetBrightness on {name}"))?;
+            let returned = property(
+                &output.context("WmiSetBrightness returned no result")?,
+                w!("ReturnValue"),
+            )?;
+            let code =
+                VariantToUInt32(&returned.0).context("reading WmiSetBrightness return value")?;
+            ensure!(code == 0, "WmiSetBrightness on {name} returned {code}");
+        }
+        Ok(())
+    }
+}
+
+fn wmi_set(panels: &mut BTreeMap<String, Display>, request: Request, writes: &mut Writes) {
+    let result = com_call(|| {
+        // Opened by the first panel that needs a write; dropped inside this apartment.
+        let mut session = None;
+        set_displays(
+            panels
+                .iter_mut()
+                .map(|(name, panel)| (name.as_str(), panel)),
+            request,
+            writes,
+            |name, percent| match session
+                .get_or_insert_with(|| WmiSession::open().map_err(|e| format!("{e:#}")))
+            {
+                Ok(session) => session.set(name, percent),
+                Err(error) => Err(anyhow::anyhow!("{error}")),
             },
-        )
-    })
+        );
+        Ok(())
+    });
+    if let Err(error) = result {
+        writes.errors.push(format!("{error:#}"));
+    }
 }
 
 struct PhysicalMonitors(Vec<PHYSICAL_MONITOR>);
@@ -522,10 +631,10 @@ fn ddc_range(monitor: &PHYSICAL_MONITOR) -> Result<(u32, u32, u32)> {
     Ok((min, current, max))
 }
 
-struct DdcBaselines {
+struct DdcDisplays {
     monitors: PhysicalMonitors,
-    // Index into the retained handle array, baseline, native min/max.
-    levels: Vec<(usize, f32, u32, u32)>,
+    // Index into the retained handle array, and that monitor's state.
+    displays: Vec<(usize, Display)>,
 }
 
 fn write_ddc(
@@ -537,7 +646,8 @@ fn write_ddc(
     let matches = |(min, current, max): (u32, u32, u32)| {
         current.abs_diff(value) <= ((max - min) / 100).max(1)
     };
-    if matches(read()?) {
+    // Monitors are often still busy just after a write, so a failed read also retries.
+    if read().is_ok_and(matches) {
         return Ok(());
     }
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -548,59 +658,58 @@ fn write_ddc(
     Ok(())
 }
 
-impl DdcBaselines {
+impl DdcDisplays {
     fn capture() -> Result<Self> {
         let monitors = physical_monitors()?;
-        let levels: Vec<_> = monitors
+        let displays: Vec<_> = monitors
             .0
             .iter()
             .enumerate()
             .filter_map(|(index, monitor)| {
                 ddc_range(monitor).ok().map(|(min, current, max)| {
-                    (index, (current - min) as f32 / (max - min) as f32, min, max)
+                    let baseline = (current - min) as f32 / (max - min) as f32;
+                    (index, Display::new(baseline, min, max))
                 })
             })
             .collect();
-        ensure!(!levels.is_empty(), "no monitors support DDC/CI brightness");
-        Ok(Self { monitors, levels })
+        ensure!(
+            !displays.is_empty(),
+            "no monitors support DDC/CI brightness"
+        );
+        Ok(Self { monitors, displays })
     }
 
-    fn set(&self, reference: f32, level: f32) -> Result<()> {
-        self.set_with(reference, level, |index, value| {
-            let monitor = &self.monitors.0[index];
-            write_ddc(
-                value,
-                |value| {
-                    ensure!(
-                        unsafe { SetMonitorBrightness(monitor.hPhysicalMonitor, value) } != 0,
-                        "setting DDC/CI brightness: {}",
-                        windows::core::Error::from_thread()
-                    );
-                    Ok(())
-                },
-                || ddc_range(monitor),
-            )
-        })
-    }
-
-    fn set_with(
-        &self,
-        reference: f32,
-        level: f32,
-        mut write: impl FnMut(usize, u32) -> Result<()>,
-    ) -> Result<()> {
-        attempt_all(self.levels.iter().map(|&(index, baseline, min, max)| {
-            let scaled = super::scaled_brightness(baseline, reference, level);
-            let value = (f64::from(min) + f64::from(scaled) * f64::from(max - min)).round() as u32;
-            write(index, value)
-        }))
+    fn set(&mut self, request: Request, writes: &mut Writes) {
+        let monitors = &self.monitors;
+        set_displays(
+            self.displays
+                .iter_mut()
+                .map(|(index, display)| (*index, display)),
+            request,
+            writes,
+            |index, value| {
+                let monitor = &monitors.0[index];
+                write_ddc(
+                    value,
+                    |value| {
+                        ensure!(
+                            unsafe { SetMonitorBrightness(monitor.hPhysicalMonitor, value) } != 0,
+                            "setting DDC/CI brightness: {}",
+                            windows::core::Error::from_thread()
+                        );
+                        Ok(())
+                    },
+                    || ddc_range(monitor),
+                )
+            },
+        );
     }
 }
 
 #[derive(Default)]
 struct WindowsBrightness {
-    wmi_baselines: BTreeMap<String, f32>,
-    ddc_baselines: Option<DdcBaselines>,
+    wmi: BTreeMap<String, Display>,
+    ddc: Option<DdcDisplays>,
     reference: f32,
 }
 
@@ -608,53 +717,67 @@ impl WindowsBrightness {
     fn capture(
         &mut self,
         wmi: Result<BTreeMap<String, f32>>,
-        ddc: Result<DdcBaselines>,
+        ddc: Result<DdcDisplays>,
     ) -> Result<f32> {
-        self.wmi_baselines = wmi.unwrap_or_default();
-        self.ddc_baselines = ddc.ok();
-        self.reference = 0.0;
-        let levels: Vec<_> = self
-            .wmi_baselines
-            .values()
-            .copied()
-            .chain(
-                self.ddc_baselines
-                    .iter()
-                    .flat_map(|d| d.levels.iter().map(|&(_, level, _, _)| level)),
-            )
+        self.wmi = wmi
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, level)| (name, Display::new(level, 0, 100)))
             .collect();
-        ensure!(!levels.is_empty(), "no supported brightness monitors");
-        self.reference = levels.into_iter().fold(0.0, f32::max);
-        Ok(self.reference)
+        self.ddc = ddc.ok();
+        let reference = self
+            .wmi
+            .values()
+            .chain(
+                self.ddc
+                    .iter()
+                    .flat_map(|ddc| ddc.displays.iter().map(|(_, d)| d)),
+            )
+            .map(|display| display.baseline)
+            .reduce(f32::max);
+        // A failed capture must not leave the previous displays writable.
+        self.reference = reference.unwrap_or(0.0);
+        reference.context("no supported brightness monitors")
     }
 
-    fn set_with(
+    fn write_with(
         &mut self,
         level: f32,
-        wmi: impl FnOnce(&BTreeMap<String, f32>, f32, f32) -> Result<()>,
-        ddc: impl FnOnce(&DdcBaselines, f32, f32) -> Result<()>,
+        restoring: bool,
+        wmi: impl FnOnce(&mut BTreeMap<String, Display>, Request, &mut Writes),
+        ddc: impl FnOnce(&mut DdcDisplays, Request, &mut Writes),
     ) -> Result<()> {
         let level = normalized(level)?;
-        if self.reference > 0.0 {
-            let wmi = (!self.wmi_baselines.is_empty())
-                .then(|| wmi(&self.wmi_baselines, self.reference, level));
-            let ddc = self
-                .ddc_baselines
-                .as_ref()
-                .map(|baselines| ddc(baselines, self.reference, level));
-            attempt_all(wmi.into_iter().chain(ddc))?;
+        if self.reference <= 0.0 {
+            return Ok(());
         }
-        Ok(())
+        let request = Request {
+            reference: self.reference,
+            level,
+            restoring,
+        };
+        let mut writes = Writes::default();
+        if !self.wmi.is_empty() {
+            wmi(&mut self.wmi, request, &mut writes);
+        }
+        if let Some(displays) = &mut self.ddc {
+            ddc(displays, request, &mut writes);
+        }
+        writes.finish()
     }
 }
 
 impl Brightness for WindowsBrightness {
     fn get(&mut self) -> Result<f32> {
-        self.capture(wmi_levels(), DdcBaselines::capture())
+        self.capture(wmi_levels(), DdcDisplays::capture())
     }
 
     fn set(&mut self, level: f32) -> Result<()> {
-        self.set_with(level, wmi_set, DdcBaselines::set)
+        self.write_with(level, false, wmi_set, DdcDisplays::set)
+    }
+
+    fn restore(&mut self, level: f32) -> Result<()> {
+        self.write_with(level, true, wmi_set, DdcDisplays::set)
     }
 }
 
@@ -822,6 +945,24 @@ mod tests {
             write_ddc(5, |_| Ok(()), || Ok((0, actual, 100))).unwrap();
         }
     }
+
+    #[test]
+    fn ddc_retries_a_read_that_fails_right_after_the_write() {
+        let mut reads = 0;
+        write_ddc(
+            5,
+            |_| Ok(()),
+            || {
+                reads += 1;
+                ensure!(reads > 1, "monitor busy");
+                Ok((0, 5, 100))
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, 2);
+    }
+
+    use std::collections::BTreeSet;
     use windows::Win32::Security::{GetTokenInformation, TokenPrivileges};
     use windows::Win32::System::SystemServices::{HIBERFILE_TYPE_NONE, HIBERFILE_TYPE_REDUCED};
 
@@ -1044,24 +1185,114 @@ mod tests {
         assert_eq!(devices.levels["headphones"], 0.4);
     }
 
-    fn ddc_baselines() -> DdcBaselines {
-        DdcBaselines {
+    #[test]
+    fn disconnected_endpoints_keep_their_kind_through_com_calls() {
+        for code in [
+            HRESULT::from_win32(ERROR_NOT_FOUND.0),
+            AUDCLNT_E_DEVICE_INVALIDATED,
+        ] {
+            assert!(endpoint_error(code.into()).is::<Disconnected>());
+        }
+        assert!(!endpoint_error(windows::Win32::Foundation::E_FAIL.into()).is::<Disconnected>());
+        std::thread::spawn(|| {
+            let error = com_call::<()>(|| Err(disconnected_endpoint().context("restoring volume")))
+                .unwrap_err();
+            assert!(error.is::<Disconnected>());
+            assert!(error.to_string().contains("restoring volume"));
+            let error = com_call::<()>(|| anyhow::bail!("unrelated")).unwrap_err();
+            assert!(!error.is::<Disconnected>());
+        })
+        .join()
+        .unwrap();
+    }
+
+    fn ddc_displays() -> DdcDisplays {
+        DdcDisplays {
             monitors: PhysicalMonitors(Vec::new()),
-            levels: vec![(0, 0.8, 10, 110), (1, 0.4, 20, 220)],
+            displays: vec![
+                (0, Display::new(0.8, 10, 110)),
+                (1, Display::new(0.4, 20, 220)),
+            ],
         }
     }
 
     fn brightness() -> WindowsBrightness {
-        WindowsBrightness::default()
+        let mut brightness = WindowsBrightness::default();
+        brightness
+            .capture(
+                Ok(BTreeMap::from([("panel".into(), 0.6)])),
+                Ok(ddc_displays()),
+            )
+            .unwrap();
+        brightness
+    }
+
+    /// Native values written to each display, and displays whose writes fail.
+    #[derive(Default)]
+    struct Hardware {
+        values: BTreeMap<String, u32>,
+        broken: BTreeSet<String>,
+        writes: Vec<(String, u32)>,
+    }
+
+    impl Hardware {
+        fn write(&mut self, name: String, value: u32) -> Result<()> {
+            ensure!(!self.broken.contains(&name), "{name} failed");
+            self.values.insert(name.clone(), value);
+            self.writes.push((name, value));
+            Ok(())
+        }
+    }
+
+    fn write(
+        brightness: &mut WindowsBrightness,
+        hardware: &std::cell::RefCell<Hardware>,
+        level: f32,
+        restoring: bool,
+    ) -> Result<()> {
+        brightness.write_with(
+            level,
+            restoring,
+            |wmi, request, writes| {
+                set_displays(
+                    wmi.iter_mut()
+                        .map(|(name, display)| (name.clone(), display)),
+                    request,
+                    writes,
+                    |name, value| hardware.borrow_mut().write(name, value),
+                )
+            },
+            |ddc, request, writes| {
+                set_displays(
+                    ddc.displays
+                        .iter_mut()
+                        .map(|(index, display)| (format!("ddc{index}"), display)),
+                    request,
+                    writes,
+                    |name, value| hardware.borrow_mut().write(name, value),
+                )
+            },
+        )
+    }
+
+    fn written(hardware: &std::cell::RefCell<Hardware>) -> Vec<(String, u32)> {
+        std::mem::take(&mut hardware.borrow_mut().writes)
+    }
+
+    fn pairs(writes: &[(&str, u32)]) -> Vec<(String, u32)> {
+        writes
+            .iter()
+            .map(|&(name, value)| (name.into(), value))
+            .collect()
     }
 
     #[test]
     fn brightness_capture_survives_either_provider_becoming_unavailable() {
-        let mut brightness = brightness();
+        let mut brightness = WindowsBrightness::default();
         let wmi = BTreeMap::from([("panel".into(), 0.6)]);
         assert_eq!(
             brightness
-                .capture(Ok(wmi.clone()), Ok(ddc_baselines()))
+                .capture(Ok(wmi.clone()), Ok(ddc_displays()))
                 .unwrap(),
             0.8
         );
@@ -1071,25 +1302,19 @@ mod tests {
                 .unwrap(),
             0.6
         );
-        assert!(brightness.ddc_baselines.is_none());
+        assert!(brightness.ddc.is_none());
         assert_eq!(
             brightness
-                .capture(Err(anyhow::anyhow!("WMI unavailable")), Ok(ddc_baselines()))
+                .capture(Err(anyhow::anyhow!("WMI unavailable")), Ok(ddc_displays()))
                 .unwrap(),
             0.8
         );
-        assert!(brightness.wmi_baselines.is_empty());
+        assert!(brightness.wmi.is_empty());
     }
 
     #[test]
     fn brightness_failed_capture_does_not_reuse_old_provider_baselines() {
         let mut brightness = brightness();
-        brightness
-            .capture(
-                Ok(BTreeMap::from([("panel".into(), 0.6)])),
-                Ok(ddc_baselines()),
-            )
-            .unwrap();
         assert!(
             brightness
                 .capture(
@@ -1098,133 +1323,103 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(brightness.wmi_baselines.is_empty());
-        assert!(brightness.ddc_baselines.is_none());
-        let mut writes = Vec::new();
-        brightness
-            .set_with(
-                0.5,
-                |_, _, _| {
-                    writes.push("WMI");
-                    Ok(())
-                },
-                |_, _, _| anyhow::bail!("stale DDC write"),
-            )
-            .unwrap();
-        assert!(writes.is_empty());
+        assert!(brightness.wmi.is_empty());
+        assert!(brightness.ddc.is_none());
+        let hardware = Default::default();
+        write(&mut brightness, &hardware, 0.5, false).unwrap();
+        assert!(written(&hardware).is_empty());
     }
 
     #[test]
-    fn brightness_restores_ddc_even_when_wmi_restore_fails() {
+    fn brightness_writes_each_display_its_share_and_skips_unchanged_values() {
         let mut brightness = brightness();
-        brightness
-            .capture(
-                Ok(BTreeMap::from([("panel".into(), 0.6)])),
-                Ok(ddc_baselines()),
-            )
-            .unwrap();
-        let mut restored = Vec::new();
-        assert!(
-            brightness
-                .set_with(
-                    0.8,
-                    |_, _, _| anyhow::bail!("WMI disconnected"),
-                    |ddc, reference, level| ddc.set_with(reference, level, |index, value| {
-                        restored.push((index, value));
-                        Ok(())
-                    }),
-                )
-                .is_err()
+        let hardware = Default::default();
+        write(&mut brightness, &hardware, 0.4, false).unwrap();
+        assert_eq!(
+            written(&hardware),
+            pairs(&[("panel", 30), ("ddc0", 50), ("ddc1", 60)])
         );
-        assert_eq!(restored, [(0, 90), (1, 100)]);
+        write(&mut brightness, &hardware, 0.4, false).unwrap();
+        assert!(written(&hardware).is_empty());
     }
 
     #[test]
-    fn brightness_skips_providers_without_current_baselines() {
+    fn one_failing_display_keeps_the_others_fading_and_sits_out_the_fade() {
         let mut brightness = brightness();
-        brightness
-            .capture(Err(anyhow::anyhow!("WMI unavailable")), Ok(ddc_baselines()))
-            .unwrap();
-        let mut restored = Vec::new();
-        brightness
-            .set_with(
-                0.8,
-                |_, _, _| anyhow::bail!("uncaptured WMI provider"),
-                |ddc, reference, level| {
-                    ddc.set_with(reference, level, |index, value| {
-                        restored.push((index, value));
-                        Ok(())
-                    })
-                },
-            )
-            .unwrap();
-        assert_eq!(restored, [(0, 90), (1, 100)]);
+        let hardware = std::cell::RefCell::new(Hardware::default());
+        hardware.borrow_mut().broken.insert("ddc0".into());
+        let error = write(&mut brightness, &hardware, 0.4, false).unwrap_err();
+        assert!(error.is::<Partial>());
+        assert_eq!(written(&hardware), pairs(&[("panel", 30), ("ddc1", 60)]));
+        write(&mut brightness, &hardware, 0.2, false).unwrap();
+        assert_eq!(written(&hardware), pairs(&[("panel", 15), ("ddc1", 40)]));
+    }
+
+    #[test]
+    fn every_display_failing_is_a_total_failure_for_overlay_fallback() {
+        let mut brightness = brightness();
+        let hardware = std::cell::RefCell::new(Hardware::default());
+        hardware.borrow_mut().broken =
+            BTreeSet::from(["panel".into(), "ddc0".into(), "ddc1".into()]);
+        let error = write(&mut brightness, &hardware, 0.4, false).unwrap_err();
+        assert!(!error.is::<Partial>());
+    }
+
+    #[test]
+    fn restore_retries_only_displays_that_are_not_yet_restored() {
+        let mut brightness = brightness();
+        let hardware = std::cell::RefCell::new(Hardware::default());
+        hardware.borrow_mut().broken.insert("ddc0".into());
+        assert!(write(&mut brightness, &hardware, 0.4, false).is_err());
+        written(&hardware);
+        // Restore retries the display that sat out the fade, alongside the others.
+        hardware.borrow_mut().broken.clear();
+        hardware.borrow_mut().broken.insert("panel".into());
+        let error = write(&mut brightness, &hardware, 0.8, true).unwrap_err();
+        assert!(error.is::<Partial>());
+        assert_eq!(written(&hardware), pairs(&[("ddc0", 90), ("ddc1", 100)]));
+        // The user adjusts a restored display before the retry; it is left alone.
+        hardware.borrow_mut().values.insert("ddc1".into(), 70);
+        hardware.borrow_mut().broken.clear();
+        write(&mut brightness, &hardware, 0.8, true).unwrap();
+        assert_eq!(written(&hardware), pairs(&[("panel", 60)]));
+        assert_eq!(hardware.borrow().values["ddc1"], 70);
     }
 
     #[test]
     fn ddc_restore_attempts_healthy_monitors_after_a_failure_and_retries() {
-        let ddc = ddc_baselines();
-        let mut restored = BTreeMap::from([(0, 0), (1, 0), (2, 77)]);
-        assert!(
-            ddc.set_with(0.8, 0.8, |index, value| {
+        let mut ddc = ddc_displays();
+        let request = Request {
+            reference: 0.8,
+            level: 0.8,
+            restoring: true,
+        };
+        let mut restored = BTreeMap::from([(0, 0), (1, 0)]);
+        let mut writes = Writes::default();
+        set_displays(
+            ddc.displays.iter_mut().map(|(index, d)| (*index, d)),
+            request,
+            &mut writes,
+            |index, value| {
                 ensure!(index != 0, "monitor disconnected");
                 restored.insert(index, value);
                 Ok(())
-            })
-            .is_err()
+            },
         );
-        assert_eq!(restored, BTreeMap::from([(0, 0), (1, 100), (2, 77)]));
-        ddc.set_with(0.8, 0.8, |index, value| {
-            restored.insert(index, value);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(restored, BTreeMap::from([(0, 90), (1, 100), (2, 77)]));
-    }
-
-    #[test]
-    fn wmi_restore_reports_missing_captured_panels_and_restores_present_panels() {
-        let baselines = BTreeMap::from([("missing".into(), 0.8), ("present".into(), 0.4)]);
-        let mut restored = BTreeMap::from([(1, 0.1), (2, 0.7)]);
-        let result = set_wmi_monitors(
-            &baselines,
-            0.8,
-            0.8,
-            [Ok(("present".into(), 1)), Ok(("uncaptured".into(), 2))],
-            |monitor, level| {
-                restored.insert(monitor, level);
+        assert!(writes.finish().unwrap_err().is::<Partial>());
+        assert_eq!(restored, BTreeMap::from([(0, 0), (1, 100)]));
+        let mut writes = Writes::default();
+        set_displays(
+            ddc.displays.iter_mut().map(|(index, d)| (*index, d)),
+            request,
+            &mut writes,
+            |index, value| {
+                restored.insert(index, value);
                 Ok(())
             },
         );
-        assert!(result.is_err());
-        assert!((restored[&1] - 0.4).abs() < 0.000001);
-        assert_eq!(restored[&2], 0.7);
-    }
-
-    #[test]
-    fn wmi_restore_continues_after_a_monitor_write_or_identity_failure() {
-        let baselines = BTreeMap::from([("broken".into(), 0.8), ("healthy".into(), 0.4)]);
-        let mut restored = BTreeMap::from([(0, 0.1), (1, 0.1), (2, 0.7)]);
-        let result = set_wmi_monitors(
-            &baselines,
-            0.8,
-            0.8,
-            [
-                Ok(("broken".into(), 0)),
-                Err(anyhow::anyhow!("unreadable monitor identity")),
-                Ok(("healthy".into(), 1)),
-                Ok(("uncaptured".into(), 2)),
-            ],
-            |monitor, level| {
-                ensure!(monitor != 0, "monitor write failed");
-                restored.insert(monitor, level);
-                Ok(())
-            },
-        );
-        assert!(result.is_err());
-        assert_eq!(restored[&0], 0.1);
-        assert!((restored[&1] - 0.4).abs() < 0.000001);
-        assert_eq!(restored[&2], 0.7);
+        writes.finish().unwrap();
+        assert_eq!(restored, BTreeMap::from([(0, 90), (1, 100)]));
     }
 
     #[test]

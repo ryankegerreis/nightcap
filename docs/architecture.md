@@ -64,6 +64,11 @@ window is hidden and egui is not repainting. It owns the platform backends.
   (max alpha 0.9 at target 0 %, mapped linearly).
   A failed native write rebases overlay opacity against the last successful native
   level, avoiding an abrupt absolute-brightness jump while retaining restoration.
+  A `platform::Partial` error means some displays took the level, so native fading
+  continues on those displays instead.
+- A failed restore keeps its original and retries every 5 s, for up to 24 attempts.
+  A `platform::Disconnected` error drops that original, so the next fade captures
+  the new device. A timer started while a restore is pending fades from the original.
 - Calls a `repaint: Box<dyn Fn() + Send>` hook after each snapshot change so the UI and
   tray refresh.
 
