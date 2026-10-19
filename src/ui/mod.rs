@@ -337,7 +337,7 @@ impl eframe::App for NightcapApp {
         [0.0; 4]
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, #[cfg(target_os = "windows")] _gl: Option<&eframe::glow::Context>) {
         self.engine.shutdown();
         // Drop all tray callbacks before the last EngineHandle joins its worker.
         self.tray.take();
@@ -400,7 +400,7 @@ fn in_app_bundle() -> bool {
 
 fn app_icon() -> egui::IconData {
     let mut rgba = crate::tray::moon_rgba(128);
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel[..3].copy_from_slice(&[88, 86, 214]);
     }
     egui::IconData {

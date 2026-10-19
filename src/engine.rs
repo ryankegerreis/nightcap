@@ -11,12 +11,18 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{fade::FadePlan, platform::Backends, settings::Settings};
+use crate::{
+    fade::FadePlan,
+    platform::{Backends, Disconnected, Partial},
+    settings::Settings,
+};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const WAKE_THRESHOLD: Duration = Duration::from_secs(30);
 const FINISHING_WAKE_THRESHOLD: Duration = Duration::from_secs(5);
 const RESTORE_RETRY: Duration = Duration::from_secs(5);
+/// About two minutes of retries, enough for displays and audio to return after wake.
+const RESTORE_ATTEMPTS: u32 = 24;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClockReading {
@@ -201,16 +207,16 @@ struct FadeTrack {
     from: Option<f32>,
     last: Option<f32>,
     overlay: bool,
+    overlay_reference: Option<f32>,
     unavailable: bool,
 }
 
 impl FadeTrack {
+    /// A kept original means its restore failed, possibly for only some displays.
+    /// The next fade starts from that original rather than the last faded level.
     fn reset(&self, keep_original: bool) -> Self {
         Self {
             original: self.original.filter(|_| keep_original),
-            last: self
-                .last
-                .filter(|_| keep_original && self.original.is_some()),
             ..Self::default()
         }
     }
@@ -234,6 +240,7 @@ pub struct Engine<C: Clock = SystemClock> {
     brightness: FadeTrack,
     volume: FadeTrack,
     restore_after: Option<SystemTime>,
+    restore_failures: u32,
 }
 
 impl Engine<SystemClock> {
@@ -325,6 +332,7 @@ impl<C: Clock> Engine<C> {
             brightness: FadeTrack::default(),
             volume: FadeTrack::default(),
             restore_after: None,
+            restore_failures: 0,
         }
     }
 
@@ -336,6 +344,7 @@ impl<C: Clock> Engine<C> {
                 self.cancel();
                 // The new fade owns any pending originals until its next cancel/wake.
                 self.restore_after = None;
+                self.restore_failures = 0;
                 self.snapshot.state = TimerState::Running;
                 self.snapshot.total = duration;
                 self.snapshot.remaining = duration;
@@ -466,7 +475,7 @@ impl<C: Clock> Engine<C> {
     fn apply_brightness(&mut self, plan: FadePlan, elapsed: Duration, target: u8) {
         if self.brightness.from.is_none() {
             let original = if let Some(level) = self.brightness.original {
-                Some(Ok(self.brightness.last.unwrap_or(level)))
+                Some(Ok(level))
             } else {
                 self.backends
                     .brightness
@@ -496,12 +505,23 @@ impl<C: Clock> Engine<C> {
             && let Some(backend) = self.backends.brightness.as_mut()
             && let Err(error) = backend.set(level)
         {
+            // Displays that took the level keep fading natively.
+            let partial = error.is::<Partial>();
             self.report_error("setting brightness", error);
-            self.snapshot.brightness_supported = false;
-            self.brightness.overlay = true;
+            if !partial {
+                self.snapshot.brightness_supported = false;
+                self.brightness.overlay = true;
+                self.brightness.overlay_reference = self.brightness.last;
+            }
         }
         if self.brightness.overlay {
-            self.snapshot.overlay_alpha = 0.9 * (1.0 - level);
+            let reference = self.brightness.overlay_reference.unwrap_or(1.0);
+            let relative = if reference > 0.0 {
+                level / reference
+            } else {
+                1.0
+            };
+            self.snapshot.overlay_alpha = 0.9 * (1.0 - relative.clamp(0.0, 1.0));
         }
         self.brightness.last = Some(level);
         self.snapshot.brightness_percent = Some(level * 100.0);
@@ -510,7 +530,7 @@ impl<C: Clock> Engine<C> {
     fn apply_volume(&mut self, plan: FadePlan, elapsed: Duration, target: u8) {
         if self.volume.from.is_none() {
             let original = if let Some(level) = self.volume.original {
-                Some(Ok(self.volume.last.unwrap_or(level)))
+                Some(Ok(level))
             } else {
                 self.backends
                     .volume
@@ -552,12 +572,18 @@ impl<C: Clock> Engine<C> {
         if let Some(level) = self.brightness.original
             && let Some(backend) = self.backends.brightness.as_mut()
         {
-            match backend.set(level) {
+            match backend.restore(level) {
                 Ok(()) => {
                     self.brightness.original = None;
                     self.snapshot.brightness_percent = Some(level * 100.0);
                 }
-                Err(error) => self.report_error("restoring brightness", error),
+                Err(error) => {
+                    // A display that is gone has nothing left to restore.
+                    if error.is::<Disconnected>() {
+                        self.brightness.original = None;
+                    }
+                    self.report_error("restoring brightness", error);
+                }
             }
         }
         if let Some(level) = self.volume.original
@@ -568,8 +594,27 @@ impl<C: Clock> Engine<C> {
                     self.volume.original = None;
                     self.snapshot.volume_percent = Some(level * 100.0);
                 }
-                Err(error) => self.report_error("restoring volume", error),
+                Err(error) => {
+                    // The next fade captures the new output instead of the missing one.
+                    if error.is::<Disconnected>() {
+                        self.volume.original = None;
+                    }
+                    self.report_error("restoring volume", error);
+                }
             }
+        }
+        let pending = self.brightness.original.is_some() || self.volume.original.is_some();
+        self.restore_failures = if pending {
+            self.restore_failures + 1
+        } else {
+            0
+        };
+        if self.restore_failures >= RESTORE_ATTEMPTS {
+            // Stop polling for a device that never recovers, and let later fades recapture.
+            log::warn!("giving up restoring levels after {RESTORE_ATTEMPTS} attempts");
+            self.brightness.original = None;
+            self.volume.original = None;
+            self.restore_failures = 0;
         }
         self.restore_after = (self.brightness.original.is_some() || self.volume.original.is_some())
             .then(|| self.last_time.wall + RESTORE_RETRY);
@@ -1069,6 +1114,101 @@ mod tests {
     }
 
     #[test]
+    fn restart_after_a_failed_restore_fades_from_the_original_level() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(150);
+        h.brightness.state.lock().unwrap().partial_set = true;
+        h.volume.state.lock().unwrap().fail_set = true;
+        h.engine.command(Command::Cancel);
+        h.start();
+        h.brightness.state.lock().unwrap().partial_set = false;
+        h.volume.state.lock().unwrap().fail_set = false;
+        // Restored displays do not jump back to the previous timer's faded level.
+        h.advance(61);
+        assert!(h.brightness() > 0.78, "{}", h.brightness());
+        h.advance(60);
+        assert!(h.volume() > 0.58, "{}", h.volume());
+        h.engine.command(Command::Cancel);
+        close(h.brightness(), 0.8);
+        close(h.volume(), 0.6);
+    }
+
+    #[test]
+    fn partial_brightness_failure_keeps_fading_natively() {
+        let mut h = Harness::new(preferences(), true);
+        h.brightness.state.lock().unwrap().partial_set = true;
+        h.start();
+        h.advance(90);
+        close(h.brightness(), 0.5);
+        close(h.engine.snapshot().overlay_alpha, 0.0);
+        assert!(h.engine.snapshot().brightness_supported);
+        assert!(h.engine.snapshot().last_error.is_some());
+        h.advance(30);
+        close(h.brightness(), 0.2);
+    }
+
+    #[test]
+    fn partially_restored_brightness_is_retried_until_every_display_returns() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(150);
+        h.brightness.state.lock().unwrap().partial_set = true;
+        h.engine.command(Command::Cancel);
+        assert_eq!(h.engine.brightness.original, Some(0.8));
+        h.brightness.state.lock().unwrap().partial_set = false;
+        h.clock.advance(Duration::from_secs(5));
+        h.engine.tick();
+        assert_eq!(h.engine.brightness.original, None);
+        assert!(!h.engine.needs_tick());
+    }
+
+    #[test]
+    fn disconnected_output_is_not_restored_and_the_next_fade_captures_the_new_one() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(150);
+        h.volume.state.lock().unwrap().disconnected = true;
+        h.engine.command(Command::Cancel);
+        assert_eq!(h.engine.volume.original, None);
+        assert!(!h.engine.needs_tick());
+        assert!(h.engine.snapshot().last_error.is_some());
+        // The new default output.
+        {
+            let mut volume = h.volume.state.lock().unwrap();
+            volume.disconnected = false;
+            volume.level = 0.3;
+        }
+        let gets = h.volume.state.lock().unwrap().get_calls;
+        h.start();
+        h.advance(150);
+        assert_eq!(h.volume.state.lock().unwrap().get_calls, gets + 1);
+        assert!(h.engine.snapshot().volume_supported);
+        h.engine.command(Command::Cancel);
+        close(h.volume(), 0.3);
+    }
+
+    #[test]
+    fn restore_gives_up_after_bounded_retries_and_stops_polling() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(150);
+        h.brightness.state.lock().unwrap().fail_set = true;
+        h.engine.command(Command::Cancel);
+        for _ in 1..RESTORE_ATTEMPTS {
+            assert!(h.engine.needs_tick());
+            h.clock.advance(RESTORE_RETRY);
+            h.engine.tick();
+        }
+        assert!(!h.engine.needs_tick());
+        assert_eq!(h.engine.brightness.original, None);
+        let sets = h.brightness.state.lock().unwrap().set_calls.len();
+        h.clock.advance(RESTORE_RETRY);
+        h.engine.tick();
+        assert_eq!(h.brightness.state.lock().unwrap().set_calls.len(), sets);
+    }
+
+    #[test]
     fn shutdown_retries_pending_restoration_immediately() {
         let mut h = Harness::new(preferences(), true);
         h.start();
@@ -1206,6 +1346,25 @@ mod tests {
         h.engine.command(Command::Cancel);
         assert!(h.volume.state.lock().unwrap().set_calls.is_empty());
         close(h.brightness(), 0.8);
+    }
+
+    #[test]
+    fn native_brightness_failure_rebases_overlay_without_an_absolute_level_jump() {
+        let mut settings = preferences();
+        settings.dim.target_percent = 0;
+        let mut h = Harness::new(settings, true);
+        h.brightness.state.lock().unwrap().level = 0.1;
+        h.brightness.state.lock().unwrap().fail_set = true;
+        h.start();
+        h.advance(61);
+        close(h.brightness(), 0.1);
+        close(h.engine.snapshot().overlay_alpha, 0.015);
+        h.advance(29);
+        close(h.engine.snapshot().overlay_alpha, 0.45);
+        h.brightness.state.lock().unwrap().fail_set = false;
+        h.engine.command(Command::Cancel);
+        close(h.brightness(), 0.1);
+        close(h.engine.snapshot().overlay_alpha, 0.0);
     }
 
     #[test]

@@ -23,9 +23,40 @@ pub(crate) fn scaled_brightness(baseline: f32, reference: f32, level: f32) -> f3
     }
 }
 
+/// Some displays took the level and others failed. The engine keeps fading the
+/// healthy displays natively, and keeps retrying a restore until all succeed.
+#[derive(Debug)]
+pub struct Partial(pub String);
+
+/// The captured device no longer exists, so its level cannot be restored.
+/// The engine drops that original instead of retrying it.
+#[derive(Debug)]
+pub struct Disconnected(pub String);
+
+impl std::fmt::Display for Partial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Display for Disconnected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Partial {}
+impl std::error::Error for Disconnected {}
+
 pub trait Brightness: Send {
     fn get(&mut self) -> Result<f32>;
     fn set(&mut self, level: f32) -> Result<()>;
+
+    /// Return to the captured level. Unlike `set`, this also retries displays
+    /// that failed earlier in the fade.
+    fn restore(&mut self, level: f32) -> Result<()> {
+        self.set(level)
+    }
 }
 
 pub trait Volume: Send {

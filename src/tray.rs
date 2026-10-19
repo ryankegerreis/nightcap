@@ -593,9 +593,14 @@ mod tests {
     fn icon_has_transparent_opaque_and_antialiased_pixels() {
         let icon = moon_rgba(32);
         assert_eq!(icon.len(), 32 * 32 * 4);
-        assert!(icon.chunks_exact(4).any(|p| p[3] == 0));
-        assert!(icon.chunks_exact(4).any(|p| p[3] == 255));
-        assert!(icon.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255));
+        assert!(icon.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0));
+        assert!(icon.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 255));
+        assert!(
+            icon.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] > 0 && pixel[3] < 255)
+        );
     }
 
     #[test]

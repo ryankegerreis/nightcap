@@ -4,7 +4,7 @@ A sleep timer for your computer, like the one on a TV. Set a time, and Nightcap 
 
 Nightcap is built in Rust with [egui](https://github.com/emilk/egui) and runs on macOS, Windows and Linux. It works offline and needs no account.
 
-> **Status:** working desktop app. Timer, fades, menu bar/tray controls, Settings, and overlay fallback are integrated. macOS has been exercised with real brightness and volume fades; Windows and Linux are compile-checked.
+> **Status:** working desktop app. Timer, fades, menu bar/tray controls, Settings, and overlay fallback are integrated. macOS has been exercised with real brightness and volume fades; Windows has native UI, volume, restoration and overlay checks. Linux is compile-checked. See the platform hardening reports for coverage and limitations.
 
 ![Nightcap main window in light and dark appearance](docs/design/main-window.png)
 
@@ -27,6 +27,8 @@ The interface follows macOS conventions in light and dark appearance. The mockup
 ## Building
 
 You need a recent stable [Rust toolchain](https://rustup.rs).
+On Windows, also install the MSVC C++ build tools and Windows SDK described in
+the [Rust Windows prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html).
 
 ```sh
 cargo run
@@ -89,6 +91,14 @@ Privacy & Security. The Windows build is unsigned and SmartScreen may warn.
 NIGHTCAP_DRY_RUN=1 NIGHTCAP_SPEED=60 cargo run
 ```
 
+In Windows PowerShell:
+
+```powershell
+$env:NIGHTCAP_DRY_RUN = '1'
+$env:NIGHTCAP_SPEED = '60'
+cargo run
+```
+
 `NIGHTCAP_DRY_RUN=1` replaces all end actions with a log message; no sleep,
 hibernation or shutdown is requested. Brightness and volume fades still affect
 real hardware. After a dry-run timer ends, use Cancel or Quit to restore levels
@@ -116,9 +126,12 @@ is hidden because macOS has no public user-level hibernate action. Shutdown can 
 permission to control System Events; allow it in System Settings → Privacy &
 Security → Automation. The timer itself requires no Accessibility permission.
 
-Windows support targets Windows 10 or later. Volume uses the default CoreAudio
-endpoint. Brightness uses WMI for supported built-in panels and DDC/CI for supported
-external monitors. Native
+Windows support targets Windows 10 or later. Volume captures the default CoreAudio
+endpoint when a fade starts and keeps writes and restoration on that endpoint.
+Brightness uses WMI for supported built-in panels and DDC/CI for supported
+external monitors. DDC writes are checked against the reported level; monitors
+that accept but ignore writes fall back to the dimming overlay. Windows uses the
+OpenGL renderer to support transparent and hidden viewports. Native
 window decorations and the notification-area tray are retained. Power actions
 depend on Windows privileges and hibernation configuration. Hibernate is offered
 only when Windows reports S4 support, a full hibernation file, and access to the
@@ -161,3 +174,18 @@ Unless you explicitly state otherwise, any contribution you intentionally submit
 
 The [macOS hardening report](docs/macos-hardening.md) records feature coverage,
 opt-in hardware checks, and remaining platform limitations.
+
+Windows has read-only native discovery checks in `cargo test`. To exercise real
+brightness and volume changes, close other Nightcap instances and run this
+opt-in test alone:
+
+```powershell
+cargo test --locked --test windows_runtime -- --ignored --nocapture --test-threads=1
+```
+
+The hardware test always substitutes dry-run power actions, restores captured
+levels on exit, and verifies overlay state when hardware brightness is unavailable.
+Keep the connected displays and selected audio output unchanged during this test.
+It does not test actual suspend, hibernation, shutdown, or physical reconnection.
+The [Windows hardening report](docs/windows-hardening.md) records the native test
+run, reproduced issues and remaining limitations.
