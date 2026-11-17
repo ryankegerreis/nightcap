@@ -4,19 +4,36 @@
 // Release builds on Windows run without a console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, mpsc},
+    time::{Duration, Instant},
+};
 
 use eframe::egui;
 use nightcap::{
     engine::{Engine, SpeedClock, SystemClock},
+    instance::{self, Launch},
     platform,
     settings::Settings,
     tray::Tray,
-    ui::{NightcapApp, theme, window_builder},
+    ui::{NightcapApp, RootWaker, theme, window_builder},
 };
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Before touching devices: a second engine would capture faded levels as originals.
+    let mut instance = match instance::acquire() {
+        Launch::Primary(instance) => instance,
+        Launch::Secondary { shown: true } => {
+            log::info!("Nightcap is already running; showed its window");
+            return Ok(());
+        }
+        Launch::Secondary { shown: false } => {
+            log::error!("Nightcap is already running but could not be shown");
+            std::process::exit(1);
+        }
+    };
+    let instance = &mut instance;
     let mut settings = Settings::load();
     let mut backends = platform::backends();
     if settings.apply_hibernate_availability(backends.hibernate_supported) {
@@ -64,30 +81,37 @@ fn main() -> eframe::Result {
             cc.egui_ctx.set_theme(egui::ThemePreference::System);
             theme::install_fonts(&cc.egui_ctx);
             nightcap::ui::install_app_icon();
-            let context = cc.egui_ctx.clone();
+            let waker = RootWaker::new(cc);
+            let engine_waker = waker.clone();
             let engine = Engine::spawn_with_clock(
                 settings.clone(),
                 backends,
                 clock,
                 // A nonzero delay avoids egui's extra immediate-repaint pass.
                 // Hidden roots run App::logic only, refreshing tray/overlay at engine cadence.
-                Box::new(move || {
-                    context.request_repaint_after_for(
-                        Duration::from_millis(16),
-                        egui::ViewportId::ROOT,
-                    )
-                }),
+                Box::new(move || engine_waker.wake_after(Duration::from_millis(16))),
             )?;
-            let context = cc.egui_ctx.clone();
-            let tray = Tray::new(
-                engine.clone(),
-                Arc::new(move || context.request_repaint_of(egui::ViewportId::ROOT)),
-            )
-            .map_err(|error| {
-                log::warn!("Tray unavailable; closing the window will quit: {error:#}")
-            })
-            .ok();
-            Ok(Box::new(NightcapApp::new(engine, settings, tray)))
+            let tray_waker = waker.clone();
+            let tray = Tray::new(engine.clone(), Arc::new(move || tray_waker.wake_now()))
+                .map_err(|error| {
+                    log::warn!("Tray unavailable; closing the window will quit: {error:#}")
+                })
+                .ok();
+            let (activate, activations) = mpsc::channel();
+            // The UI accepts once it has asked the window to show, or refuses while
+            // quitting; a refused launch starts its own copy after this one exits.
+            // Requests the UI reaches too late expire instead of opening the window.
+            instance.on_activate(move |allowed| {
+                let (reply, shown) = mpsc::channel();
+                if activate.send((reply, Instant::now() + allowed)).is_err() {
+                    return false;
+                }
+                waker.wake_now();
+                shown.recv_timeout(allowed).unwrap_or(false)
+            });
+            Ok(Box::new(
+                NightcapApp::new(engine, settings, tray).with_activations(activations),
+            ))
         }),
     )
 }

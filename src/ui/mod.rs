@@ -1,6 +1,13 @@
 //! App routing between the main timer, settings viewport, and dimming overlay.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
 
 use eframe::egui;
 
@@ -36,6 +43,7 @@ pub struct NightcapApp {
     save_after: Option<Instant>,
     notice: Option<StatusNote>,
     ctx: Option<egui::Context>,
+    activations: Option<mpsc::Receiver<Activation>>,
     #[cfg(target_os = "macos")]
     _wake_observer: crate::platform::macos::WakeObserver,
 }
@@ -69,7 +77,15 @@ impl NightcapApp {
             save_after: None,
             notice: None,
             ctx: None,
+            activations: None,
         }
+    }
+
+    /// Each request, from a later launch of Nightcap, shows and focuses the main
+    /// window. Its reply says whether that was requested, which is false while quitting.
+    pub fn with_activations(mut self, activations: mpsc::Receiver<Activation>) -> Self {
+        self.activations = Some(activations);
+        self
     }
 
     pub fn open_settings(&mut self) {
@@ -160,7 +176,7 @@ impl NightcapApp {
 }
 
 impl eframe::App for NightcapApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         theme::install(ctx);
         self.ctx = Some(ctx.clone());
         self.engine.set_window_visible(self.root_visible);
@@ -216,6 +232,18 @@ impl eframe::App for NightcapApp {
                 self.quit(ctx);
             }
         }
+        // After this pass's Quit and close handling, so a quitting app refuses.
+        if let Some(activations) = self.activations.take() {
+            let quitting = self.quitting;
+            answer_activations(&activations, quitting, Instant::now(), || {
+                self.open_window(ctx, true)
+            });
+            self.activations = Some(activations);
+        }
+        #[cfg(target_os = "windows")]
+        self.overlay.follow_root(frame);
+        #[cfg(not(target_os = "windows"))]
+        let _ = frame;
         self.overlay.sync(ctx, snapshot.overlay_alpha);
     }
 
@@ -349,23 +377,117 @@ impl eframe::App for NightcapApp {
     }
 }
 
+/// A later launch's request to show the window: its reply, and when it expires.
+pub type Activation = (mpsc::Sender<bool>, Instant);
+
+/// Answers every pending, unexpired launch request, calling `show` first unless
+/// quitting. A refused launch starts its own copy once this one has exited.
+/// Expired requests are dropped: their launch has already given up waiting.
+fn answer_activations(
+    activations: &mpsc::Receiver<Activation>,
+    quitting: bool,
+    now: Instant,
+    show: impl FnOnce(),
+) {
+    let pending: Vec<_> = activations
+        .try_iter()
+        .filter(|&(_, expires)| now <= expires)
+        .map(|(reply, _)| reply)
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    if !quitting {
+        show();
+    }
+    for reply in pending {
+        let _ = reply.send(!quitting);
+    }
+}
+
 fn close_edge(requested: bool, handled: &mut bool) -> bool {
     let edge = requested && !*handled;
     *handled = requested;
     edge
 }
 
+/// Requests root repaints from the engine, tray, and later launches, on any thread.
+///
+/// On Windows, a redraw requested as the tray menu's modal loop starts can be
+/// lost. egui still counts that repaint as pending and ignores later requests,
+/// so a visible window would stop updating and leave tray actions queued until
+/// the pointer moves over it. A native paint request recovers it.
+#[derive(Clone)]
+pub struct RootWaker {
+    ctx: egui::Context,
+    last_pass: Arc<AtomicU64>,
+    #[cfg(target_os = "windows")]
+    hwnd: Option<isize>,
+}
+
+impl RootWaker {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(target_os = "windows")]
+        let hwnd = {
+            use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+            match cc.window_handle().map(|handle| handle.as_raw()) {
+                Ok(RawWindowHandle::Win32(handle)) => Some(handle.hwnd.get()),
+                _ => None,
+            }
+        };
+        Self {
+            ctx: cc.egui_ctx.clone(),
+            last_pass: Arc::new(AtomicU64::new(u64::MAX)),
+            #[cfg(target_os = "windows")]
+            hwnd,
+        }
+    }
+
+    /// Frequent engine updates. Recover only when no root pass ran since the last one.
+    pub fn wake_after(&self, delay: Duration) {
+        self.ctx
+            .request_repaint_after_for(delay, egui::ViewportId::ROOT);
+        let pass = self.ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT);
+        if self.last_pass.swap(pass, Ordering::Relaxed) == pass {
+            self.paint_natively();
+        }
+    }
+
+    /// User requests: the tray menu that delivers them is what loses redraws.
+    pub fn wake_now(&self) {
+        self.ctx.request_repaint_of(egui::ViewportId::ROOT);
+        self.last_pass.store(
+            self.ctx.cumulative_pass_nr_for(egui::ViewportId::ROOT),
+            Ordering::Relaxed,
+        );
+        self.paint_natively();
+    }
+
+    fn paint_natively(&self) {
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = self.hwnd {
+            use windows::Win32::{
+                Foundation::HWND,
+                Graphics::Gdi::{RDW_INTERNALPAINT, RedrawWindow},
+                UI::WindowsAndMessaging::{IsIconic, IsWindowVisible},
+            };
+            let window = HWND(hwnd as _);
+            // SAFETY: plain Win32 calls; a stale handle fails harmlessly. Hidden and
+            // minimized roots get no WM_PAINT, and eframe already paints them directly.
+            unsafe {
+                if IsWindowVisible(window).as_bool() && !IsIconic(window).as_bool() {
+                    let _ = RedrawWindow(Some(window), None, None, RDW_INTERNALPAINT);
+                }
+            }
+        }
+    }
+}
+
 /// Keep native decorations on Windows/Linux; macOS paints its unified header.
 pub fn window_builder(title: &str) -> egui::ViewportBuilder {
-    // An empty icon tells eframe to leave the bundle's own icon alone.
-    let icon = if in_app_bundle() {
-        egui::IconData::default()
-    } else {
-        app_icon()
-    };
     let builder = egui::ViewportBuilder::default()
         .with_title(title)
-        .with_icon(icon);
+        .with_icon(window_icon());
     #[cfg(target_os = "macos")]
     let builder = builder
         .with_fullsize_content_view(true)
@@ -396,6 +518,20 @@ fn in_app_bundle() -> bool {
     cfg!(target_os = "macos")
         && std::env::current_exe()
             .is_ok_and(|path| path.to_string_lossy().contains(".app/Contents/MacOS/"))
+}
+
+/// Settings rebuilds its viewport every root pass. egui compares icons by pointer,
+/// so share one: a fresh icon would be rendered and re-sent to the OS each frame.
+fn window_icon() -> Arc<egui::IconData> {
+    static ICON: OnceLock<Arc<egui::IconData>> = OnceLock::new();
+    Arc::clone(ICON.get_or_init(|| {
+        // An empty icon tells eframe to leave the bundle's own icon alone.
+        Arc::new(if in_app_bundle() {
+            egui::IconData::default()
+        } else {
+            app_icon()
+        })
+    }))
 }
 
 fn app_icon() -> egui::IconData {
@@ -454,5 +590,44 @@ mod tests {
         }
         assert!(!close_edge(false, &mut handled));
         assert!(close_edge(true, &mut handled));
+    }
+
+    #[test]
+    fn launch_requests_are_refused_while_quitting_shown_otherwise_and_expire() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(5);
+        let (requests, activations) = mpsc::channel();
+        let request = |expires| {
+            let (reply, shown) = mpsc::channel();
+            requests.send((reply, expires)).unwrap();
+            shown
+        };
+        let answer = |quitting| {
+            let mut showed = false;
+            answer_activations(&activations, quitting, now, || showed = true);
+            showed
+        };
+        // Requested and quit before the same pass: nothing shown, both refused.
+        let replies = [request(later), request(later)];
+        assert!(!answer(true));
+        assert!(replies.iter().all(|shown| shown.try_recv() == Ok(false)));
+        let shown = request(later);
+        assert!(answer(false));
+        assert_eq!(shown.try_recv(), Ok(true));
+        assert!(!answer(false), "nothing pending");
+        // A launch that has given up must not open the window afterwards.
+        let expired = request(now - Duration::from_millis(1));
+        assert!(!answer(false));
+        assert!(expired.try_recv().is_err());
+    }
+
+    #[test]
+    fn rebuilt_window_builders_send_no_repeated_icon_commands() {
+        let mut current = window_builder("Settings");
+        for _ in 0..3 {
+            let (commands, recreate) = current.patch(window_builder("Settings"));
+            assert!(commands.is_empty(), "{commands:?}");
+            assert!(!recreate);
+        }
     }
 }

@@ -719,12 +719,21 @@ impl WindowsBrightness {
         wmi: Result<BTreeMap<String, f32>>,
         ddc: Result<DdcDisplays>,
     ) -> Result<f32> {
+        // A display already at its minimum cannot dim natively. Its trivially
+        // successful writes (e.g. a virtual display reporting 0) would otherwise
+        // count as native fading and keep the overlay off the monitors that failed.
+        let present = matches!(&wmi, Ok(panels) if !panels.is_empty())
+            || matches!(&ddc, Ok(ddc) if !ddc.displays.is_empty());
         self.wmi = wmi
             .unwrap_or_default()
             .into_iter()
+            .filter(|&(_, level)| level > 0.0)
             .map(|(name, level)| (name, Display::new(level, 0, 100)))
             .collect();
-        self.ddc = ddc.ok();
+        self.ddc = ddc.ok().and_then(|mut ddc| {
+            ddc.displays.retain(|(_, display)| display.baseline > 0.0);
+            (!ddc.displays.is_empty()).then_some(ddc)
+        });
         let reference = self
             .wmi
             .values()
@@ -737,7 +746,11 @@ impl WindowsBrightness {
             .reduce(f32::max);
         // A failed capture must not leave the previous displays writable.
         self.reference = reference.unwrap_or(0.0);
-        reference.context("no supported brightness monitors")
+        reference.context(if present {
+            "every display is already at its minimum brightness"
+        } else {
+            "no supported brightness monitors"
+        })
     }
 
     fn write_with(
@@ -902,12 +915,16 @@ impl Power for WindowsPower {
     }
 }
 
+/// Whether any display offers native brightness, whatever its current level.
+/// Each fade captures afresh, so a display at its minimum now (and left out of
+/// that capture) can still fade natively after the user raises it.
+fn brightness_supported(wmi: Result<BTreeMap<String, f32>>, ddc: Result<DdcDisplays>) -> bool {
+    wmi.is_ok_and(|panels| !panels.is_empty()) || ddc.is_ok_and(|ddc| !ddc.displays.is_empty())
+}
+
 pub fn backends() -> Backends {
-    let mut brightness = WindowsBrightness::default();
-    let brightness = brightness
-        .get()
-        .ok()
-        .map(|_| Box::new(brightness) as Box<dyn Brightness>);
+    let brightness = brightness_supported(wmi_levels(), DdcDisplays::capture())
+        .then(|| Box::new(WindowsBrightness::default()) as Box<dyn Brightness>);
     let mut volume = WindowsVolume::default();
     let volume = volume
         .get()
@@ -1310,6 +1327,60 @@ mod tests {
             0.8
         );
         assert!(brightness.wmi.is_empty());
+    }
+
+    #[test]
+    fn displays_at_minimum_are_not_counted_as_native_fading() {
+        // Reproduced with a virtual display reporting DDC 0/100 beside a monitor
+        // that ignores writes: the virtual display's writes masked the failure.
+        let mut displays = ddc_displays();
+        displays.displays[1].1 = Display::new(0.0, 0, 100);
+        let mut brightness = WindowsBrightness::default();
+        let wmi = BTreeMap::from([("off".into(), 0.0), ("panel".into(), 0.6)]);
+        assert_eq!(brightness.capture(Ok(wmi), Ok(displays)).unwrap(), 0.8);
+        assert_eq!(brightness.wmi.keys().collect::<Vec<_>>(), ["panel"]);
+        assert_eq!(brightness.ddc.as_ref().unwrap().displays.len(), 1);
+        let hardware = std::cell::RefCell::new(Hardware {
+            broken: BTreeSet::from(["panel".into(), "ddc0".into()]),
+            ..Default::default()
+        });
+        let error = write(&mut brightness, &hardware, 0.4, false).unwrap_err();
+        assert!(!error.is::<Partial>(), "{error:#}");
+
+        let mut displays = ddc_displays();
+        for (_, display) in &mut displays.displays {
+            *display = Display::new(0.0, 0, 100);
+        }
+        let wmi = BTreeMap::from([("off".into(), 0.0)]);
+        assert!(brightness.capture(Ok(wmi), Ok(displays)).is_err());
+        assert!(brightness.wmi.is_empty());
+        assert!(brightness.ddc.is_none());
+    }
+
+    #[test]
+    fn displays_starting_at_minimum_keep_native_brightness_available() {
+        // Startup must not mistake "nothing to fade now" for "unsupported":
+        // that would leave the overlay in charge after the user raises brightness.
+        let mut displays = ddc_displays();
+        for (_, display) in &mut displays.displays {
+            *display = Display::new(0.0, 0, 100);
+        }
+        let at_minimum = || Ok(BTreeMap::from([("panel".into(), 0.0)]));
+        assert!(brightness_supported(at_minimum(), Ok(displays)));
+        assert!(brightness_supported(
+            at_minimum(),
+            Err(anyhow::anyhow!("no DDC"))
+        ));
+        let no_ddc = || Err(anyhow::anyhow!("no DDC"));
+        assert!(!brightness_supported(
+            Err(anyhow::anyhow!("no WMI")),
+            no_ddc()
+        ));
+        assert!(!brightness_supported(Ok(BTreeMap::new()), no_ddc()));
+        // A later fade, after the user raises the panel, captures it natively.
+        let mut brightness = WindowsBrightness::default();
+        let raised = BTreeMap::from([("panel".into(), 0.5)]);
+        assert_eq!(brightness.capture(Ok(raised), no_ddc()).unwrap(), 0.5);
     }
 
     #[test]

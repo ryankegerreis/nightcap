@@ -10,6 +10,8 @@ Windows selects eframe's OpenGL renderer for transparent and hidden viewports.
 ```
 src/
   main.rs            app entry: builds NativeOptions, wires engine + tray + UI
+  instance.rs        one Nightcap per session (Windows): a later launch shows the
+                     running copy's window and exits
   settings.rs        Settings struct (serde), load/save JSON in the OS config dir
   fade.rs            pure fade math: level at time t for a fade plan (unit tested)
   engine.rs          timer engine thread: state machine, drives fades, fires the end action
@@ -28,7 +30,9 @@ src/
     main_window.rs   the main timer window
     settings_window.rs  Settings window (separate viewport, opened by gear icon / Cmd+,)
     overlay.rs       fallback dimming overlay: fullscreen, borderless, transparent,
-                     always-on-top, mouse-passthrough black viewport with variable alpha
+                     always-on-top, mouse-passthrough black viewport with variable alpha.
+                     Windows uses a native black layered popup instead, with the alpha
+                     as its window opacity, covering the root window's monitor
 ```
 
 ## Core types (in `settings.rs` / `engine.rs`)
@@ -70,7 +74,9 @@ window is hidden and egui is not repainting. It owns the platform backends.
   A `platform::Disconnected` error drops that original, so the next fade captures
   the new device. A timer started while a restore is pending fades from the original.
 - Calls a `repaint: Box<dyn Fn() + Send>` hook after each snapshot change so the UI and
-  tray refresh.
+  tray refresh. The hook and tray actions go through `ui::RootWaker`. On Windows, a
+  redraw requested as the tray menu's modal loop starts can be lost, after which egui
+  ignores further requests; the waker then also posts a native paint to the root.
 
 ## Platform traits (`platform/mod.rs`)
 
@@ -90,4 +96,5 @@ so no GTK is required. Menu matches the mockup: "Start Timer" header, 15/30/45 M
 1 Hour, 90 Minutes; while running also Pause/Resume, +15 Minutes, Cancel; then
 Open Nightcap, Settings…, Quit Nightcap. Title shows remaining time (macOS menu bar)
 when `show_time_in_menu_bar` is on. Closing the main window hides it; the app keeps
-running in the tray.
+running in the tray. On Windows the menu opens on right-click and a left-click opens
+the main window.
