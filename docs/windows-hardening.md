@@ -105,3 +105,116 @@ changes real levels and needs stable devices; it never calls native power action
 - The Settings viewport responds to pointer/keyboard input, but its native
   accessibility tree exposes window chrome rather than the settings controls.
   The main-window accessibility tree is available.
+
+# Windows hardening run — 2026-11-17
+
+Same host, now with the SudoMaker virtual display active as a second monitor
+(DDC/CI reports it at brightness 0 of 100). Rust 1.99.1. The app was launched for
+real in debug and release builds and driven through UI Automation, the real
+notification-area icon and menu, and real mouse input. Every timer used
+`NIGHTCAP_DRY_RUN=1`; no power action was requested. Audio started at 34.4% and
+was verified restored; the test settings file was removed afterwards.
+
+## Reproduced issues and fixes
+
+- **Tray actions and the window froze after the tray menu:** a redraw requested
+  as the menu's modal loop started was never delivered. egui then counted the
+  repaint as pending and dropped every later request, so a visible window
+  stopped updating (a running countdown froze) and tray Quit, Settings… and Open
+  Nightcap stayed queued until the pointer moved over the window. Quit therefore
+  appeared to do nothing and did not restore volume. An external
+  `RDW_INTERNALPAINT` released the queue, which confirmed the cause. Root wakes
+  from tray actions and later launches now also post a native paint; engine
+  wakes do so only when no root pass ran since the previous wake. Opening and
+  dismissing the menu three times no longer stops the countdown, and tray
+  Settings…, Open Nightcap and Quit (with restore, mid-fade) act immediately.
+- **The dimming overlay was never drawn:** winit's mouse passthrough marks a
+  window layered without setting layered attributes, and Windows does not draw
+  such a window. Once attributes were applied, the fullscreen request turned
+  out to be lost too: the overlay was a monitor-sized window anchored at the
+  root's centre. Moving it afterwards left a caption strip over a transparent
+  surface. The earlier report's overlay check confirmed the window existed and
+  that clicks passed through, not that it was drawn. Windows now uses a native
+  black layered popup whose window opacity is the overlay alpha. A capture with
+  `CAPTUREBLT` shows the whole primary monitor and taskbar dimmed, and
+  `WindowFromPoint` under it returns the Nightcap window. Real clicks on Pause
+  and Cancel pass through while running, paused and finished, and timers started
+  from the tray dim while the window is hidden. The popup follows display
+  changes itself, because a paused timer with a hidden root gets no app updates.
+- **A virtual display masked native failure:** the MSI monitor ignores writes,
+  but the virtual display at 0 accepted its (unchanging) writes, so every
+  failure was reported as partial. The engine kept "fading natively" and never
+  showed the overlay, so nothing visibly dimmed. Displays already at their
+  minimum are now left out of each fade's capture; the hardware test reports
+  overlay alpha 0.200. The startup check still counts them as supported, so a
+  display raised from its minimum later fades natively.
+- **Second instances:** a second launch started another engine and tray icon.
+  It captured the first instance's faded levels as its originals, and both
+  timers wrote to the same devices. The running copy now owns a session-local
+  named mutex until it has restored levels and exited. A later launch finds the
+  running copy's message-only listener window and asks it, with
+  `SendMessageTimeout`, to show its window. That call's reply answers only that
+  launch, so no answer can be left over for another one. The UI answers after
+  handling that pass's Quit, so a copy that is quitting refuses. Accepting means
+  the show and focus commands were issued; focus remains subject to Windows'
+  foreground rules, and only the running copy's process is allowed to take the
+  foreground. A request the UI reaches after its launch stopped waiting expires
+  rather than opening the window later. A refused launch, or one made after a
+  crash (which abandons the mutex), keeps waiting: it is shown by whichever launch
+  took over, or starts normally once it owns the mutex itself. A launch
+  that was shown exits with code 0. One that cannot open the running copy (for
+  example because it runs elevated), or gets no answer within 10 seconds, exits
+  with code 1 instead of starting a second engine. Live: two simultaneous
+  launches were both answered within 500 ms with Nightcap in the foreground, and
+  a launch fired immediately after tray Quit started its own window.
+- **Left-clicking the tray icon:** tray-icon opens the menu on left clicks by
+  default. That modal menu swallowed the double click that was meant to restore
+  the window. A left click now opens the window and the menu stays on the right
+  button.
+- **Settings written with a BOM:** PowerShell 5's UTF-8 output (and older
+  Notepad) starts with a byte-order mark. serde_json rejected it, so every
+  preference silently reverted to defaults and the file was then overwritten.
+  The loader now accepts a leading BOM.
+- **Per-frame window icon:** the Settings viewport rebuilt the 128×128
+  supersampled icon on every root pass. egui compares icons by pointer, so it
+  also re-sent `SetWindowIcon` every frame. The icon is now built once.
+
+## Executed verification
+
+```powershell
+cargo fmt --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --release --locked
+cargo test --locked --test windows_runtime -- --ignored --nocapture --test-threads=1
+```
+
+- Default suite: 106 library tests, 1 binary test and 2 Windows runtime tests
+  passed; the hardware test is opt-in. The overlay viewport tests now run on
+  macOS and Linux only; Windows tests the native dimmer, with a real window.
+- Opt-in hardware suite passed: volume 0.344 → 0.257 and restored; overlay
+  alpha 0.200 after the monitor ignored DDC writes.
+- Release binary: idle CPU 0 s over 5 s with the window visible; a second
+  launch exited with code 0 and showed the first; tray Quit exited.
+
+## Remaining limits
+
+- The notification-area menu is drawn in the light theme while Windows is dark.
+  muda offers dark themes only for menu bars; dark popup menus need the
+  undocumented uxtheme `SetPreferredAppMode`, so this was left alone.
+- When some displays fade natively and others fail, the failed displays are not
+  dimmed. The overlay covers only the root window's monitor, and only when
+  native fading fails everywhere.
+- Linux has no single-instance guard; macOS relies on LaunchServices for the
+  app bundle.
+- A display is treated as unable to dim when it sits at the bottom of its
+  reported range (DDC levels are normalized to the monitor's own range). A WMI
+  panel whose lowest supported level is above 0%, already at that level, still
+  counts as fading natively. This host has no WMI panel, so that case was not
+  reproduced. When every detected display is excluded, the overlay dims instead,
+  and the window reports both the missing brightness control and the reason.
+- 32-bit Windows builds were not compiled; releases are x64 only.
+- Close-to-tray trusts that the tray icon was created. If Explorer has not yet
+  accepted it (tray-icon retries when the taskbar restarts), relaunching
+  Nightcap now shows the hidden window.
+- Actual sleep, hibernate, shutdown and wake were still not exercised.

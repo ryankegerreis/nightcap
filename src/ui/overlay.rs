@@ -5,20 +5,31 @@
 //! normal windows' backgrounds explicitly. Call `show` on every root UI pass.
 //! Register the hidden child on the first root UI pass, before the root can close.
 //! Logic-only updates can then reveal it without revealing or focusing the root.
+//!
+//! Windows uses a native layered window instead of a viewport (see `dimmer`).
+//! There, call `follow_root` before `sync` so the dimming covers the root's monitor.
 
+#[cfg(not(target_os = "windows"))]
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
 };
 
+use eframe::egui::Context;
+#[cfg(not(target_os = "windows"))]
 use eframe::egui::{
-    self, Color32, Context, LayerId, Order, ViewportBuilder, ViewportClass, ViewportId, WindowLevel,
+    self, Color32, LayerId, Order, ViewportBuilder, ViewportClass, ViewportId, WindowLevel,
 };
 
 pub struct Overlay {
+    #[cfg(not(target_os = "windows"))]
     alpha: Arc<AtomicU32>,
+    #[cfg(not(target_os = "windows"))]
     id: ViewportId,
+    #[cfg(not(target_os = "windows"))]
     registered: bool,
+    #[cfg(target_os = "windows")]
+    dimmer: dimmer::Dimmer,
 }
 
 impl Default for Overlay {
@@ -30,19 +41,40 @@ impl Default for Overlay {
 impl Overlay {
     pub fn new() -> Self {
         Self {
+            #[cfg(not(target_os = "windows"))]
             alpha: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
+            #[cfg(not(target_os = "windows"))]
             id: ViewportId::from_hash_of("nightcap-dimming-overlay"),
+            #[cfg(not(target_os = "windows"))]
             registered: false,
+            #[cfg(target_os = "windows")]
+            dimmer: dimmer::Dimmer::default(),
+        }
+    }
+
+    /// The dimming covers the monitor that holds this window, hidden or not.
+    #[cfg(target_os = "windows")]
+    pub fn follow_root(&mut self, root: &impl raw_window_handle::HasWindowHandle) {
+        use raw_window_handle::RawWindowHandle;
+        if let Ok(RawWindowHandle::Win32(handle)) = root.window_handle().map(|h| h.as_raw()) {
+            self.dimmer.follow(handle.hwnd.get());
         }
     }
 
     /// Call from every root App::ui pass. Zero alpha keeps the child hidden, ready
     /// for a fade started from the tray while the root is hidden.
     /// Covers one monitor; on macOS this follows the root's monitor without entering a
-    /// fullscreen Space. On other desktops, the window manager selects the fullscreen
-    /// monitor from the root's position; Wayland may choose a different output.
+    /// fullscreen Space. On Windows it covers the root's monitor. On Linux, the window
+    /// manager selects the fullscreen monitor from the root's position; Wayland may
+    /// choose a different output.
     pub fn show(&mut self, ctx: &Context, alpha: f32) {
         self.sync(ctx, alpha);
+        #[cfg(not(target_os = "windows"))]
+        self.show_viewport(ctx);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn show_viewport(&mut self, ctx: &Context) {
         let alpha = f32::from_bits(self.alpha.load(Ordering::Relaxed));
         self.registered = true;
         #[cfg(target_os = "macos")]
@@ -68,8 +100,6 @@ impl Overlay {
             }
             #[cfg(target_os = "macos")]
             install_macos_focus_guard();
-            #[cfg(target_os = "windows")]
-            make_windows_overlay_passive();
             let ctx = ui.ctx();
             let alpha = f32::from_bits(shared_alpha.load(Ordering::Relaxed));
             let rect = ctx.input(|input| input.viewport_rect());
@@ -86,12 +116,9 @@ impl Overlay {
     }
 
     /// Logic-only updates keep an existing child alive when the root is hidden.
+    #[cfg(not(target_os = "windows"))]
     pub fn sync(&mut self, ctx: &Context, alpha: f32) {
-        let alpha = if alpha.is_finite() {
-            alpha.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
+        let alpha = normalized(alpha);
         let previous = self.alpha.swap(alpha.to_bits(), Ordering::Relaxed);
         if self.registered && previous != alpha.to_bits() {
             // Hiding is immediate even if the root has no UI pass to remove it.
@@ -99,8 +126,23 @@ impl Overlay {
             ctx.request_repaint_of(self.id);
         }
     }
+
+    /// Logic-only updates keep dimming while the root is hidden.
+    #[cfg(target_os = "windows")]
+    pub fn sync(&mut self, _ctx: &Context, alpha: f32) {
+        self.dimmer.apply(normalized(alpha));
+    }
 }
 
+fn normalized(alpha: f32) -> f32 {
+    if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn monitor_builder(ctx: &Context) -> ViewportBuilder {
     let (size, root_rect) =
         ctx.input(|input| (input.viewport().monitor_size, input.viewport().outer_rect));
@@ -156,40 +198,291 @@ fn monitor_builder(ctx: &Context) -> ViewportBuilder {
     }
 }
 
-/// Keep Windows from selecting the overlay when another app window is hidden.
+/// A plain black, click-through, topmost layered popup whose opacity is the
+/// overlay alpha. eframe's transparent OpenGL viewport cannot do this on Windows:
+/// winit's mouse passthrough leaves it layered without attributes, so it is never
+/// drawn; its fullscreen request is lost once egui applies the position and size;
+/// and moving it afterwards leaves a caption strip over a transparent surface.
 #[cfg(target_os = "windows")]
-fn make_windows_overlay_passive() {
-    use windows::Win32::{
-        Foundation::{HWND, LPARAM},
-        UI::WindowsAndMessaging::{
-            EnumWindows, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId,
-            SetWindowLongPtrW, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+mod dimmer {
+    use std::{marker::PhantomData, sync::Once};
+
+    use windows::{
+        Win32::{
+            Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+            Graphics::Gdi::{
+                BLACK_BRUSH, GetMonitorInfoW, GetStockObject, HBRUSH, HMONITOR,
+                MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow,
+            },
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW,
+                GetWindowRect, HWND_TOPMOST, IsWindowVisible, LWA_ALPHA, RegisterClassExW, SW_HIDE,
+                SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes,
+                SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_DISPLAYCHANGE, WNDCLASSEXW,
+                WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+                WS_EX_TRANSPARENT, WS_POPUP,
+            },
         },
+        core::{PCWSTR, w},
     };
-    use windows::core::BOOL;
-    unsafe extern "system" fn configure(window: HWND, _param: LPARAM) -> BOOL {
-        let mut process = 0;
-        let mut title = [0_u16; 64];
-        // SAFETY: EnumWindows supplied a live handle; buffers and out-pointers are valid.
+
+    const CLASS: PCWSTR = w!("NightcapDimmingOverlay");
+
+    /// Handles are stored as integers. The window belongs to the UI thread that
+    /// made it, so the dimmer is not `Send`.
+    #[derive(Default)]
+    pub(super) struct Dimmer {
+        window: Option<isize>,
+        root: Option<isize>,
+        /// Applied opacity; zero while hidden.
+        opacity: u8,
+        _thread_bound: PhantomData<*const ()>,
+    }
+
+    fn monitor_rect(monitor: HMONITOR) -> Option<RECT> {
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: valid monitor handle and output structure.
+        unsafe { GetMonitorInfoW(monitor, &mut info) }
+            .as_bool()
+            .then_some(info.rcMonitor)
+    }
+
+    unsafe extern "system" fn procedure(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        // SAFETY: Win32 calls on the window this procedure was called for.
         unsafe {
-            GetWindowThreadProcessId(window, Some(&mut process));
-            if process == std::process::id() {
-                let length = GetWindowTextW(window, &mut title) as usize;
-                if String::from_utf16_lossy(&title[..length]) == "Nightcap Dimming Overlay" {
-                    let old = GetWindowLongPtrW(window, GWL_EXSTYLE);
-                    let new = (old | WS_EX_NOACTIVATE.0 as isize | WS_EX_TOOLWINDOW.0 as isize)
-                        & !(WS_EX_APPWINDOW.0 as isize);
-                    if old != new {
-                        SetWindowLongPtrW(window, GWL_EXSTYLE, new);
+            // A paused timer with a hidden root gets no app updates, so follow
+            // resolution and layout changes here, to the root's monitor (in user data).
+            // The *LongPtr functions take and return i32 on 32-bit Windows.
+            let root = GetWindowLongPtrW(window, GWLP_USERDATA) as isize;
+            let anchor = if root != 0 { HWND(root as _) } else { window };
+            if message == WM_DISPLAYCHANGE
+                && IsWindowVisible(window).as_bool()
+                && let Some(rect) =
+                    monitor_rect(MonitorFromWindow(anchor, MONITOR_DEFAULTTONEAREST))
+            {
+                let _ = SetWindowPos(
+                    window,
+                    None,
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+            DefWindowProcW(window, message, wparam, lparam)
+        }
+    }
+
+    fn create() -> windows::core::Result<HWND> {
+        // SAFETY: plain Win32 calls; the class's black brush paints the whole client.
+        unsafe {
+            let instance = HINSTANCE(GetModuleHandleW(None)?.0);
+            static REGISTER: Once = Once::new();
+            REGISTER.call_once(|| {
+                let class = WNDCLASSEXW {
+                    cbSize: size_of::<WNDCLASSEXW>() as u32,
+                    lpfnWndProc: Some(procedure),
+                    hInstance: instance,
+                    hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
+                    lpszClassName: CLASS,
+                    ..Default::default()
+                };
+                if RegisterClassExW(&class) == 0 {
+                    log::warn!(
+                        "Registering the dimming overlay class failed: {}",
+                        windows::core::Error::from_thread()
+                    );
+                }
+            });
+            // Transparent + layered passes input through; no-activate keeps focus put.
+            CreateWindowExW(
+                WS_EX_LAYERED
+                    | WS_EX_TRANSPARENT
+                    | WS_EX_TOPMOST
+                    | WS_EX_TOOLWINDOW
+                    | WS_EX_NOACTIVATE,
+                CLASS,
+                w!("Nightcap Dimming Overlay"),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(instance),
+                None,
+            )
+        }
+    }
+
+    impl Dimmer {
+        pub(super) fn follow(&mut self, root: isize) {
+            if self.root != Some(root) {
+                self.root = Some(root);
+                self.share_root();
+            }
+        }
+
+        /// The window procedure reads the root from user data on display changes.
+        fn share_root(&self) {
+            if let (Some(window), Some(root)) = (self.window, self.root) {
+                // SAFETY: stores an integer in this dimmer's own window.
+                unsafe { SetWindowLongPtrW(HWND(window as _), GWLP_USERDATA, root as _) };
+            }
+        }
+
+        /// `alpha` is already within `0.0..=1.0`. Unchanged values cost three cheap
+        /// queries. Bounds are compared with the window's actual rectangle, since
+        /// display changes also move it from the window procedure.
+        pub(super) fn apply(&mut self, alpha: f32) {
+            let opacity = (alpha * 255.0).round() as u8;
+            if opacity == 0 {
+                self.hide();
+                return;
+            }
+            let Some(window) = self.window() else {
+                return;
+            };
+            let bounds = self.monitor_bounds();
+            // SAFETY: `window` is this dimmer's live window, on its creating thread.
+            unsafe {
+                if opacity != self.opacity
+                    && let Err(error) =
+                        SetLayeredWindowAttributes(window, COLORREF(0), opacity, LWA_ALPHA)
+                {
+                    log::warn!("Setting the dimming opacity failed: {error}");
+                    return;
+                }
+                let mut current = RECT::default();
+                let moved = GetWindowRect(window, &mut current).is_err() || bounds != Some(current);
+                if (self.opacity == 0 || moved)
+                    && let Some(rect) = bounds
+                {
+                    // Cover the root's monitor above other topmost windows, without focus.
+                    if let Err(error) = SetWindowPos(
+                        window,
+                        Some(HWND_TOPMOST),
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                    ) {
+                        log::warn!("Showing the dimming overlay failed: {error}");
+                        return;
                     }
                 }
             }
+            self.opacity = opacity;
         }
-        BOOL(1)
+
+        fn hide(&mut self) {
+            if self.opacity != 0
+                && let Some(window) = self.window
+            {
+                // SAFETY: hides this dimmer's own live window.
+                let _ = unsafe { ShowWindow(HWND(window as _), SW_HIDE) };
+            }
+            self.opacity = 0;
+        }
+
+        fn monitor_bounds(&self) -> Option<RECT> {
+            // SAFETY: monitor query; a stale root handle falls back to the nearest monitor.
+            monitor_rect(unsafe {
+                match self.root {
+                    Some(root) => MonitorFromWindow(HWND(root as _), MONITOR_DEFAULTTONEAREST),
+                    None => MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY),
+                }
+            })
+        }
+
+        fn window(&mut self) -> Option<HWND> {
+            if self.window.is_none() {
+                match create() {
+                    Ok(window) => {
+                        self.window = Some(window.0 as isize);
+                        self.share_root();
+                    }
+                    Err(error) => log::warn!("Creating the dimming overlay failed: {error}"),
+                }
+            }
+            self.window.map(|window| HWND(window as _))
+        }
     }
-    // SAFETY: callback has the required ABI and no borrowed state escapes.
-    if let Err(error) = unsafe { EnumWindows(Some(configure), LPARAM(0)) } {
-        log::warn!("Configuring passive overlay window failed: {error}");
+
+    impl Drop for Dimmer {
+        fn drop(&mut self) {
+            if let Some(window) = self.window.take() {
+                // SAFETY: destroys this dimmer's own window, on its creating thread.
+                let _ = unsafe { DestroyWindow(HWND(window as _)) };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetLayeredWindowAttributes, GetWindowLongPtrW, GetWindowRect, IsWindow,
+            IsWindowVisible,
+        };
+
+        use super::*;
+
+        fn opacity(window: HWND) -> u8 {
+            let mut alpha = 0;
+            // SAFETY: live window; valid output pointer.
+            unsafe { GetLayeredWindowAttributes(window, None, Some(&mut alpha), None) }.unwrap();
+            alpha
+        }
+
+        #[test]
+        fn dims_the_whole_primary_monitor_click_through_and_hides_at_zero() {
+            let mut dimmer = Dimmer::default();
+            dimmer.apply(0.0);
+            assert!(dimmer.window.is_none(), "nothing to dim creates no window");
+            dimmer.apply(0.5);
+            let window = HWND(dimmer.window.unwrap() as _);
+            let mut rect = RECT::default();
+            // SAFETY: live window owned by this test thread; valid output pointers.
+            unsafe {
+                assert!(IsWindowVisible(window).as_bool());
+                GetWindowRect(window, &mut rect).unwrap();
+                let style = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32;
+                for required in [
+                    WS_EX_LAYERED,
+                    WS_EX_TRANSPARENT,
+                    WS_EX_TOPMOST,
+                    WS_EX_NOACTIVATE,
+                ] {
+                    assert_eq!(style & required.0, required.0, "{required:?}");
+                }
+            }
+            assert_eq!(Some(rect), dimmer.monitor_bounds());
+            assert_eq!(opacity(window), 128);
+            dimmer.apply(0.9);
+            assert_eq!(opacity(window), 230);
+            dimmer.apply(0.0);
+            // SAFETY: as above.
+            assert!(!unsafe { IsWindowVisible(window) }.as_bool());
+            dimmer.apply(0.2);
+            // SAFETY: as above.
+            assert!(unsafe { IsWindowVisible(window) }.as_bool());
+            assert_eq!(opacity(window), 51);
+            drop(dimmer);
+            // SAFETY: only queries whether the handle still names a window.
+            assert!(!unsafe { IsWindow(Some(window)) }.as_bool());
+        }
     }
 }
 
@@ -253,7 +546,8 @@ fn install_macos_focus_guard() {
     });
 }
 
-#[cfg(test)]
+// Windows dims with a native window; its tests live in `dimmer`.
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::*;
 

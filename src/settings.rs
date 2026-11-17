@@ -121,7 +121,10 @@ impl Settings {
         let result = fs::read(path)
             .with_context(|| format!("reading {}", path.display()))
             .and_then(|bytes| {
-                serde_json::from_slice::<Self>(&bytes).context("parsing settings JSON")
+                // Windows editors and PowerShell 5's UTF-8 output start with a BOM,
+                // which serde_json rejects; that would reset and overwrite every setting.
+                let json = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+                serde_json::from_slice::<Self>(json).context("parsing settings JSON")
             });
         match result {
             Ok(mut settings) => {
@@ -258,5 +261,13 @@ mod tests {
         assert_eq!(Settings::load_from(&path), Settings::default());
         std::fs::write(&path, r#"{"last_duration_min": 60}"#).unwrap();
         assert_eq!(Settings::load_from(&path).last_duration_min, 60);
+    }
+
+    #[test]
+    fn files_saved_with_a_utf8_bom_keep_their_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, b"\xEF\xBB\xBF{\"last_duration_min\": 90}").unwrap();
+        assert_eq!(Settings::load_from(&path).last_duration_min, 90);
     }
 }

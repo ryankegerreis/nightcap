@@ -186,7 +186,7 @@ mod native {
 
     use anyhow::Context as _;
     use tray_icon::{
-        Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent, TrayIconId,
+        Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent, TrayIconId,
         menu::{
             IsMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem,
             accelerator::{Accelerator, Code, Modifiers},
@@ -224,13 +224,15 @@ mod native {
                 }
             }));
             TrayIconEvent::set_event_handler(Some(|event: TrayIconEvent| {
-                // Menu clicks on macOS/Windows are handled by muda. Windows additionally
-                // supports double-clicking the icon to restore the main window.
-                if let TrayIconEvent::DoubleClick {
-                    id,
-                    button: MouseButton::Left,
-                    ..
-                } = event
+                // Menu clicks on macOS/Windows are handled by muda. On Windows the
+                // menu opens with the right button; a left click restores the window.
+                if cfg!(target_os = "windows")
+                    && let TrayIconEvent::Click {
+                        id,
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
                 {
                     for target in targets() {
                         if target.tray_id == id {
@@ -344,8 +346,10 @@ mod native {
             let builder = TrayIconBuilder::new().with_menu(Box::new(menu.clone()));
             #[cfg(target_os = "macos")]
             let builder = builder.with_icon_templated(icon_data);
+            // tray-icon opens Windows menus on left clicks too, and the menu's modal
+            // loop would swallow the click that restores the window.
             #[cfg(target_os = "windows")]
-            let builder = builder.with_icon(icon_data);
+            let builder = builder.with_icon(icon_data).with_menu_on_left_click(false);
             let icon = builder
                 .with_tooltip("Nightcap")
                 .build()

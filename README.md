@@ -129,10 +129,16 @@ Security → Automation. The timer itself requires no Accessibility permission.
 Windows support targets Windows 10 or later. Volume captures the default CoreAudio
 endpoint when a fade starts and keeps writes and restoration on that endpoint.
 Brightness uses WMI for supported built-in panels and DDC/CI for supported
-external monitors. DDC writes are checked against the reported level; monitors
-that accept but ignore writes fall back to the dimming overlay. Windows uses the
-OpenGL renderer to support transparent and hidden viewports. Native
-window decorations and the notification-area tray are retained. Power actions
+external monitors. DDC writes are checked against the reported level; a monitor
+that accepts but ignores writes sits out the fade, and when no display fades
+natively Nightcap uses the dimming overlay instead. Displays already
+at their minimum, such as virtual displays reporting zero, are left out of native
+fading. The overlay is a native click-through window covering the monitor that
+holds Nightcap's window. Windows uses the OpenGL renderer to support transparent
+and hidden viewports. Native window decorations and the notification-area tray
+are retained: left-click the tray icon to open Nightcap, right-click for its
+menu. Only one Nightcap runs per Windows session; launching it again shows the
+running copy instead of starting a second timer. Power actions
 depend on Windows privileges and hibernation configuration. Hibernate is offered
 only when Windows reports S4 support, a full hibernation file, and access to the
 required shutdown privilege; a reduced Fast Startup file is insufficient.
@@ -185,7 +191,8 @@ cargo test --locked --test windows_runtime -- --ignored --nocapture --test-threa
 
 The hardware test always substitutes dry-run power actions, restores captured
 levels on exit, and verifies overlay state when hardware brightness is unavailable.
-Keep the connected displays and selected audio output unchanged during this test.
+Keep the connected displays and selected audio output unchanged during this test,
+and make sure at least one supported display is above its minimum brightness.
 It does not test actual suspend, hibernation, shutdown, or physical reconnection.
 The [Windows hardening report](docs/windows-hardening.md) records the native test
 run, reproduced issues and remaining limitations.

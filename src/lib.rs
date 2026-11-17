@@ -2,6 +2,7 @@
 
 pub mod engine;
 pub mod fade;
+pub mod instance;
 pub mod platform;
 pub mod settings;
 pub mod tray;
