@@ -24,6 +24,8 @@ env_logger = "0.11.11"
 chrono = "0.4.45"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 tempfile = "3.27.0"
+semver = "1.0.28"
+webbrowser = "1.2.4"
 
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false }

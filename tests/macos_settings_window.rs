@@ -10,7 +10,7 @@ fn main() {
         println!("macos_settings_window ignored: requires a macOS window-server session");
         return;
     }
-    use nightcap::{settings::Settings, ui::settings_window};
+    use nightcap::{settings::Settings, ui::settings_window, updates};
     use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained};
     use objc2_app_kit::{
         NSApplication, NSBackingStoreType, NSScreen, NSWindow, NSWindowCollectionBehavior,
@@ -23,15 +23,19 @@ fn main() {
         let mut open = true;
         let mut settings = Settings::default();
         let mut opening = opening;
+        let update_status = updates::UpdateStatus::new(updates::current_version());
         let mut output = ctx.run_ui(Default::default(), |ui| {
             settings_window::show(
                 ui.ctx(),
                 &mut open,
                 &mut opening,
                 &mut settings,
-                false,
-                false,
-                false,
+                settings_window::SettingsView {
+                    brightness_supported: false,
+                    volume_supported: false,
+                    hibernate_supported: false,
+                    updates: &update_status,
+                },
             );
         });
         output.textures_delta.clear();
@@ -294,6 +298,7 @@ fn main() {
     let mut opening = true;
     let mut open = true;
     let mut preferences = Settings::default();
+    let update_status = updates::UpdateStatus::new(updates::current_version());
     let mut render = |opening: &mut bool| {
         let mut output = ctx.run_ui(Default::default(), |ui| {
             settings_window::show(
@@ -301,9 +306,12 @@ fn main() {
                 &mut open,
                 opening,
                 &mut preferences,
-                false,
-                false,
-                false,
+                settings_window::SettingsView {
+                    brightness_supported: false,
+                    volume_supported: false,
+                    hibernate_supported: false,
+                    updates: &update_status,
+                },
             );
         });
         output.textures_delta.clear();

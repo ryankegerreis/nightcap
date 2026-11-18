@@ -17,6 +17,7 @@ use nightcap::{
     settings::Settings,
     tray::Tray,
     ui::{NightcapApp, RootWaker, theme, window_builder},
+    updates::UpdateChecker,
 };
 
 fn main() -> eframe::Result {
@@ -97,6 +98,11 @@ fn main() -> eframe::Result {
                     log::warn!("Tray unavailable; closing the window will quit: {error:#}")
                 })
                 .ok();
+            let updates_waker = waker.clone();
+            let updates = UpdateChecker::spawn(
+                settings.check_for_updates,
+                Arc::new(move || updates_waker.wake_now()),
+            );
             let (activate, activations) = mpsc::channel();
             // The UI accepts once it has asked the window to show, or refuses while
             // quitting; a refused launch starts its own copy after this one exits.
@@ -110,7 +116,7 @@ fn main() -> eframe::Result {
                 shown.recv_timeout(allowed).unwrap_or(false)
             });
             Ok(Box::new(
-                NightcapApp::new(engine, settings, tray).with_activations(activations),
+                NightcapApp::new(engine, settings, tray, updates).with_activations(activations),
             ))
         }),
     )

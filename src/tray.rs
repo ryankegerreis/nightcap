@@ -4,11 +4,12 @@
 //! let the tray (and its engine handle) be dropped without leaving a worker alive.
 
 use std::{
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
 use crate::engine::{Command, EngineHandle, Snapshot, TimerState};
+use crate::updates::Release;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayAction {
@@ -27,12 +28,14 @@ impl Tray {
     /// Must be called on the main thread after the event loop exists.
     /// `wake` can be called from any thread; request a root viewport repaint from it.
     pub fn new(engine: EngineHandle, wake: Arc<dyn Fn() + Send + Sync>) -> anyhow::Result<Self> {
-        let display = Display::new(&engine.snapshot(), false);
+        let display = Display::new(&engine.snapshot(), false, None);
         let (sender, actions) = mpsc::channel();
         let dispatch = Arc::new(Dispatch {
             engine,
             sender,
             wake,
+            download: Mutex::new(None),
+            open: Arc::new(crate::updates::open_in_browser),
         });
         let native = native::NativeTray::new(dispatch, &display)?;
         Ok(Self {
@@ -42,9 +45,22 @@ impl Tray {
         })
     }
 
-    /// Changes native items only when the state, displayed second, or title preference changes.
-    pub fn update(&mut self, snapshot: &Snapshot, show_time_in_menu_bar: bool) {
-        let display = Display::new(snapshot, show_time_in_menu_bar);
+    /// Changes native items only when the state, displayed second, title preference,
+    /// or available update changes.
+    pub fn update(
+        &mut self,
+        snapshot: &Snapshot,
+        show_time_in_menu_bar: bool,
+        update: Option<&Release>,
+    ) {
+        let display = Display::new(
+            snapshot,
+            show_time_in_menu_bar,
+            update.map(|release| Offer {
+                version: release.version.to_string(),
+                url: release.download_url(),
+            }),
+        );
         if self.display != display {
             self.native.update(&display);
             self.display = display;
@@ -71,6 +87,10 @@ enum Action {
     TogglePause,
     Add,
     Cancel,
+    /// Opens the download that the menu item showed when it was clicked.
+    /// ksni builds its item with the URL in the closure instead.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Download,
     Ui(TrayAction),
 }
 
@@ -78,10 +98,30 @@ struct Dispatch {
     engine: EngineHandle,
     sender: mpsc::Sender<TrayAction>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    /// The download URL of the update item currently in the native menu. Set on
+    /// the thread that delivers its clicks, together with the item's label.
+    download: Mutex<Option<String>>,
+    open: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl Dispatch {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    fn set_download(&self, url: Option<String>) {
+        *self.download.lock().unwrap_or_else(|e| e.into_inner()) = url;
+    }
+
     fn run(&self, action: Action) {
+        if let Action::Download = action {
+            let url = self
+                .download
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(url) = url {
+                (self.open)(&url);
+            }
+            return;
+        }
         let state = self.engine.snapshot().state;
         let command = match action {
             Action::Ui(action) => {
@@ -111,14 +151,22 @@ impl Dispatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct Offer {
+    version: String,
+    url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Display {
     state: TimerState,
     time: String,
     show_time: bool,
+    /// A newer release, offered above Open Nightcap.
+    update: Option<Offer>,
 }
 
 impl Display {
-    fn new(snapshot: &Snapshot, show_time: bool) -> Self {
+    fn new(snapshot: &Snapshot, show_time: bool, update: Option<Offer>) -> Self {
         let seconds = snapshot.menu_seconds();
         Self {
             state: snapshot.state,
@@ -128,7 +176,14 @@ impl Display {
                 format!("{}:{:02}", seconds / 60, seconds % 60)
             },
             show_time,
+            update,
         }
+    }
+
+    fn update_label(&self) -> Option<String> {
+        self.update
+            .as_ref()
+            .map(|offer| format!("Download Nightcap {}", offer.version))
     }
 
     fn active(&self) -> bool {
@@ -255,7 +310,9 @@ mod native {
         cancel: MenuItem,
         active_separator: PredefinedMenuItem,
         active_visible: bool,
-        _events: Arc<Events>,
+        update_item: MenuItem,
+        update_visible: bool,
+        events: Arc<Events>,
         #[cfg(target_os = "macos")]
         _app_menu: Menu,
     }
@@ -282,6 +339,8 @@ mod native {
                 (add.id().clone(), Action::Add),
                 (cancel.id().clone(), Action::Cancel),
             ]);
+            let update_item = MenuItem::new("", true, None);
+            items.push((update_item.id().clone(), Action::Download));
             menu.append(&PredefinedMenuItem::separator())?;
             let modifier = if cfg!(target_os = "macos") {
                 Modifiers::META
@@ -373,7 +432,9 @@ mod native {
                 cancel,
                 active_separator: PredefinedMenuItem::separator(),
                 active_visible: false,
-                _events: events,
+                update_item,
+                update_visible: false,
+                events,
                 #[cfg(target_os = "macos")]
                 _app_menu: app_menu,
             };
@@ -403,6 +464,31 @@ mod native {
                     }
                 }
                 self.active_visible = display.active();
+            }
+            let update = display.update_label();
+            if let Some(label) = &update {
+                self.update_item.set_text(label);
+            }
+            // Menu clicks arrive on this thread, so a click opens what the label showed.
+            self.events
+                .dispatch
+                .set_download(display.update.as_ref().map(|offer| offer.url.clone()));
+            if update.is_some() != self.update_visible {
+                if update.is_some() {
+                    // Just after the separator above Open Nightcap: the header,
+                    // five presets, and the active items when they are shown.
+                    let index = 7 + if self.active_visible { 5 } else { 0 };
+                    if let Err(error) = self.menu.insert(&self.update_item, index) {
+                        log::warn!("Adding the update menu item failed: {error}");
+                    } else {
+                        self.update_visible = true;
+                    }
+                } else {
+                    if let Err(error) = self.menu.remove(&self.update_item) {
+                        log::warn!("Removing the update menu item failed: {error}");
+                    }
+                    self.update_visible = false;
+                }
             }
             for preset in &self.presets {
                 preset.set_enabled(!display.active());
@@ -439,6 +525,8 @@ mod native {
         dispatch: Arc<Dispatch>,
         display: Display,
         icon: ksni::Icon,
+        /// Flipped when a different release replaces the offer; see `NativeTray::update`.
+        id_epoch: bool,
     }
 
     impl Service {
@@ -474,7 +562,11 @@ mod native {
             self.dispatch.run(Action::Ui(TrayAction::OpenWindow));
         }
         fn menu_about_to_show(&mut self) {
-            self.display = Display::new(&self.dispatch.engine.snapshot(), self.display.show_time);
+            self.display = Display::new(
+                &self.dispatch.engine.snapshot(),
+                self.display.show_time,
+                self.display.update.take(),
+            );
         }
         fn menu(&self) -> Vec<MenuItem<Self>> {
             let mut menu = vec![Self::item("Start Timer", false, Action::Start(15))];
@@ -495,6 +587,19 @@ mod native {
                 ]);
             }
             menu.push(MenuItem::Separator);
+            if let (Some(label), Some(offer)) = (self.display.update_label(), &self.display.update)
+            {
+                // Bound to this menu's URL, not whatever is current when clicked.
+                let url = offer.url.clone();
+                menu.push(
+                    StandardItem {
+                        label,
+                        activate: Box::new(move |service: &mut Self| (service.dispatch.open)(&url)),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
             menu.push(Self::item(
                 "Open Nightcap",
                 true,
@@ -519,12 +624,24 @@ mod native {
                     .into(),
                 );
             }
+            if self.id_epoch {
+                // Hidden; present or absent only to change the layout.
+                menu.push(
+                    StandardItem {
+                        visible: false,
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
             menu
         }
     }
 
     pub(super) struct NativeTray {
         handle: Handle<Service>,
+        offer: Option<Offer>,
     }
 
     impl NativeTray {
@@ -540,6 +657,7 @@ mod native {
                 handle: Service {
                     dispatch,
                     display: display.clone(),
+                    id_epoch: false,
                     icon: ksni::Icon {
                         width: 32,
                         height: 32,
@@ -547,11 +665,20 @@ mod native {
                     },
                 }
                 .spawn()?,
+                offer: display.update.clone(),
             })
         }
         pub(super) fn update(&mut self, display: &Display) {
-            self.handle
-                .update(|service| service.display = display.clone());
+            // ksni keeps an item's D-Bus ID when only its label changes, so a host
+            // still showing the old offer would run the new callback. Toggling a
+            // hidden item changes the layout in the same update, which expires
+            // every ID; a click on the old item is then ignored.
+            let new_ids = replaces_offer(self.offer.as_ref(), display.update.as_ref());
+            self.offer = display.update.clone();
+            self.handle.update(|service| {
+                service.display = display.clone();
+                service.id_epoch ^= new_ids;
+            });
         }
     }
 
@@ -560,6 +687,13 @@ mod native {
             self.handle.shutdown();
         }
     }
+}
+
+/// A different release replacing one already offered, as opposed to one appearing,
+/// disappearing, or staying the same.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn replaces_offer(old: Option<&Offer>, new: Option<&Offer>) -> bool {
+    matches!((old, new), (Some(old), Some(new)) if old != new)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -586,13 +720,49 @@ mod tests {
             remaining: Duration::from_millis(754_001),
             ..Default::default()
         };
-        assert_eq!(Display::new(&snapshot, true).status(), "Sleeping in 12:35");
+        assert_eq!(
+            Display::new(&snapshot, true, None).status(),
+            "Sleeping in 12:35"
+        );
         snapshot.state = TimerState::Paused;
-        assert_eq!(Display::new(&snapshot, true).pause_label(), "Resume");
+        assert_eq!(Display::new(&snapshot, true, None).pause_label(), "Resume");
         snapshot.state = TimerState::Finishing;
-        assert!(!Display::new(&snapshot, true).controllable());
+        assert!(!Display::new(&snapshot, true, None).controllable());
         snapshot.state = TimerState::Idle;
-        assert_eq!(Display::new(&snapshot, true).time, "");
+        assert_eq!(Display::new(&snapshot, true, None).time, "");
+    }
+
+    #[test]
+    fn display_offers_an_available_update() {
+        let snapshot = Snapshot::default();
+        assert_eq!(Display::new(&snapshot, true, None).update_label(), None);
+        let update = Display::new(
+            &snapshot,
+            true,
+            Some(Offer {
+                version: "0.2.0".into(),
+                url: "https://example.invalid/0.2.0".into(),
+            }),
+        );
+        assert_eq!(
+            update.update_label().as_deref(),
+            Some("Download Nightcap 0.2.0")
+        );
+        assert_ne!(update, Display::new(&snapshot, true, None));
+    }
+
+    #[test]
+    fn only_a_different_offer_replaces_the_linux_item() {
+        let offer = |version: &str| Offer {
+            version: version.into(),
+            url: format!("https://example.invalid/{version}"),
+        };
+        let (old, new) = (offer("0.2.0"), offer("0.3.0"));
+        assert!(replaces_offer(Some(&old), Some(&new)));
+        assert!(!replaces_offer(Some(&old), Some(&old)));
+        assert!(!replaces_offer(None, Some(&new)));
+        assert!(!replaces_offer(Some(&old), None));
+        assert!(!replaces_offer(None, None));
     }
 
     #[test]
@@ -621,10 +791,14 @@ mod tests {
         )
         .unwrap();
         let (sender, receiver) = mpsc::channel();
+        let (opened_tx, opened) = mpsc::channel::<String>();
+        let opened_tx = Mutex::new(opened_tx);
         let dispatch = Dispatch {
             engine,
             sender,
             wake: Arc::new(|| {}),
+            download: Mutex::new(None),
+            open: Arc::new(move |url| opened_tx.lock().unwrap().send(url.to_owned()).unwrap()),
         };
         for (action, expected) in [
             (Action::Start(30), TimerState::Running),
@@ -642,5 +816,12 @@ mod tests {
         }
         dispatch.run(Action::Ui(TrayAction::OpenSettings));
         assert_eq!(receiver.try_recv().unwrap(), TrayAction::OpenSettings);
+        // Download opens the URL the item showed, without a UI round trip.
+        dispatch.run(Action::Download);
+        assert!(opened.try_recv().is_err());
+        dispatch.set_download(Some("https://example.invalid/0.2.0".into()));
+        dispatch.run(Action::Download);
+        assert_eq!(opened.try_recv().unwrap(), "https://example.invalid/0.2.0");
+        assert!(receiver.try_recv().is_err());
     }
 }
