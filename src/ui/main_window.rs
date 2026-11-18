@@ -25,6 +25,7 @@ pub struct MainView<'a> {
     pub duration_min: &'a mut u32,
     pub custom: &'a mut bool,
     pub notice: Option<&'a str>,
+    pub overlay_available: bool,
 }
 
 pub struct MainOutcome {
@@ -41,6 +42,7 @@ pub fn show(ui: &mut egui::Ui, view: MainView<'_>) -> MainOutcome {
         duration_min,
         custom,
         notice,
+        overlay_available,
     } = view;
     let mut outcome = MainOutcome {
         open_settings: false,
@@ -82,7 +84,7 @@ pub fn show(ui: &mut egui::Ui, view: MainView<'_>) -> MainOutcome {
                         idle,
                         &mut outcome,
                     );
-                    notes(ui, snapshot);
+                    notes(ui, snapshot, overlay_available);
                 });
         });
 
@@ -306,13 +308,10 @@ fn options_group(
     });
 }
 
-fn notes(ui: &mut egui::Ui, snapshot: &Snapshot) {
+fn notes(ui: &mut egui::Ui, snapshot: &Snapshot, overlay_available: bool) {
     let mut lines = Vec::new();
     if !snapshot.brightness_supported {
-        lines.push(
-            "This display doesn’t support brightness control. Nightcap will dim it with an overlay instead."
-                .to_owned(),
-        );
+        lines.push(super::overlay::fallback_message(overlay_available).to_owned());
     }
     if !snapshot.volume_supported {
         lines.push("Volume control isn’t available on this device.".to_owned());
@@ -521,6 +520,7 @@ mod tests {
                         duration_min: duration,
                         custom: &mut custom,
                         notice: None,
+                        overlay_available: true,
                     },
                 ));
             },
@@ -536,6 +536,17 @@ mod tests {
             }
             _ => None,
         })
+    }
+
+    #[test]
+    fn unusable_overlay_reports_that_screen_dimming_is_unavailable() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            theme::install(ui.ctx());
+            notes(ui, &Snapshot::default(), false);
+        });
+        output.textures_delta.clear();
+        assert!(text_position(&output, "Screen dimming is unavailable on this desktop.").is_some());
     }
 
     #[test]
@@ -704,6 +715,7 @@ mod tests {
                         duration_min: &mut duration,
                         custom: &mut custom,
                         notice: None,
+                        overlay_available: true,
                     },
                 );
             },

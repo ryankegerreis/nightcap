@@ -32,6 +32,11 @@ tray-icon = { version = "0.26.1", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3.6", features = ["blocking"] }
+raw-window-handle = "0.6.2"
+x11rb = { version = "0.13.2", features = ["randr", "render", "shape"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { version = "0.13.2", features = ["xtest"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = { version = "0.30.13", default-features = false }

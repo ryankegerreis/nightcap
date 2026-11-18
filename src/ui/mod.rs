@@ -23,6 +23,8 @@ pub mod overlay;
 pub mod settings_window;
 pub mod theme;
 pub mod widgets;
+#[cfg(target_os = "linux")]
+mod x11_overlay;
 
 const SAVE_DELAY: Duration = Duration::from_millis(300);
 const NOTICE_DURATION: Duration = Duration::from_millis(4500);
@@ -266,10 +268,14 @@ impl eframe::App for NightcapApp {
             });
             self.activations = Some(activations);
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         self.overlay.follow_root(frame);
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let _ = frame;
+        #[cfg(target_os = "linux")]
+        self.overlay
+            .sync(ctx, snapshot.overlay_alpha, self.root_visible);
+        #[cfg(not(target_os = "linux"))]
         self.overlay.sync(ctx, snapshot.overlay_alpha);
     }
 
@@ -294,6 +300,7 @@ impl eframe::App for NightcapApp {
         let updates = self.updates.status();
         let tokens = theme::tokens(ui.ctx());
         ui.painter().rect_filled(ui.max_rect(), 0.0, tokens.window);
+        #[cfg(not(target_os = "linux"))]
         self.overlay.show(ui.ctx(), snapshot.overlay_alpha);
         if !self.root_visible {
             let outcome = settings_window::show(
@@ -301,7 +308,7 @@ impl eframe::App for NightcapApp {
                 &mut self.settings_open,
                 &mut self.settings_opening_pending,
                 &mut self.settings,
-                settings_view(&snapshot, &updates),
+                settings_view(&snapshot, &updates, self.overlay.available()),
             );
             if self.settings_outcome(outcome) {
                 self.mark_settings_dirty();
@@ -332,6 +339,7 @@ impl eframe::App for NightcapApp {
                         duration_min: &mut self.duration_min,
                         custom: &mut self.custom_duration,
                         notice: notice.as_deref(),
+                        overlay_available: self.overlay.available(),
                     },
                 );
             });
@@ -366,7 +374,7 @@ impl eframe::App for NightcapApp {
             &mut self.settings_open,
             &mut self.settings_opening_pending,
             &mut self.settings,
-            settings_view(&snapshot, &updates),
+            settings_view(&snapshot, &updates, self.overlay.available()),
         );
         if self.settings_outcome(outcome) {
             settings_changed = true;
@@ -407,9 +415,11 @@ impl eframe::App for NightcapApp {
 fn settings_view<'a>(
     snapshot: &crate::engine::Snapshot,
     updates: &'a UpdateStatus,
+    overlay_available: bool,
 ) -> settings_window::SettingsView<'a> {
     settings_window::SettingsView {
         brightness_supported: snapshot.brightness_supported,
+        overlay_available,
         volume_supported: snapshot.volume_supported,
         hibernate_supported: snapshot.hibernate_supported,
         updates,

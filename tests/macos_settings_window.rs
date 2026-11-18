@@ -32,6 +32,7 @@ fn main() {
                 &mut settings,
                 settings_window::SettingsView {
                     brightness_supported: false,
+                    overlay_available: true,
                     volume_supported: false,
                     hibernate_supported: false,
                     updates: &update_status,
@@ -308,6 +309,7 @@ fn main() {
                 &mut preferences,
                 settings_window::SettingsView {
                     brightness_supported: false,
+                    overlay_available: true,
                     volume_supported: false,
                     hibernate_supported: false,
                     updates: &update_status,

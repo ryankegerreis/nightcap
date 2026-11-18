@@ -8,28 +8,38 @@
 //!
 //! Windows uses a native layered window instead of a viewport (see `dimmer`).
 //! There, call `follow_root` before `sync` so the dimming covers the root's monitor.
+//! Linux uses a native, unmanaged X11 window when compositing and input shaping
+//! are available.
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
 };
 
 use eframe::egui::Context;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use eframe::egui::{
     self, Color32, LayerId, Order, ViewportBuilder, ViewportClass, ViewportId, WindowLevel,
 };
 
 pub struct Overlay {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     alpha: Arc<AtomicU32>,
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     id: ViewportId,
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     registered: bool,
     #[cfg(target_os = "windows")]
     dimmer: dimmer::Dimmer,
+    #[cfg(target_os = "linux")]
+    x11_anchor: Option<u32>,
+    #[cfg(target_os = "linux")]
+    x11_layer: Option<super::x11_overlay::Layer>,
+    #[cfg(target_os = "linux")]
+    x11_available: bool,
+    #[cfg(target_os = "linux")]
+    x11_retry: Option<(std::time::Instant, std::time::Duration)>,
 }
 
 impl Default for Overlay {
@@ -41,14 +51,22 @@ impl Default for Overlay {
 impl Overlay {
     pub fn new() -> Self {
         Self {
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             alpha: Arc::new(AtomicU32::new(0.0_f32.to_bits())),
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             id: ViewportId::from_hash_of("nightcap-dimming-overlay"),
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             registered: false,
             #[cfg(target_os = "windows")]
             dimmer: dimmer::Dimmer::default(),
+            #[cfg(target_os = "linux")]
+            x11_anchor: None,
+            #[cfg(target_os = "linux")]
+            x11_layer: None,
+            #[cfg(target_os = "linux")]
+            x11_available: false,
+            #[cfg(target_os = "linux")]
+            x11_retry: None,
         }
     }
 
@@ -61,19 +79,44 @@ impl Overlay {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn follow_root(&mut self, root: &impl raw_window_handle::HasWindowHandle) {
+        use raw_window_handle::RawWindowHandle;
+        let anchor = root
+            .window_handle()
+            .ok()
+            .and_then(|handle| match handle.as_raw() {
+                RawWindowHandle::Xlib(handle) => u32::try_from(handle.window).ok(),
+                RawWindowHandle::Xcb(handle) => Some(handle.window.get()),
+                _ => None,
+            });
+        if self.x11_anchor == anchor {
+            return;
+        }
+        self.x11_anchor = anchor;
+        self.x11_layer = None;
+        self.x11_retry = None;
+    }
+
+    pub fn available(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.x11_available;
+        #[cfg(not(target_os = "linux"))]
+        true
+    }
+
     /// Call from every root App::ui pass. Zero alpha keeps the child hidden, ready
     /// for a fade started from the tray while the root is hidden.
-    /// Covers one monitor; on macOS this follows the root's monitor without entering a
-    /// fullscreen Space. On Windows it covers the root's monitor. On Linux, the window
-    /// manager selects the fullscreen monitor from the root's position; Wayland may
-    /// choose a different output.
+    /// Covers the root's monitor. macOS uses a separate viewport without entering
+    /// a fullscreen Space.
+    #[cfg(not(target_os = "linux"))]
     pub fn show(&mut self, ctx: &Context, alpha: f32) {
         self.sync(ctx, alpha);
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         self.show_viewport(ctx);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     fn show_viewport(&mut self, ctx: &Context) {
         let alpha = f32::from_bits(self.alpha.load(Ordering::Relaxed));
         self.registered = true;
@@ -90,8 +133,6 @@ impl Overlay {
             .with_active(false)
             .with_resizable(false)
             .with_has_shadow(false);
-        #[cfg(target_os = "linux")]
-        let builder = builder.with_window_type(egui::X11WindowType::Dock);
         let shared_alpha = Arc::clone(&self.alpha);
         ctx.show_viewport_deferred(self.id, builder, move |ui, class| {
             // Embedded viewports would dim the app itself and intercept input.
@@ -116,7 +157,7 @@ impl Overlay {
     }
 
     /// Logic-only updates keep an existing child alive when the root is hidden.
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     pub fn sync(&mut self, ctx: &Context, alpha: f32) {
         let alpha = normalized(alpha);
         let previous = self.alpha.swap(alpha.to_bits(), Ordering::Relaxed);
@@ -132,6 +173,84 @@ impl Overlay {
     pub fn sync(&mut self, _ctx: &Context, alpha: f32) {
         self.dimmer.apply(normalized(alpha));
     }
+
+    #[cfg(target_os = "linux")]
+    pub fn sync(&mut self, ctx: &Context, alpha: f32, root_visible: bool) {
+        use std::time::{Duration, Instant};
+
+        let alpha = normalized(alpha);
+        let mut available = false;
+        if let Some(anchor) = self.x11_anchor {
+            let now = Instant::now();
+            if self.x11_retry.is_none_or(|(retry_at, _)| now >= retry_at) {
+                let result = match &mut self.x11_layer {
+                    Some(layer) => layer.apply(anchor, alpha),
+                    None => super::x11_overlay::Layer::new(anchor).and_then(|mut layer| {
+                        let supported = layer.apply(anchor, alpha)?;
+                        self.x11_layer = Some(layer);
+                        Ok(supported)
+                    }),
+                };
+                match result {
+                    Ok(supported) => {
+                        available = supported;
+                        self.x11_retry = None;
+                    }
+                    Err(error) => {
+                        if self.x11_retry.is_none() {
+                            log::warn!("X11 dimming overlay unavailable: {error:#}");
+                        }
+                        let delay = x11_retry_delay(self.x11_retry.map(|(_, previous)| previous));
+                        self.x11_layer = None;
+                        self.x11_retry = Some((Instant::now() + delay, delay));
+                    }
+                }
+            }
+            if alpha > 0.0 || (root_visible && !available) {
+                // Poll faster during a fade, including when the main window is hidden.
+                let poll_interval = if alpha > 0.0 {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(2)
+                };
+                ctx.request_repaint_after(self.x11_retry.map_or(poll_interval, |(retry_at, _)| {
+                    retry_at.saturating_duration_since(Instant::now())
+                }));
+            }
+        }
+        if self.x11_available != available {
+            self.x11_available = available;
+            ctx.request_repaint();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn x11_retry_delay(previous: Option<std::time::Duration>) -> std::time::Duration {
+    use std::time::Duration;
+    previous.map_or(Duration::from_secs(2), |delay| {
+        (delay * 2).min(Duration::from_secs(60))
+    })
+}
+
+#[cfg(all(target_os = "linux", test))]
+#[test]
+fn x11_retry_delay_doubles_until_it_reaches_the_cap() {
+    use std::time::Duration;
+    let mut delay = None;
+    for expected in [2, 4, 8, 16, 32, 60, 60] {
+        delay = Some(x11_retry_delay(delay));
+        assert_eq!(delay, Some(Duration::from_secs(expected)));
+    }
+    assert_eq!(x11_retry_delay(None), Duration::from_secs(2));
+}
+
+pub(super) fn fallback_message(overlay_available: bool) -> &'static str {
+    if overlay_available {
+        "This display doesn’t support brightness control. Nightcap will dim it with an overlay instead."
+    } else {
+        "Screen dimming is unavailable on this desktop."
+    }
 }
 
 fn normalized(alpha: f32) -> f32 {
@@ -142,7 +261,7 @@ fn normalized(alpha: f32) -> f32 {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn monitor_builder(ctx: &Context) -> ViewportBuilder {
     let (size, root_rect) =
         ctx.input(|input| (input.viewport().monitor_size, input.viewport().outer_rect));
@@ -547,7 +666,7 @@ fn install_macos_focus_guard() {
 }
 
 // Windows dims with a native window; its tests live in `dimmer`.
-#[cfg(all(test, not(target_os = "windows")))]
+#[cfg(all(test, not(any(target_os = "windows", target_os = "linux"))))]
 mod tests {
     use super::*;
 

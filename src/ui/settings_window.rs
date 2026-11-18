@@ -11,6 +11,7 @@ use super::widgets::{self, Choice, MeterKind};
 /// What Settings shows besides the preferences themselves.
 pub struct SettingsView<'a> {
     pub brightness_supported: bool,
+    pub overlay_available: bool,
     pub volume_supported: bool,
     pub hibernate_supported: bool,
     pub updates: &'a UpdateStatus,
@@ -95,6 +96,7 @@ fn settings_body(
 ) -> SettingsOutcome {
     let SettingsView {
         brightness_supported,
+        overlay_available,
         volume_supported,
         hibernate_supported,
         updates,
@@ -126,10 +128,7 @@ fn settings_body(
                 MeterKind::Brightness,
             );
             if !brightness_supported {
-                footnote(
-                    ui,
-                    "This display doesn’t support brightness control. Nightcap will dim it with an overlay instead.",
-                );
+                footnote(ui, super::overlay::fallback_message(overlay_available));
             }
             section_title(ui, "Volume");
             changed |= fade_group(
@@ -637,6 +636,7 @@ mod tests {
         ctx: &egui::Context,
         updates: &UpdateStatus,
         events: Vec<egui::Event>,
+        dimming_available: bool,
     ) -> (SettingsOutcome, Vec<(String, egui::Rect)>) {
         fn texts(shape: &egui::Shape, found: &mut Vec<(String, egui::Rect)>) {
             match shape {
@@ -660,7 +660,8 @@ mod tests {
         };
         let mut output = ctx.run_ui(input, |ui| {
             let view = SettingsView {
-                brightness_supported: true,
+                brightness_supported: dimming_available,
+                overlay_available: dimming_available,
                 volume_supported: true,
                 hibernate_supported: false,
                 updates,
@@ -677,7 +678,7 @@ mod tests {
     }
 
     fn click(ctx: &egui::Context, updates: &UpdateStatus, label: &str) -> SettingsOutcome {
-        let (_, texts) = render(ctx, updates, Vec::new());
+        let (_, texts) = render(ctx, updates, Vec::new(), true);
         let (_, rect) = texts
             .iter()
             .find(|(text, _)| text == label)
@@ -689,9 +690,20 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::NONE,
         };
-        render(ctx, updates, vec![egui::Event::PointerMoved(pos)]);
-        render(ctx, updates, vec![button(true)]);
-        render(ctx, updates, vec![button(false)]).0
+        render(ctx, updates, vec![egui::Event::PointerMoved(pos)], true);
+        render(ctx, updates, vec![button(true)], true);
+        render(ctx, updates, vec![button(false)], true).0
+    }
+
+    #[test]
+    fn settings_reports_when_screen_dimming_is_unavailable() {
+        let updates = UpdateStatus::new(semver::Version::new(0, 1, 2));
+        let (_, texts) = render(&egui::Context::default(), &updates, Vec::new(), false);
+        assert!(
+            texts
+                .iter()
+                .any(|(text, _)| text == "Screen dimming is unavailable on this desktop.")
+        );
     }
 
     #[test]
@@ -700,7 +712,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut updates = UpdateStatus::new(semver::Version::new(0, 1, 2));
         let shown = |updates: &UpdateStatus| {
-            render(&egui::Context::default(), updates, Vec::new())
+            render(&egui::Context::default(), updates, Vec::new(), true)
                 .1
                 .into_iter()
                 .map(|(text, _)| text)

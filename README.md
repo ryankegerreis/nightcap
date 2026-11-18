@@ -6,7 +6,7 @@ Nightcap is built in Rust with [egui](https://github.com/emilk/egui) and runs on
 GitHub, using the system's `curl`, whether a newer version exists; the request
 carries only Nightcap's version number. Turn this off under Settings → Updates.
 
-> **Status:** working desktop app. Timer, fades, menu bar/tray controls, Settings, and overlay fallback are integrated. macOS has been exercised with real brightness and volume fades; Windows has native UI, volume, restoration and overlay checks. Linux has native engine and isolated X11/tray checks, with unresolved overlay input and Settings issues. See the platform hardening reports for coverage and limitations.
+> **Status:** working desktop app. Timer, fades, menu bar/tray controls, Settings, and overlay fallback are integrated. macOS has been exercised with real brightness and volume fades. Windows has native UI, volume, restoration and overlay checks. Linux has native engine, isolated X11/tray and click-through overlay checks, and an unresolved Settings update issue. See the platform hardening reports for coverage and limitations.
 
 ![Nightcap main window in light and dark appearance](docs/design/main-window.png)
 
@@ -19,7 +19,7 @@ carries only Nightcap's version number. Turn this off under Settings → Updates
   when a startup check confirms that this machine supports it and the app can request it.
 - **Restore:** put brightness and volume back when you cancel the timer or wake the computer.
 - **Menu bar and system tray:** start, pause, resume, extend and cancel timers without opening the window. Closing the window keeps the timer running; Open Nightcap brings it back. Quit restores faded levels when restoration is enabled.
-- **Overlay fallback:** on displays that don't support brightness control, dim the root window’s monitor with a passive, transparent overlay. It keeps updating while the main window is hidden.
+- **Overlay fallback:** on displays that don't support brightness control, dim the root window’s monitor with a passive, transparent overlay. It keeps updating while the main window is hidden. On Linux, the overlay requires a composited X11 session.
 - **Update notice:** Settings → Updates shows the installed version and whether a newer one is out, with Check Now and Download buttons. When an update exists, the menu bar or tray menu also offers it. Nightcap never installs anything itself; Download opens this platform's file from the release in your browser.
 - **Native appearance:** system light/dark theme, runtime system fonts on macOS/Windows, thin countdown digits in fixed-width cells, and separate Settings (gear button or ⌘, on macOS). Preferences are saved in the OS configuration directory.
 
@@ -156,12 +156,13 @@ On Linux, the tray needs a D-Bus session with a StatusNotifier host (for example
 KDE Plasma, or a compatible GNOME extension). If tray initialization fails,
 closing the main window quits instead of leaving an inaccessible background
 process. Brightness needs a supported `/sys/class/backlight` device and access
-through writable sysfs, logind’s SetBrightness, or `brightnessctl`; otherwise the
-overlay is used. Volume tries `wpctl`, `pactl`, then `amixer`. Power actions use
+through writable sysfs, logind’s SetBrightness, or `brightnessctl`. When native
+brightness is unavailable, a composited X11 desktop can use the click-through
+overlay. Wayland and X11 desktops lacking the required overlay support show
+that screen dimming is unavailable. Volume tries `wpctl`, `pactl`, then `amixer`. Power actions use
 systemd/logind and remain subject to the session’s polkit permissions. Hibernate
 is offered only when logind's CanHibernate check returns yes, allowing it without
-an authorization prompt. Failed or unavailable checks keep the option hidden. Overlay
-placement depends on the window manager; Wayland can select a different output.
+an authorization prompt. Failed or unavailable checks keep the option hidden.
 
 The overlay covers one monitor, is always on top, and lets mouse input pass
 through. It is a visual fade rather than hardware brightness control. With
