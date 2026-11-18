@@ -9,7 +9,11 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 
-use super::{Backends, Brightness, Power, Volume};
+use super::{
+    Backends, Brightness, Power, Volume,
+    display_group::{CapturedDisplay, DisplayDriver, DisplayGroup, DisplayWrite},
+    normalized,
+};
 use crate::settings::EndAction;
 
 fn command(program: &str, args: &[&str]) -> Result<String> {
@@ -25,11 +29,6 @@ fn command(program: &str, args: &[&str]) -> Result<String> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     String::from_utf8(output.stdout).with_context(|| format!("decoding {program} output"))
-}
-
-fn normalized(level: f32) -> Result<f32> {
-    ensure!(level.is_finite(), "control level must be finite");
-    Ok(level.clamp(0.0, 1.0))
 }
 
 fn parse_wpctl(output: &str) -> Result<f32> {
@@ -135,12 +134,6 @@ fn normalized_backlight(value: u32, max: u32) -> Result<f32> {
     Ok(value as f32 / max as f32)
 }
 
-fn backlight_value(level: f32, max: u32) -> Result<u32> {
-    ensure!(max != 0, "backlight maximum is zero");
-    // f64 avoids rounding a large u32 maximum above its representable range.
-    Ok((f64::from(normalized(level)?) * f64::from(max)).round() as u32)
-}
-
 #[derive(Clone, Copy)]
 enum BacklightWriter {
     Sysfs,
@@ -155,16 +148,15 @@ struct Backlight {
 }
 
 impl Backlight {
-    fn get(&self) -> Result<f32> {
-        normalized_backlight(
-            read_number(&self.path.join("brightness"))?,
-            read_number(&self.path.join("max_brightness"))?,
-        )
+    /// The current level, and the native maximum it is measured against.
+    fn read(&self) -> Result<(f32, u32)> {
+        let max = read_number(&self.path.join("max_brightness"))?;
+        let level = normalized_backlight(read_number(&self.path.join("brightness"))?, max)?;
+        Ok((level, max))
     }
 
-    fn set(&self, level: f32) -> Result<()> {
-        let value =
-            backlight_value(level, read_number(&self.path.join("max_brightness"))?)?.to_string();
+    fn set(&self, value: u32) -> Result<()> {
+        let value = value.to_string();
         match self.writer {
             BacklightWriter::Sysfs => fs::write(self.path.join("brightness"), value)
                 .with_context(|| format!("writing {} brightness", self.name))?,
@@ -200,13 +192,11 @@ impl Backlight {
     }
 }
 
-struct LinuxBrightness {
+struct LinuxBacklights {
     devices: Vec<Backlight>,
-    baselines: Vec<f32>,
-    reference: f32,
 }
 
-impl LinuxBrightness {
+impl LinuxBacklights {
     fn discover() -> Result<Self> {
         let mut paths: Vec<_> = fs::read_dir("/sys/class/backlight")
             .context("enumerating backlights")?
@@ -250,7 +240,7 @@ impl LinuxBrightness {
                 continue;
             };
             let device = Backlight { path, name, writer };
-            if device.get().is_ok() {
+            if device.read().is_ok() {
                 devices.push(device);
             }
         }
@@ -258,39 +248,44 @@ impl LinuxBrightness {
             !devices.is_empty(),
             "no usable backlight control (sysfs/logind/brightnessctl)"
         );
-        Ok(Self {
-            devices,
-            baselines: Vec::new(),
-            reference: 0.0,
-        })
+        Ok(Self { devices })
     }
 }
 
-impl Brightness for LinuxBrightness {
-    fn get(&mut self) -> Result<f32> {
-        ensure!(!self.devices.is_empty(), "no backlights");
-        let baselines = self
+impl DisplayDriver for LinuxBacklights {
+    type Key = usize;
+
+    fn capture(&mut self) -> Result<Vec<CapturedDisplay<usize>>> {
+        let mut failure = None;
+        let displays: Vec<_> = self
             .devices
             .iter()
-            .map(Backlight::get)
-            .collect::<Result<Vec<_>>>()?;
-        self.reference = baselines.iter().copied().fold(0.0, f32::max);
-        self.baselines = baselines;
-        Ok(self.reference)
+            .enumerate()
+            .filter_map(|(key, device)| match device.read() {
+                Ok((level, max)) => Some(CapturedDisplay {
+                    key,
+                    level,
+                    min: 0,
+                    max,
+                }),
+                Err(error) => {
+                    log::warn!("Skipping backlight {}: {error:#}", device.name);
+                    failure = Some(error);
+                    None
+                }
+            })
+            .collect();
+        match failure {
+            Some(error) if displays.is_empty() => Err(error),
+            _ => Ok(displays),
+        }
     }
 
-    fn set(&mut self, level: f32) -> Result<()> {
-        ensure!(level.is_finite(), "non-finite brightness");
-        ensure!(
-            self.baselines.len() == self.devices.len(),
-            "brightness must be read before setting"
-        );
-        if self.reference > 0.0 {
-            for (device, baseline) in self.devices.iter().zip(&self.baselines) {
-                device.set(super::scaled_brightness(*baseline, self.reference, level))?;
-            }
-        }
-        Ok(())
+    fn write(&mut self, writes: &[DisplayWrite<usize>]) -> Vec<Result<()>> {
+        writes
+            .iter()
+            .map(|write| self.devices[write.key].set(write.value))
+            .collect()
     }
 }
 
@@ -361,11 +356,8 @@ impl Power for LinuxPower {
 }
 
 pub fn backends() -> Backends {
-    let brightness = match LinuxBrightness::discover() {
-        Ok(mut backend) => backend
-            .get()
-            .ok()
-            .map(|_| Box::new(backend) as Box<dyn Brightness>),
+    let brightness = match LinuxBacklights::discover() {
+        Ok(backlights) => Some(Box::new(DisplayGroup::new(backlights)) as Box<dyn Brightness>),
         Err(error) => {
             log::debug!("Linux brightness unavailable: {error:#}");
             None
@@ -393,6 +385,7 @@ pub fn backends() -> Backends {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Partial;
 
     #[test]
     fn hibernate_requires_logind_to_allow_it_without_authentication() {
@@ -413,46 +406,71 @@ mod tests {
         }
     }
 
-    #[test]
-    fn backlight_baselines_refresh_only_on_get_and_restore_each_device() {
-        let dir = tempfile::tempdir().unwrap();
+    fn backlights(dir: &Path, levels: &[(&str, u32)]) -> DisplayGroup<LinuxBacklights> {
         let mut devices = Vec::new();
-        for (name, level) in [("dim", 20), ("bright", 80)] {
-            let path = dir.path().join(name);
+        for (name, level) in levels {
+            let path = dir.join(name);
             fs::create_dir(&path).unwrap();
             fs::write(path.join("brightness"), level.to_string()).unwrap();
             fs::write(path.join("max_brightness"), "100").unwrap();
             devices.push(Backlight {
                 path,
-                name: name.into(),
+                name: (*name).into(),
                 writer: BacklightWriter::Sysfs,
             });
         }
-        let mut backend = LinuxBrightness {
-            devices,
-            baselines: Vec::new(),
-            reference: 0.0,
-        };
+        DisplayGroup::new(LinuxBacklights { devices })
+    }
+
+    fn value(dir: &Path, name: &str) -> u32 {
+        read_number(&dir.join(name).join("brightness")).unwrap()
+    }
+
+    fn break_writes(dir: &Path, name: &str) {
+        let brightness = dir.join(name).join("brightness");
+        fs::remove_file(&brightness).unwrap();
+        fs::create_dir(&brightness).unwrap();
+    }
+
+    #[test]
+    fn backlight_baselines_refresh_only_on_get_and_restore_each_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let mut backend = backlights(dir, &[("dim", 20), ("bright", 80)]);
         assert_eq!(backend.get().unwrap(), 0.8);
         backend.set(0.4).unwrap();
-        assert_eq!(backend.devices[0].get().unwrap(), 0.1);
-        assert_eq!(backend.devices[1].get().unwrap(), 0.4);
+        assert_eq!((value(dir, "dim"), value(dir, "bright")), (10, 40));
         backend.set(0.8).unwrap();
-        assert_eq!(backend.devices[0].get().unwrap(), 0.2);
-        assert_eq!(backend.devices[1].get().unwrap(), 0.8);
+        assert_eq!((value(dir, "dim"), value(dir, "bright")), (20, 80));
         backend.set(0.4).unwrap();
         assert_eq!(backend.get().unwrap(), 0.4);
         backend.set(0.2).unwrap();
-        assert_eq!(backend.devices[0].get().unwrap(), 0.05);
-        assert_eq!(backend.devices[1].get().unwrap(), 0.2);
-        backend
-            .devices
-            .iter()
-            .for_each(|device| device.set(0.0).unwrap());
-        assert_eq!(backend.get().unwrap(), 0.0);
-        backend.set(0.8).unwrap();
-        assert_eq!(backend.devices[0].get().unwrap(), 0.0);
-        assert_eq!(backend.devices[1].get().unwrap(), 0.0);
+        assert_eq!((value(dir, "dim"), value(dir, "bright")), (5, 20));
+    }
+
+    #[test]
+    fn a_failed_backlight_does_not_block_fading_or_restoring_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let mut backend = backlights(dir, &[("broken", 80), ("healthy", 80)]);
+        assert_eq!(backend.get().unwrap(), 0.8);
+        backend.set(0.4).unwrap();
+        break_writes(dir, "broken");
+        assert!(backend.set(0.2).unwrap_err().is::<Partial>());
+        assert_eq!(value(dir, "healthy"), 20);
+        assert!(backend.restore(0.8).unwrap_err().is::<Partial>());
+        assert_eq!(value(dir, "healthy"), 80);
+    }
+
+    #[test]
+    fn an_unreadable_backlight_is_left_out_of_the_fade() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let mut backend = backlights(dir, &[("unreadable", 90), ("healthy", 60)]);
+        fs::remove_file(dir.join("unreadable/brightness")).unwrap();
+        assert_eq!(backend.get().unwrap(), 0.6);
+        backend.set(0.3).unwrap();
+        assert_eq!(value(dir, "healthy"), 30);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result, ensure};
 use nightcap::{
+    dimming::DimMethod,
     engine::{Clock, ClockReading, Command, Engine, TimerState},
     platform::{self, Backends, Power},
     settings::{EndAction, Settings},
@@ -147,6 +148,20 @@ impl Levels {
         Ok(levels)
     }
 
+    /// Reads like `read`, except that backlights faded to zero report a level of zero.
+    fn observe(backends: &mut Backends) -> Result<Self> {
+        let brightness = backends
+            .brightness
+            .as_mut()
+            .map(|backend| match backend.get() {
+                Err(error) if error.is::<platform::AtMinimum>() => Ok(0.0),
+                level => level,
+            })
+            .transpose()?;
+        let volume = backends.volume.as_mut().map(|b| b.get()).transpose()?;
+        Ok(Self { brightness, volume })
+    }
+
     fn assert_matches(self, expected: Self, tolerances: Tolerances) -> Result<()> {
         for (actual, expected, tolerance) in [
             (self.brightness, expected.brightness, tolerances.brightness),
@@ -175,12 +190,12 @@ fn native_discovery_and_worker_reads() -> Result<()> {
     thread::spawn(move || -> Result<()> {
         println!(
             "native levels: {:?}; hibernate={hibernate}",
-            Levels::read(&mut backends)?
+            Levels::observe(&mut backends)?
         );
         let mut engine = Engine::new(Settings::default(), backends, TestClock::new());
         let snapshot = engine.snapshot();
         ensure!(snapshot.state == TimerState::Idle);
-        ensure!(snapshot.brightness_supported == brightness);
+        ensure!((snapshot.dimming.method == DimMethod::Native) == brightness);
         ensure!(snapshot.volume_supported == volume);
         ensure!(snapshot.hibernate_supported == hibernate);
         ensure!(snapshot.last_error.is_none());
@@ -231,7 +246,11 @@ impl RestoreHardware {
     fn restore(&mut self) -> Result<()> {
         // Attempt both even if one fails.
         let brightness = match (self.backends.brightness.as_mut(), self.original.brightness) {
-            (Some(backend), Some(level)) => backend.set(level),
+            (Some(backend), Some(level)) => {
+                // A fade step ends the restored state, so the restore writes every display again.
+                let _ = backend.set(level);
+                backend.restore(level)
+            }
             _ => Ok(()),
         };
         let volume = match (self.backends.volume.as_mut(), self.original.volume) {
@@ -253,7 +272,7 @@ impl Drop for RestoreHardware {
 
 #[test]
 fn guard_restores_each_original_backlight_after_partial_and_zero_observations() -> Result<()> {
-    // A read captures the baseline just as LinuxBrightness::get does. Only the
+    // A read captures the baseline just as the Linux display group does. Only the
     // hardware I/O is substituted so this failure-path check can run by default.
     struct Backlights {
         levels: Arc<Mutex<[f32; 2]>>,
@@ -274,6 +293,10 @@ fn guard_restores_each_original_backlight_after_partial_and_zero_observations() 
                 *self.levels.lock().unwrap() = self.baseline.map(|value| value * ratio);
             }
             Ok(())
+        }
+
+        fn restore(&mut self, level: f32) -> Result<()> {
+            self.set(level)
         }
     }
 
@@ -315,13 +338,17 @@ impl Power for RecordedPower {
 #[ignore = "changes real Linux brightness/volume; run alone with stable devices; power is dry-run"]
 fn native_fades_controls_completion_and_restoration() -> Result<()> {
     let tolerances = Tolerances::discover()?;
+    ensure!(
+        Levels::observe(&mut platform::backends())?.brightness != Some(0.0),
+        "requires a backlight above zero to observe a native fade"
+    );
     // Brightness reads recapture per-device baselines. Keep the restore guard's
     // capture untouched, even when assertion reads see partial fades or zero.
     let mut restore = RestoreHardware::capture(platform::backends())?;
     let original = restore.original;
     let mut observer = platform::backends();
     observer.power = Box::new(platform::DryRunPower);
-    Levels::read(&mut observer)?.assert_matches(original, tolerances)?;
+    Levels::observe(&mut observer)?.assert_matches(original, tolerances)?;
     println!("original levels: {original:?}");
     let actions = Arc::new(Mutex::new(Vec::new()));
     let mut backends = platform::backends();
@@ -341,7 +368,7 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
     engine.tick();
     let faded = engine.snapshot();
     ensure!(faded.state == TimerState::Running && faded.last_error.is_none());
-    let lowered = Levels::read(&mut observer)?;
+    let lowered = Levels::observe(&mut observer)?;
     lowered.assert_matches(
         Levels {
             brightness: original.brightness.map(|v| v * 0.75),
@@ -350,11 +377,11 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
         tolerances,
     )?;
     if original.brightness.is_none() {
-        ensure!((faded.overlay_alpha - 0.225).abs() < 0.001);
+        ensure!((faded.dimming.overlay_alpha - 0.225).abs() < 0.001);
     }
     println!(
         "faded levels: {lowered:?}; overlay alpha={}",
-        faded.overlay_alpha
+        faded.dimming.overlay_alpha
     );
     engine.command(Command::Pause);
     clock.advance(120);
@@ -362,15 +389,15 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
     ensure!(engine.snapshot().remaining == faded.remaining);
     engine.command(Command::AddMinutes(15));
     ensure!(engine.snapshot().remaining == faded.remaining + Duration::from_secs(900));
-    Levels::read(&mut observer)?.assert_matches(lowered, tolerances)?;
+    Levels::observe(&mut observer)?.assert_matches(lowered, tolerances)?;
     engine.command(Command::Resume);
     clock.advance(60);
     engine.tick();
     ensure!(engine.snapshot().remaining == Duration::from_secs(1440));
     engine.command(Command::Cancel);
     ensure!(engine.snapshot().state == TimerState::Idle);
-    ensure!(engine.snapshot().overlay_alpha == 0.0);
-    Levels::read(&mut observer)?.assert_matches(original, tolerances)?;
+    ensure!(engine.snapshot().dimming.overlay_alpha == 0.0);
+    Levels::observe(&mut observer)?.assert_matches(original, tolerances)?;
     ensure!(actions.lock().unwrap().is_empty());
 
     let mut expected_actions = Vec::new();
@@ -390,7 +417,7 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
         ensure!(engine.snapshot().last_error.is_none());
         expected_actions.push(action);
         ensure!(*actions.lock().unwrap() == expected_actions);
-        Levels::read(&mut observer)?.assert_matches(
+        Levels::observe(&mut observer)?.assert_matches(
             Levels {
                 brightness: original
                     .brightness
@@ -403,8 +430,8 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
         )?;
         engine.command(Command::SystemWoke);
         ensure!(engine.snapshot().state == TimerState::Idle);
-        ensure!(engine.snapshot().overlay_alpha == 0.0);
-        Levels::read(&mut observer)?.assert_matches(original, tolerances)?;
+        ensure!(engine.snapshot().dimming.overlay_alpha == 0.0);
+        Levels::observe(&mut observer)?.assert_matches(original, tolerances)?;
     }
 
     settings.restore_on_cancel_or_wake = false;
@@ -416,8 +443,8 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
     engine.tick();
     let retained = engine.snapshot();
     engine.command(Command::Cancel);
-    ensure!(engine.snapshot().overlay_alpha == retained.overlay_alpha);
-    Levels::read(&mut observer)?.assert_matches(lowered, tolerances)?;
+    ensure!(engine.snapshot().dimming.overlay_alpha == retained.dimming.overlay_alpha);
+    Levels::observe(&mut observer)?.assert_matches(lowered, tolerances)?;
     restore.restore()?;
 
     settings.restore_on_cancel_or_wake = true;
@@ -429,9 +456,9 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
     engine.tick();
     ensure!(!engine.command(Command::Shutdown));
     ensure!(engine.snapshot().state == TimerState::Idle);
-    ensure!(engine.snapshot().overlay_alpha == 0.0);
+    ensure!(engine.snapshot().dimming.overlay_alpha == 0.0);
     ensure!(engine.snapshot().last_error.is_none());
-    Levels::read(&mut observer)?.assert_matches(original, tolerances)?;
+    Levels::observe(&mut observer)?.assert_matches(original, tolerances)?;
     println!(
         "native fades, pause/resume/extend, cancel, dry-run completion, synthetic wake, restore-off and shutdown verified"
     );

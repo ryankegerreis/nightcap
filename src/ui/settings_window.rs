@@ -2,6 +2,7 @@
 
 use eframe::egui::{self, Id, Margin, Vec2};
 
+use crate::dimming::DimMethod;
 use crate::settings::{BEFORE_MINUTES, FadeSettings, OVER_MINUTES, Settings};
 use crate::updates::UpdateStatus;
 
@@ -10,8 +11,7 @@ use super::widgets::{self, Choice, MeterKind};
 
 /// What Settings shows besides the preferences themselves.
 pub struct SettingsView<'a> {
-    pub brightness_supported: bool,
-    pub overlay_available: bool,
+    pub dimming: DimMethod,
     pub volume_supported: bool,
     pub hibernate_supported: bool,
     pub updates: &'a UpdateStatus,
@@ -95,8 +95,7 @@ fn settings_body(
     view: &SettingsView<'_>,
 ) -> SettingsOutcome {
     let SettingsView {
-        brightness_supported,
-        overlay_available,
+        dimming,
         volume_supported,
         hibernate_supported,
         updates,
@@ -127,8 +126,8 @@ fn settings_body(
                 &mut settings.dim,
                 MeterKind::Brightness,
             );
-            if !brightness_supported {
-                footnote(ui, super::overlay::fallback_message(overlay_available));
+            if let Some(message) = super::overlay::fallback_message(dimming) {
+                footnote(ui, message);
             }
             section_title(ui, "Volume");
             changed |= fade_group(
@@ -660,8 +659,11 @@ mod tests {
         };
         let mut output = ctx.run_ui(input, |ui| {
             let view = SettingsView {
-                brightness_supported: dimming_available,
-                overlay_available: dimming_available,
+                dimming: if dimming_available {
+                    DimMethod::Native
+                } else {
+                    DimMethod::Unavailable
+                },
                 volume_supported: true,
                 hibernate_supported: false,
                 updates,

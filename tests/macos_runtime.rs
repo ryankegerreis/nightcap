@@ -29,14 +29,16 @@ impl TestClock {
 }
 struct RestoreHardware {
     controls: Backends,
+    // Reads recapture, so they must not disturb the capture cleanup depends on.
+    observer: Backends,
     brightness: f32,
     volume: f32,
 }
 impl RestoreHardware {
     fn read(&mut self) -> Result<(f32, f32)> {
         Ok((
-            self.controls.brightness.as_mut().unwrap().get()?,
-            self.controls.volume.as_mut().unwrap().get()?,
+            self.observer.brightness.as_mut().unwrap().get()?,
+            self.observer.volume.as_mut().unwrap().get()?,
         ))
     }
     fn assert_restored(&mut self) -> Result<()> {
@@ -54,12 +56,10 @@ impl RestoreHardware {
 }
 impl Drop for RestoreHardware {
     fn drop(&mut self) {
-        let _ = self
-            .controls
-            .brightness
-            .as_mut()
-            .unwrap()
-            .set(self.brightness);
+        let brightness = self.controls.brightness.as_mut().unwrap();
+        // A fade step ends the restored state, so the restore writes every display again.
+        let _ = brightness.set(self.brightness);
+        let _ = brightness.restore(self.brightness);
         let _ = self.controls.volume.as_mut().unwrap().set(self.volume);
     }
 }
@@ -80,6 +80,7 @@ fn native_fades_pause_extend_cancel_wake_and_quit() -> Result<()> {
         .get()?;
     let mut restore = RestoreHardware {
         controls,
+        observer: platform::backends(),
         brightness,
         volume,
     };
@@ -164,7 +165,7 @@ fn native_fades_pause_extend_cancel_wake_and_quit() -> Result<()> {
         .brightness
         .as_mut()
         .unwrap()
-        .set(brightness)?;
+        .restore(brightness)?;
     restore.controls.volume.as_mut().unwrap().set(volume)?;
     settings.restore_on_cancel_or_wake = true;
     engine.command(Command::UpdateSettings(settings));

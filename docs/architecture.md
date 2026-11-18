@@ -14,9 +14,12 @@ src/
                      running copy's window and exits
   settings.rs        Settings struct (serde), load/save JSON in the OS config dir
   fade.rs            pure fade math: level at time t for a fade plan (unit tested)
+  dimming.rs         screen dimming: picks native brightness or the overlay, carries the fade
   engine.rs          timer engine thread: state machine, drives fades, fires the end action
   platform/
     mod.rs           traits Brightness, Volume, Power + `fn backends() -> Backends`
+    display_group.rs one brightness fade across the captured displays: per-display
+                     values, partial failure and restore retries, for every OS
     macos.rs         macOS impls
     windows.rs       Windows impls
     linux.rs         Linux impls
@@ -28,6 +31,7 @@ src/
                      UpdateStatus: checking, available release, checked, failed (manual)
   ui/
     mod.rs           NightcapApp: eframe::App, routes between main window and settings
+    window_lifecycle.rs  when the windows open, hide and close, and when the app quits
     theme.rs         colors, fonts, spacing tokens taken from the mockup (light + dark)
     widgets.rs       custom widgets: progress ring, segmented control, toggle switch,
                      grouped list rows, stepper/select rows, round Start/Cancel buttons
@@ -61,18 +65,22 @@ src/
 window is hidden and egui is not repainting. It owns the platform backends.
 
 - Commands (via `std::sync::mpsc`): `Start { duration }`, `Pause`, `Resume`, `Cancel`,
-  `AddMinutes(u32)`, `UpdateSettings(Settings)`, `SystemWoke`, `Shutdown`.
+  `AddMinutes(u32)`, `UpdateSettings(Settings)`, `OverlayAvailable(bool)`, `SystemWoke`,
+  `Shutdown`.
 - Shared snapshot (`Arc<Mutex<Snapshot>>`): `state: Idle | Running | Paused | Finishing`,
   `total`, `remaining`, `ends_at` (wall clock, for "10:20 PM"), current brightness /
-  volume percent applied, `overlay_alpha: f32` (0 = no overlay), backend capability flags
-  (`brightness_supported`, `volume_supported`, `hibernate_supported`), last error string.
+  volume percent applied, `dimming: DimStatus` (the dimming method, level and overlay
+  alpha), backend capability flags (`volume_supported`, `hibernate_supported`), last error string.
   Hibernate availability is checked once at startup and includes permission to request it.
 - Ticks about every 250 ms. Uses `Instant` for remaining time; captures original
   brightness/volume when a fade begins and restores them on Cancel (if the restore
   setting is on), and after the end action when the machine wakes (detect a wall-clock
   gap over 5 s while Finishing (30 s while Running/Paused), plus native macOS workspace wake notifications).
-- If hardware brightness is unsupported, the dim fade drives `overlay_alpha` instead
-  (max alpha 0.9 at target 0 %, mapped linearly).
+- `dimming.rs` owns screen dimming. It prefers native brightness and otherwise drives
+  `overlay_alpha` (max alpha 0.9 at target 0 %, mapped linearly). The UI thread owns the
+  overlay's window and reports whether it can draw with `OverlayAvailable`. With neither
+  method working, `DimMethod::Unavailable` tells the UI to say so; the alpha keeps following
+  the fade, so an overlay that returns resumes at the level the fade has reached.
   The Linux UI requires a composited X11 display with RandR and X Shape support
   before mapping its unmanaged ARGB window. The root monitor is selected with
   RandR. Native Wayland reports overlay dimming as unavailable.
@@ -91,13 +99,21 @@ window is hidden and egui is not repainting. It owns the platform backends.
 ## Platform traits (`platform/mod.rs`)
 
 ```rust
-pub trait Brightness: Send { fn get(&mut self) -> Result<f32>; fn set(&mut self, level: f32) -> Result<()>; }
+pub trait Brightness: Send { fn get(&mut self) -> Result<f32>; fn set(&mut self, level: f32) -> Result<()>; fn restore(&mut self, level: f32) -> Result<()>; }
 pub trait Volume: Send { fn get(&mut self) -> Result<f32>; fn set(&mut self, level: f32) -> Result<()>; }
 pub trait Power: Send { fn perform(&mut self, action: EndAction) -> Result<()>; }
 ```
 Levels are `0.0..=1.0`. `Result` is `anyhow::Result`. Native OS APIs are preferred;
 well-known OS command-line tools are an acceptable fallback (e.g. `pmset sleepnow`,
 `systemctl suspend`, `wpctl`/`pactl`/`amixer`, `/sys/class/backlight`).
+
+Every OS implements `Brightness` through `DisplayGroup`. Its adapters implement
+`DisplayDriver`: they capture each display's level and native range, and write the
+native values for a pass. The group owns proportional fading, skips unchanged values,
+keeps healthy displays fading when another fails (`Partial`), and lets a retried restore
+write only the displays that have not returned. The first restore always writes. A display whose fade write failed sits out the
+rest of that fade; one whose restore failed is tried again by the next fade. A display already at its minimum is left out
+of a fade, and a fade with every display at its minimum falls back to the overlay.
 
 ## Tray
 

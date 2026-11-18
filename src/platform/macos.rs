@@ -9,11 +9,31 @@ use std::{
 
 use anyhow::{Context, Result, ensure};
 
-use super::{Backends, Brightness, Power, Volume};
+use super::{
+    Backends, Brightness, Power, Volume,
+    display_group::{CapturedDisplay, DisplayDriver, DisplayGroup, DisplayWrite},
+    normalized,
+};
 use crate::settings::EndAction;
 
 type GetBrightness = unsafe extern "C" fn(u32, *mut f32) -> i32;
 type SetBrightness = unsafe extern "C" fn(u32, f32) -> i32;
+
+/// macOS takes a continuous level, so native values count millionths of full brightness.
+const LEVEL_STEPS: u32 = 1_000_000;
+
+fn step_level(value: u32) -> f32 {
+    (f64::from(value) / f64::from(LEVEL_STEPS)) as f32
+}
+
+fn captured_display(key: u32, level: f32) -> Result<CapturedDisplay<u32>> {
+    Ok(CapturedDisplay {
+        key,
+        level: normalized(level)?,
+        min: 0,
+        max: LEVEL_STEPS,
+    })
+}
 
 unsafe extern "C" {
     fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
@@ -68,7 +88,6 @@ struct DisplayBrightness {
     get: GetBrightness,
     set: SetBrightness,
     current_display: unsafe extern "C" fn() -> u32,
-    captured_display: Option<u32>,
 }
 
 impl DisplayBrightness {
@@ -96,14 +115,15 @@ impl DisplayBrightness {
                 get,
                 set,
                 current_display: CGMainDisplayID,
-                captured_display: None,
             })
         }
     }
 }
 
-impl Brightness for DisplayBrightness {
-    fn get(&mut self) -> Result<f32> {
+impl DisplayDriver for DisplayBrightness {
+    type Key = u32;
+
+    fn capture(&mut self) -> Result<Vec<CapturedDisplay<u32>>> {
         let mut level = 0.0;
         // SAFETY: the selector has the CoreGraphics signature and no thread affinity.
         let display = unsafe { (self.current_display)() };
@@ -112,21 +132,20 @@ impl Brightness for DisplayBrightness {
             unsafe { (self.get)(display, &mut level) },
             "reading display brightness",
         )?;
-        let level = normalized(level)?;
-        self.captured_display = Some(display);
-        Ok(level)
+        Ok(vec![captured_display(display, level)?])
     }
 
-    fn set(&mut self, level: f32) -> Result<()> {
-        let level = normalized(level)?;
-        let display = self
-            .captured_display
-            .context("brightness must be captured before writing")?;
-        // SAFETY: framework is alive and display ID comes from CoreGraphics.
-        status(
-            unsafe { (self.set)(display, level) },
-            "setting display brightness",
-        )
+    fn write(&mut self, writes: &[DisplayWrite<u32>]) -> Vec<Result<()>> {
+        writes
+            .iter()
+            .map(|write| {
+                // SAFETY: framework is alive and the display ID came from CoreGraphics.
+                status(
+                    unsafe { (self.set)(write.key, step_level(write.value)) },
+                    "setting display brightness",
+                )
+            })
+            .collect()
     }
 }
 
@@ -159,13 +178,12 @@ mod intel {
         ) -> i32;
     }
 
-    #[derive(Default)]
-    pub struct IoBrightness {
-        service: Option<u32>,
-    }
+    pub struct IoBrightness;
 
-    impl Brightness for IoBrightness {
-        fn get(&mut self) -> Result<f32> {
+    impl DisplayDriver for IoBrightness {
+        type Key = u32;
+
+        fn capture(&mut self) -> Result<Vec<CapturedDisplay<u32>>> {
             let key = CFString::new("brightness");
             let mut level = 0.0;
             // SAFETY: CoreGraphics supplies the borrowed IOKit display service port.
@@ -182,24 +200,28 @@ mod intel {
                 },
                 "reading IODisplay brightness",
             )?;
-            let level = normalized(level)?;
-            self.service = Some(service);
-            Ok(level)
+            Ok(vec![captured_display(service, level)?])
         }
 
-        fn set(&mut self, level: f32) -> Result<()> {
-            let level = normalized(level)?;
-            let service = self
-                .service
-                .context("brightness must be captured before writing")?;
+        fn write(&mut self, writes: &[DisplayWrite<u32>]) -> Vec<Result<()>> {
             let key = CFString::new("brightness");
-            // SAFETY: same service port/key lifetime as get; level is finite.
-            status(
-                unsafe {
-                    IODisplaySetFloatParameter(service, 0, key.as_concrete_TypeRef().cast(), level)
-                },
-                "setting IODisplay brightness",
-            )
+            writes
+                .iter()
+                .map(|write| {
+                    // SAFETY: same service port/key lifetime as capture; the level is finite.
+                    status(
+                        unsafe {
+                            IODisplaySetFloatParameter(
+                                write.key,
+                                0,
+                                key.as_concrete_TypeRef().cast(),
+                                step_level(write.value),
+                            )
+                        },
+                        "setting IODisplay brightness",
+                    )
+                })
+                .collect()
         }
     }
 }
@@ -460,11 +482,6 @@ fn parse_volume(output: &str) -> Result<f32> {
     Ok(f32::from(percent) / 100.0)
 }
 
-fn normalized(level: f32) -> Result<f32> {
-    ensure!(level.is_finite(), "control level must be finite");
-    Ok(level.clamp(0.0, 1.0))
-}
-
 fn status(code: i32, operation: &str) -> Result<()> {
     ensure!(
         code == 0,
@@ -535,17 +552,17 @@ impl Power for MacPower {
 pub fn backends() -> Backends {
     let mut brightness: Option<Box<dyn Brightness>> = None;
     match DisplayBrightness::open() {
-        Ok(mut backend) => match backend.get() {
-            Ok(_) => brightness = Some(Box::new(backend)),
+        Ok(mut driver) => match driver.capture() {
+            Ok(_) => brightness = Some(Box::new(DisplayGroup::new(driver))),
             Err(error) => log::debug!("DisplayServices brightness unavailable: {error:#}"),
         },
         Err(error) => log::debug!("DisplayServices unavailable: {error:#}"),
     }
     #[cfg(target_arch = "x86_64")]
     if brightness.is_none() {
-        let mut backend = intel::IoBrightness::default();
-        if backend.get().is_ok() {
-            brightness = Some(Box::new(backend));
+        let mut driver = intel::IoBrightness;
+        if driver.capture().is_ok() {
+            brightness = Some(Box::new(DisplayGroup::new(driver)));
         }
     }
     let mut native = CoreAudioVolume::default();
@@ -635,10 +652,11 @@ mod tests {
             WRITTEN.store(display, Ordering::Relaxed);
             0
         }
-        let mut backend = DisplayBrightness::open()?;
-        backend.current_display = primary;
-        backend.get = read;
-        backend.set = write;
+        let mut driver = DisplayBrightness::open()?;
+        driver.current_display = primary;
+        driver.get = read;
+        driver.set = write;
+        let mut backend = DisplayGroup::new(driver);
         let original = backend.get()?;
         PRIMARY.store(200, Ordering::Relaxed);
         backend.set(original)?;
@@ -761,7 +779,13 @@ mod tests {
         println!("AppleScript volume: {:?}", script.get());
         let mut controls = backends();
         match controls.brightness.as_mut() {
-            Some(brightness) => println!("brightness: {:.6}", brightness.get()?),
+            Some(brightness) => match brightness.get() {
+                Ok(level) => println!("brightness: {level:.6}"),
+                Err(error) if error.is::<crate::platform::AtMinimum>() => {
+                    println!("brightness: at minimum")
+                }
+                Err(error) => return Err(error),
+            },
             None => println!("brightness: unavailable (overlay)"),
         }
         match controls.volume.as_mut() {

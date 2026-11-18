@@ -4,6 +4,8 @@ use anyhow::Result;
 
 use crate::settings::EndAction;
 
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+mod display_group;
 pub mod fallback;
 // Linux's command parsers and sysfs math are portable and tested on every host.
 #[cfg(any(target_os = "linux", test))]
@@ -13,14 +15,10 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-// Shared pure math, also tested on hosts without Windows/Linux display hardware.
-#[cfg(any(target_os = "windows", target_os = "linux", test))]
-pub(crate) fn scaled_brightness(baseline: f32, reference: f32, level: f32) -> f32 {
-    if reference <= 0.0 {
-        baseline
-    } else {
-        (baseline * level / reference).clamp(0.0, 1.0)
-    }
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+pub(crate) fn normalized(level: f32) -> Result<f32> {
+    anyhow::ensure!(level.is_finite(), "control level must be finite");
+    Ok(level.clamp(0.0, 1.0))
 }
 
 /// Some displays took the level and others failed. The engine keeps fading the
@@ -32,6 +30,16 @@ pub struct Partial(pub String);
 /// The engine drops that original instead of retrying it.
 #[derive(Debug)]
 pub struct Disconnected(pub String);
+
+/// Every display is already at its minimum, so none of them can fade natively.
+#[derive(Debug)]
+pub struct AtMinimum;
+
+impl std::fmt::Display for AtMinimum {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("every display is already at its minimum brightness")
+    }
+}
 
 impl std::fmt::Display for Partial {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,18 +53,18 @@ impl std::fmt::Display for Disconnected {
     }
 }
 
+impl std::error::Error for AtMinimum {}
 impl std::error::Error for Partial {}
 impl std::error::Error for Disconnected {}
 
 pub trait Brightness: Send {
+    /// Captures the displays for a fade and returns the level to restore.
     fn get(&mut self) -> Result<f32>;
     fn set(&mut self, level: f32) -> Result<()>;
 
     /// Return to the captured level. Unlike `set`, this also retries displays
     /// that failed earlier in the fade.
-    fn restore(&mut self, level: f32) -> Result<()> {
-        self.set(level)
-    }
+    fn restore(&mut self, level: f32) -> Result<()>;
 }
 
 pub trait Volume: Send {
@@ -102,25 +110,5 @@ impl Power for DryRunPower {
     fn perform(&mut self, action: EndAction) -> Result<()> {
         log::warn!("NIGHTCAP_DRY_RUN: would perform {action:?}; no power action requested");
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod scaling_tests {
-    use super::scaled_brightness;
-
-    #[test]
-    fn different_displays_fade_without_brightening_and_restore_individually() {
-        for baseline in [0.2, 0.8] {
-            assert!((scaled_brightness(baseline, 0.8, 0.4) - baseline / 2.0).abs() < 1e-6);
-            assert!((scaled_brightness(baseline, 0.8, 0.8) - baseline).abs() < 1e-6);
-            for step in 0..=80 {
-                assert!(scaled_brightness(baseline, 0.8, step as f32 / 100.0) <= baseline + 1e-6);
-            }
-        }
-        assert_eq!(scaled_brightness(0.0, 0.0, 1.0), 0.0);
-        assert_eq!(scaled_brightness(0.2, 0.0, 1.0), 0.2);
-        assert_eq!(scaled_brightness(0.8, 0.8, 2.0), 1.0);
-        assert_eq!(scaled_brightness(0.8, 0.8, -1.0), 0.0);
     }
 }

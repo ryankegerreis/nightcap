@@ -31,8 +31,7 @@ fn main() {
                 &mut opening,
                 &mut settings,
                 settings_window::SettingsView {
-                    brightness_supported: false,
-                    overlay_available: true,
+                    dimming: nightcap::dimming::DimMethod::Overlay,
                     volume_supported: false,
                     hibernate_supported: false,
                     updates: &update_status,
@@ -308,8 +307,7 @@ fn main() {
                 opening,
                 &mut preferences,
                 settings_window::SettingsView {
-                    brightness_supported: false,
-                    overlay_available: true,
+                    dimming: nightcap::dimming::DimMethod::Overlay,
                     volume_supported: false,
                     hibernate_supported: false,
                     updates: &update_status,

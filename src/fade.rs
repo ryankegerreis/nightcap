@@ -41,6 +41,36 @@ impl FadePlan {
     }
 }
 
+/// One level's progress through a fade.
+#[derive(Default)]
+pub(crate) struct FadeTrack {
+    pub(crate) original: Option<f32>,
+    pub(crate) from: Option<f32>,
+    pub(crate) last: Option<f32>,
+}
+
+impl FadeTrack {
+    /// A kept original means its restore failed, possibly for only some displays.
+    /// The next fade starts from that original rather than the last faded level.
+    pub(crate) fn reset(&self, keep_original: bool) -> Self {
+        Self {
+            original: self.original.filter(|_| keep_original),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn level(&self, plan: FadePlan, elapsed: Duration, target: u8) -> f32 {
+        let from = self.from.unwrap_or(1.0);
+        plan.level_at(elapsed, from, f32::from(target) / 100.0)
+            .min(self.last.unwrap_or(from))
+    }
+}
+
+pub(crate) fn valid_level(level: f32) -> anyhow::Result<f32> {
+    anyhow::ensure!(level.is_finite(), "backend returned a non-finite level");
+    Ok(level.clamp(0.0, 1.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

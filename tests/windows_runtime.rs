@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result, ensure};
 use nightcap::{
+    dimming::DimMethod,
     engine::{Clock, ClockReading, Command, Engine, EngineHandle, Snapshot, TimerState},
     platform::{self, Backends, Power},
     settings::{EndAction, Settings},
@@ -80,7 +81,7 @@ fn native_discovery_on_ui_thread_and_volume_read_on_worker() -> Result<()> {
             "discovery started a timer"
         );
         ensure!(snapshot.volume_supported == volume_available);
-        ensure!(snapshot.brightness_supported == brightness_available);
+        ensure!((snapshot.dimming.method == DimMethod::Native) == brightness_available);
         ensure!(snapshot.hibernate_supported == hibernate_supported);
         ensure!(snapshot.last_error.is_none());
         ensure!(
@@ -150,7 +151,7 @@ impl Levels {
         Self {
             brightness: original
                 .brightness
-                .and(snapshot.brightness_percent.map(|v| v / 100.0)),
+                .and(snapshot.dimming.percent.map(|v| v / 100.0)),
             volume: original
                 .volume
                 .and(snapshot.volume_percent.map(|v| v / 100.0)),
@@ -173,7 +174,11 @@ impl RestoreHardware {
 
     fn restore(&mut self) -> Result<()> {
         let brightness = match (self.controls.brightness.as_mut(), self.original.brightness) {
-            (Some(backend), Some(level)) => backend.set(level),
+            (Some(backend), Some(level)) => {
+                // A fade step ends the restored state, so the restore writes every display again.
+                let _ = backend.set(level);
+                backend.restore(level)
+            }
             _ => Ok(()),
         };
         let volume = match (self.controls.volume.as_mut(), self.original.volume) {
@@ -221,7 +226,8 @@ impl Runtime {
             let snapshot = self.handle.snapshot();
             if let Some(error) = &snapshot.last_error {
                 ensure!(
-                    !snapshot.brightness_supported && error.starts_with("setting brightness:"),
+                    snapshot.dimming.method != DimMethod::Native
+                        && error.starts_with("setting brightness:"),
                     "native engine error: {snapshot:?}"
                 );
             }
@@ -263,7 +269,7 @@ fn wait_levels(observer: &mut Backends, expected: Levels) -> Result<Levels> {
 fn assert_faded(observer: &mut Backends, snapshot: &Snapshot, original: Levels) -> Result<Levels> {
     ensure!(snapshot.volume_supported == original.volume.is_some());
     let mut expected = Levels::from_snapshot(snapshot, original);
-    if !snapshot.brightness_supported {
+    if snapshot.dimming.method != DimMethod::Native {
         expected.brightness = Levels::read(observer)?.brightness;
     }
     let actual = wait_levels(observer, expected)?;
@@ -281,19 +287,21 @@ fn assert_faded(observer: &mut Backends, snapshot: &Snapshot, original: Levels) 
                 actual <= original + tolerance,
                 "{name} increased during fade"
             );
-            if original > tolerance * 4.0 && (name != "brightness" || snapshot.brightness_supported)
+            if original > tolerance * 4.0
+                && (name != "brightness" || snapshot.dimming.method == DimMethod::Native)
             {
                 ensure!(actual < original - tolerance, "{name} did not visibly fade");
             }
         }
     }
-    if !snapshot.brightness_supported {
+    if snapshot.dimming.method != DimMethod::Native {
         ensure!(
-            snapshot.overlay_alpha > 0.0 && snapshot.overlay_alpha <= 0.9,
+            snapshot.dimming.overlay_alpha > 0.0 && snapshot.dimming.overlay_alpha <= 0.9,
             "missing dimming overlay"
         );
         let level = snapshot
-            .brightness_percent
+            .dimming
+            .percent
             .context("overlay fade has no level")?
             / 100.0;
         let reference = original.brightness.unwrap_or(1.0);
@@ -302,10 +310,10 @@ fn assert_faded(observer: &mut Backends, snapshot: &Snapshot, original: Levels) 
         } else {
             1.0
         };
-        ensure!((snapshot.overlay_alpha - 0.9 * (1.0 - relative)).abs() < 0.0001);
+        ensure!((snapshot.dimming.overlay_alpha - 0.9 * (1.0 - relative)).abs() < 0.0001);
     } else {
         ensure!(
-            snapshot.overlay_alpha == 0.0,
+            snapshot.dimming.overlay_alpha == 0.0,
             "native brightness unexpectedly used overlay"
         );
     }
@@ -356,7 +364,7 @@ fn native_fades_pause_extend_cancel_wake_and_worker_shutdown() -> Result<()> {
     let lowered = assert_faded(&mut observer, &faded, original)?;
     println!(
         "faded levels: {lowered:?}; overlay alpha={:.3}",
-        faded.overlay_alpha
+        faded.dimming.overlay_alpha
     );
     runtime.handle.send(Command::Pause)?;
     let paused = runtime.wait(|s| s.state == TimerState::Paused)?;
@@ -365,9 +373,9 @@ fn native_fades_pause_extend_cancel_wake_and_worker_shutdown() -> Result<()> {
     let extended = runtime.wait(|s| s.remaining == paused.remaining + Duration::from_secs(900))?;
     ensure!(extended.state == TimerState::Paused);
     ensure!(extended.total == paused.total + Duration::from_secs(900));
-    ensure!(extended.brightness_percent == paused.brightness_percent);
+    ensure!(extended.dimming.percent == paused.dimming.percent);
     ensure!(extended.volume_percent == paused.volume_percent);
-    ensure!(extended.overlay_alpha == paused.overlay_alpha);
+    ensure!(extended.dimming.overlay_alpha == paused.dimming.overlay_alpha);
     wait_levels(&mut observer, lowered)?;
     runtime.handle.send(Command::Resume)?;
     runtime.wait(|s| s.state == TimerState::Running)?;
@@ -376,7 +384,7 @@ fn native_fades_pause_extend_cancel_wake_and_worker_shutdown() -> Result<()> {
     assert_faded(&mut observer, &resumed, original)?;
     runtime.handle.send(Command::Cancel)?;
     let cancelled = runtime.wait(|s| s.state == TimerState::Idle)?;
-    ensure!(cancelled.overlay_alpha == 0.0);
+    ensure!(cancelled.dimming.overlay_alpha == 0.0);
     wait_levels(&mut observer, original)?;
     ensure!(
         actions.lock().unwrap().is_empty(),
@@ -402,7 +410,7 @@ fn native_fades_pause_extend_cancel_wake_and_worker_shutdown() -> Result<()> {
         assert_faded(&mut observer, &completed, original)?;
         runtime.handle.send(Command::SystemWoke)?;
         let woke = runtime.wait(|s| s.state == TimerState::Idle)?;
-        ensure!(woke.overlay_alpha == 0.0);
+        ensure!(woke.dimming.overlay_alpha == 0.0);
         wait_levels(&mut observer, original)?;
     }
     settings.restore_on_cancel_or_wake = false;
@@ -431,7 +439,7 @@ fn native_fades_pause_extend_cancel_wake_and_worker_shutdown() -> Result<()> {
         })?;
         let idle = runtime.wait(|s| s.state == TimerState::Idle)?;
         ensure!(
-            idle.overlay_alpha == faded.overlay_alpha,
+            idle.dimming.overlay_alpha == faded.dimming.overlay_alpha,
             "restore-off cleared dimming overlay"
         );
         wait_levels(&mut observer, retained)?;
@@ -454,7 +462,7 @@ fn native_fades_pause_extend_cancel_wake_and_worker_shutdown() -> Result<()> {
         runtime.handle.snapshot().state == TimerState::Idle,
         "worker did not shut down gracefully"
     );
-    ensure!(runtime.handle.snapshot().overlay_alpha == 0.0);
+    ensure!(runtime.handle.snapshot().dimming.overlay_alpha == 0.0);
     ensure!(
         runtime.handle.send(Command::Pause).is_err(),
         "worker command receiver still open"
