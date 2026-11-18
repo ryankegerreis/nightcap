@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1](https://github.com/ryankegerreis/nightcap/compare/v0.2.0...v0.2.1) (2026-11-18)
+
+
+### Bug Fixes
+
+* keep dimming reliable when a display or overlay fails ([#28](https://github.com/ryankegerreis/nightcap/issues/28)) ([4c159b5](https://github.com/ryankegerreis/nightcap/commit/4c159b516b56cbe0e9731a012e9f61aa3d2608f2))
+* keep linux dimming overlays from blocking clicks ([#26](https://github.com/ryankegerreis/nightcap/issues/26)) ([dc763a5](https://github.com/ryankegerreis/nightcap/commit/dc763a5d6aa63e20ea07edbe887c444b94ba2806))
+
 ## [0.2.0](https://github.com/ryankegerreis/nightcap/compare/v0.1.2...v0.2.0) (2026-11-18)
 
 
