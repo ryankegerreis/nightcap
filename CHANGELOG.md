@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/ryankegerreis/nightcap/compare/v0.2.1...v0.2.2) (2026-11-18)
+
+
+### Bug Fixes
+
+* open settings without a one-second delay on macOS ([#30](https://github.com/ryankegerreis/nightcap/issues/30)) ([d438206](https://github.com/ryankegerreis/nightcap/commit/d438206432be1d19b8e0c774c0f0d9405695859e))
+
 ## [0.2.1](https://github.com/ryankegerreis/nightcap/compare/v0.2.0...v0.2.1) (2026-11-18)
 
 
