@@ -166,6 +166,39 @@ pub fn toggle(ui: &mut Ui, id: Id, on: bool, label: &str) -> Response {
     response
 }
 
+/// Borderless accent-colored text button, like a macOS inline link button.
+pub fn text_button(ui: &mut Ui, id: Id, label: &str, enabled: bool) -> Response {
+    let tokens = theme::tokens(ui.ctx());
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(13.0),
+        Color32::PLACEHOLDER,
+    );
+    let (rect, _) = ui.allocate_exact_size(galley.size() + vec2(4.0, 6.0), Sense::hover());
+    let response = ui.interact(
+        rect,
+        id,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled && ui.is_enabled(), label)
+    });
+    let color = if !enabled {
+        tokens.label_tertiary
+    } else if response.is_pointer_button_down_on() {
+        tokens.accent.gamma_multiply(0.7)
+    } else {
+        tokens.accent
+    };
+    ui.painter()
+        .galley(rect.center() - galley.size() * 0.5, galley, color);
+    response
+}
+
 pub fn paint_progress_ring(ui: &Ui, _id: Id, rect: Rect, progress: f32) {
     let tokens = theme::tokens(ui.ctx());
     // Timer progress changes every tick. Animating each change would repaint at

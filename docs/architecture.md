@@ -22,6 +22,10 @@ src/
     linux.rs         Linux impls
     fallback.rs      no-op / unsupported impls used when a backend is unavailable
   tray.rs            system tray / menu bar icon + menu
+  updates.rs         update notice: a background thread runs the system curl against
+                     GitHub's /releases/latest redirect 10 s after launch, then daily
+                     (hourly retry after a failure; wall-clock deadlines survive sleep).
+                     UpdateStatus: checking, available release, checked, failed (manual)
   ui/
     mod.rs           NightcapApp: eframe::App, routes between main window and settings
     theme.rs         colors, fonts, spacing tokens taken from the mockup (light + dark)
@@ -38,7 +42,8 @@ src/
 ## Core types (in `settings.rs` / `engine.rs`)
 
 - `Settings { dim: FadeSettings, volume: FadeSettings, end_action: EndAction,
-  restore_on_cancel_or_wake: bool, show_time_in_menu_bar: bool, last_duration_min: u32 }`
+  restore_on_cancel_or_wake: bool, show_time_in_menu_bar: bool, last_duration_min: u32,
+  check_for_updates: bool }` (missing fields load their defaults; update checks default on)
 - `FadeSettings { enabled: bool, start_before_min: u32, over_min: u32, target_percent: u8 }`
   Defaults: dim = enabled, 20 min before, over 15 min, to 10 %; volume = enabled,
   15 min before, over 10 min, to 20 %.
@@ -94,7 +99,9 @@ well-known OS command-line tools are an acceptable fallback (e.g. `pmset sleepno
 `tray-icon` on macOS and Windows. On Linux use `ksni` (StatusNotifierItem over D-Bus)
 so no GTK is required. Menu matches the mockup: "Start Timer" header, 15/30/45 Minutes,
 1 Hour, 90 Minutes; while running also Pause/Resume, +15 Minutes, Cancel; then
-Open Nightcap, Settings…, Quit Nightcap. Title shows remaining time (macOS menu bar)
+Download Nightcap X.Y.Z (only while a newer release is known and update checks are on),
+Open Nightcap, Settings…, Quit Nightcap. Download opens the release asset with
+`webbrowser`, which works while every window is hidden. Title shows remaining time (macOS menu bar)
 when `show_time_in_menu_bar` is on. Closing the main window hides it; the app keeps
 running in the tray. On Windows the menu opens on right-click and a left-click opens
 the main window.

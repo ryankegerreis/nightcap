@@ -14,6 +14,7 @@ use eframe::egui;
 use crate::engine::{Command, EngineHandle, TimerState};
 use crate::settings::Settings;
 use crate::tray::{Tray, TrayAction};
+use crate::updates::{UpdateChecker, UpdateStatus};
 
 use self::main_window::{MAX_MINUTES, MIN_MINUTES, PRESETS};
 
@@ -29,6 +30,7 @@ const NOTICE_DURATION: Duration = Duration::from_millis(4500);
 pub struct NightcapApp {
     engine: EngineHandle,
     tray: Option<Tray>,
+    updates: UpdateChecker,
     overlay: overlay::Overlay,
     root_visible: bool,
     quitting: bool,
@@ -54,7 +56,12 @@ struct StatusNote {
 }
 
 impl NightcapApp {
-    pub fn new(engine: EngineHandle, settings: Settings, tray: Option<Tray>) -> Self {
+    pub fn new(
+        engine: EngineHandle,
+        settings: Settings,
+        tray: Option<Tray>,
+        updates: UpdateChecker,
+    ) -> Self {
         set_activation_policy(true);
         let duration_min = settings.last_duration_min.clamp(MIN_MINUTES, MAX_MINUTES);
         let custom_duration = !PRESETS.contains(&duration_min);
@@ -63,6 +70,7 @@ impl NightcapApp {
             _wake_observer: crate::platform::macos::WakeObserver::new(engine.clone()),
             engine,
             tray,
+            updates,
             overlay: overlay::Overlay::new(),
             root_visible: true,
             quitting: false,
@@ -149,6 +157,7 @@ impl NightcapApp {
     }
 
     fn mark_settings_dirty(&mut self) {
+        self.updates.set_enabled(self.settings.check_for_updates);
         if let Err(error) = self
             .engine
             .send(Command::UpdateSettings(self.settings.clone()))
@@ -159,6 +168,17 @@ impl NightcapApp {
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint_after(SAVE_DELAY);
         }
+    }
+
+    /// Applies what the Settings window asked for, returning whether a preference changed.
+    fn settings_outcome(&mut self, outcome: settings_window::SettingsOutcome) -> bool {
+        if outcome.check_now {
+            self.updates.check_now();
+        }
+        if let Some(url) = outcome.download {
+            open_url(&url);
+        }
+        outcome.changed
     }
 
     fn flush_save(&mut self) {
@@ -193,8 +213,14 @@ impl eframe::App for NightcapApp {
             }
         }
         self.observed_total = snapshot.total;
+        let updates = self.updates.status();
+        // Settings still reports a manual check while automatic checks are off.
+        let offered = updates
+            .available
+            .as_ref()
+            .filter(|_| self.settings.check_for_updates);
         let actions = if let Some(tray) = &mut self.tray {
-            tray.update(&snapshot, self.settings.show_time_in_menu_bar);
+            tray.update(&snapshot, self.settings.show_time_in_menu_bar, offered);
             tray.poll()
         } else {
             Vec::new()
@@ -207,6 +233,11 @@ impl eframe::App for NightcapApp {
                         self.open_window(ctx, false);
                     }
                     self.open_settings();
+                }
+                TrayAction::DownloadUpdate => {
+                    if let Some(release) = &updates.available {
+                        open_url(&release.download_url());
+                    }
                 }
                 TrayAction::Quit => self.quit(ctx),
             }
@@ -265,19 +296,21 @@ impl eframe::App for NightcapApp {
         }
 
         let snapshot = self.engine.snapshot();
+        let updates = self.updates.status();
         let tokens = theme::tokens(ui.ctx());
         ui.painter().rect_filled(ui.max_rect(), 0.0, tokens.window);
         self.overlay.show(ui.ctx(), snapshot.overlay_alpha);
         if !self.root_visible {
-            settings_window::show(
+            let outcome = settings_window::show(
                 ui.ctx(),
                 &mut self.settings_open,
                 &mut self.settings_opening_pending,
                 &mut self.settings,
-                snapshot.brightness_supported,
-                snapshot.volume_supported,
-                snapshot.hibernate_supported,
+                settings_view(&snapshot, &updates),
             );
+            if self.settings_outcome(outcome) {
+                self.mark_settings_dirty();
+            }
             return;
         }
         if let Some(note) = &self.notice {
@@ -333,15 +366,14 @@ impl eframe::App for NightcapApp {
             }
             self.send(command);
         }
-        if settings_window::show(
+        let outcome = settings_window::show(
             ui.ctx(),
             &mut self.settings_open,
             &mut self.settings_opening_pending,
             &mut self.settings,
-            snapshot.brightness_supported,
-            snapshot.volume_supported,
-            snapshot.hibernate_supported,
-        ) {
+            settings_view(&snapshot, &updates),
+        );
+        if self.settings_outcome(outcome) {
             settings_changed = true;
         }
         if self.settings_focus_pending > 0 && self.settings_open && !self.settings_opening_pending {
@@ -374,6 +406,26 @@ impl eframe::App for NightcapApp {
         {
             log::warn!("Could not save settings: {error:#}");
         }
+    }
+}
+
+fn settings_view<'a>(
+    snapshot: &crate::engine::Snapshot,
+    updates: &'a UpdateStatus,
+) -> settings_window::SettingsView<'a> {
+    settings_window::SettingsView {
+        brightness_supported: snapshot.brightness_supported,
+        volume_supported: snapshot.volume_supported,
+        hibernate_supported: snapshot.hibernate_supported,
+        updates,
+    }
+}
+
+/// Opens a link in the default browser. Unlike `egui::Context::open_url`, this
+/// works from the tray while every Nightcap window is hidden.
+fn open_url(url: &str) {
+    if let Err(error) = webbrowser::open(url) {
+        log::warn!("Could not open {url}: {error}");
     }
 }
 

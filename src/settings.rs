@@ -26,6 +26,8 @@ pub struct Settings {
     pub restore_on_cancel_or_wake: bool,
     pub show_time_in_menu_bar: bool,
     pub last_duration_min: u32,
+    /// Ask GitHub about once a day whether a newer release exists.
+    pub check_for_updates: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +71,7 @@ impl Default for Settings {
             restore_on_cancel_or_wake: true,
             show_time_in_menu_bar: true,
             last_duration_min: 45,
+            check_for_updates: true,
         }
     }
 }
@@ -232,6 +235,7 @@ mod tests {
         assert!(settings.restore_on_cancel_or_wake);
         assert!(settings.show_time_in_menu_bar);
         assert_eq!(settings.last_duration_min, 45);
+        assert!(settings.check_for_updates);
     }
 
     #[test]
@@ -244,6 +248,7 @@ mod tests {
         settings.end_action = EndAction::Hibernate;
         settings.dim.enabled = false;
         settings.last_duration_min = 90;
+        settings.check_for_updates = false;
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), settings);
         assert_eq!(
@@ -260,7 +265,10 @@ mod tests {
         std::fs::write(&path, "broken json").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());
         std::fs::write(&path, r#"{"last_duration_min": 60}"#).unwrap();
-        assert_eq!(Settings::load_from(&path).last_duration_min, 60);
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.last_duration_min, 60);
+        // Files saved before update checks existed turn them on.
+        assert!(loaded.check_for_updates);
     }
 
     #[test]

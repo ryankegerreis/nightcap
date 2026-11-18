@@ -3,19 +3,35 @@
 use eframe::egui::{self, Id, Margin, Vec2};
 
 use crate::settings::{BEFORE_MINUTES, FadeSettings, OVER_MINUTES, Settings};
+use crate::updates::UpdateStatus;
 
 use super::main_window::{end_action_choices, end_action_label};
 use super::widgets::{self, Choice, MeterKind};
+
+/// What Settings shows besides the preferences themselves.
+pub struct SettingsView<'a> {
+    pub brightness_supported: bool,
+    pub volume_supported: bool,
+    pub hibernate_supported: bool,
+    pub updates: &'a UpdateStatus,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SettingsOutcome {
+    /// A preference changed and should be applied and saved.
+    pub changed: bool,
+    pub check_now: bool,
+    /// The update download the user asked to open.
+    pub download: Option<String>,
+}
 
 pub fn show(
     ctx: &egui::Context,
     open: &mut bool,
     opening: &mut bool,
     settings: &mut Settings,
-    brightness_supported: bool,
-    volume_supported: bool,
-    hibernate_supported: bool,
-) -> bool {
+    view: SettingsView<'_>,
+) -> SettingsOutcome {
     // Register at launch, even while hidden. eframe cannot create an immediate
     // viewport in every event-loop phase used to reopen the root from the tray.
     let requested = *open;
@@ -28,7 +44,7 @@ pub fn show(
     // A missing/recreated native window must be created hidden first. Keep the
     // request pending and try preparation again on the next root frame.
     let visible = requested && prepared;
-    let mut changed = false;
+    let mut outcome = SettingsOutcome::default();
     let mut close = false;
     ctx.show_viewport_immediate(
         viewport_id(),
@@ -55,13 +71,7 @@ pub fn show(
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            changed |= settings_body(
-                                ui,
-                                settings,
-                                brightness_supported,
-                                volume_supported,
-                                hibernate_supported,
-                            );
+                            outcome = settings_body(ui, settings, &view);
                         });
                 });
         },
@@ -75,17 +85,23 @@ pub fn show(
         *open = false;
         *opening = false;
     }
-    changed
+    outcome
 }
 
 fn settings_body(
     ui: &mut egui::Ui,
     settings: &mut Settings,
-    brightness_supported: bool,
-    volume_supported: bool,
-    hibernate_supported: bool,
-) -> bool {
+    view: &SettingsView<'_>,
+) -> SettingsOutcome {
+    let SettingsView {
+        brightness_supported,
+        volume_supported,
+        hibernate_supported,
+        updates,
+    } = *view;
     let mut changed = false;
+    let mut check_now = false;
+    let mut download = None;
     egui::Frame::NONE
         .inner_margin(Margin {
             left: 20,
@@ -200,8 +216,72 @@ fn settings_body(
                     );
                 });
             });
+            section_title(ui, "Updates");
+            widgets::InsetGroup::show(ui, "update-settings", |group| {
+                group.row(true, |ui| {
+                    widgets::split(
+                        ui,
+                        |ui| widgets::body(ui, "Check for updates automatically"),
+                        |ui| {
+                            if widgets::toggle(
+                                ui,
+                                Id::new("settings-check-updates"),
+                                settings.check_for_updates,
+                                "Check for updates automatically",
+                            )
+                            .clicked()
+                            {
+                                settings.check_for_updates = !settings.check_for_updates;
+                                changed = true;
+                            }
+                        },
+                    );
+                });
+                group.row(true, |ui| {
+                    widgets::split_stacked(
+                        ui,
+                        |ui| {
+                            widgets::title_and_caption(
+                                ui,
+                                &format!("Nightcap {}", updates.current),
+                                &updates.caption(),
+                            )
+                        },
+                        |ui| match &updates.available {
+                            Some(release) => {
+                                if widgets::text_button(
+                                    ui,
+                                    Id::new("settings-download-update"),
+                                    "Download",
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    download = Some(release.download_url());
+                                }
+                            }
+                            None => {
+                                if widgets::text_button(
+                                    ui,
+                                    Id::new("settings-check-now"),
+                                    "Check Now",
+                                    !updates.checking,
+                                )
+                                .clicked()
+                                {
+                                    check_now = true;
+                                }
+                            }
+                        },
+                    );
+                });
+            });
         });
-    changed
+    SettingsOutcome {
+        changed,
+        check_now,
+        download,
+    }
 }
 
 struct FadeCopy<'a> {
@@ -550,6 +630,120 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// Renders the settings body headlessly, returning its outcome and each text's rect.
+    fn render(
+        ctx: &egui::Context,
+        updates: &UpdateStatus,
+        events: Vec<egui::Event>,
+    ) -> (SettingsOutcome, Vec<(String, egui::Rect)>) {
+        fn texts(shape: &egui::Shape, found: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => found.push((
+                    text.galley.text().to_owned(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| texts(shape, found)),
+                _ => {}
+            }
+        }
+        let mut settings = Settings::default();
+        let mut outcome = SettingsOutcome::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(460.0, 1200.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            let view = SettingsView {
+                brightness_supported: true,
+                volume_supported: true,
+                hibernate_supported: false,
+                updates,
+            };
+            outcome = settings_body(ui, &mut settings, &view);
+        });
+        // Nothing uploads textures here; drop the delta as a renderer would.
+        output.textures_delta.clear();
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            texts(&clipped.shape, &mut found);
+        }
+        (outcome, found)
+    }
+
+    fn click(ctx: &egui::Context, updates: &UpdateStatus, label: &str) -> SettingsOutcome {
+        let (_, texts) = render(ctx, updates, Vec::new());
+        let (_, rect) = texts
+            .iter()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("{label} not shown: {texts:?}"));
+        let pos = rect.center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        render(ctx, updates, vec![egui::Event::PointerMoved(pos)]);
+        render(ctx, updates, vec![button(true)]);
+        render(ctx, updates, vec![button(false)]).0
+    }
+
+    #[test]
+    fn updates_section_shows_the_version_and_offers_the_right_button() {
+        use crate::updates::Release;
+        let ctx = egui::Context::default();
+        let mut updates = UpdateStatus::new(semver::Version::new(0, 1, 2));
+        let shown = |updates: &UpdateStatus| {
+            render(&egui::Context::default(), updates, Vec::new())
+                .1
+                .into_iter()
+                .map(|(text, _)| text)
+                .collect::<Vec<_>>()
+        };
+        let texts = shown(&updates);
+        for expected in [
+            "Updates",
+            "Check for updates automatically",
+            "Nightcap 0.1.2",
+            "Not checked yet",
+            "Check Now",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "{expected}: {texts:?}"
+            );
+        }
+        let outcome = click(&ctx, &updates, "Check Now");
+        assert!(outcome.check_now && !outcome.changed);
+        assert_eq!(outcome.download, None);
+
+        // Disabled while a check runs.
+        updates.checking = true;
+        assert!(shown(&updates).iter().any(|text| text == "Checking…"));
+        assert!(!click(&ctx, &updates, "Check Now").check_now);
+
+        updates.checking = false;
+        let release = Release {
+            version: semver::Version::new(0, 2, 0),
+            page_url: format!("{}/releases/tag/v0.2.0", crate::updates::REPOSITORY),
+        };
+        updates.available = Some(release.clone());
+        let texts = shown(&updates);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "Version 0.2.0 is available")
+        );
+        assert!(!texts.iter().any(|text| text == "Check Now"));
+        let outcome = click(&ctx, &updates, "Download");
+        assert_eq!(outcome.download, Some(release.download_url()));
+        assert!(!outcome.check_now);
     }
 
     #[test]

@@ -117,9 +117,13 @@ input[type=range]::-moz-range-thumb{width:18px;height:18px;border:0;border-radiu
 .set-body{padding:4px 20px 22px}
 .sec-h{font-size:13px;font-weight:600;margin:16px 0 7px 2px}
 .foot{font-size:11px;color:var(--label2);margin:6px 2px 0;line-height:1.4}
+.link{border:0;background:none;padding:3px 2px;font:13px var(--sf);color:var(--accent);cursor:default}
+.link:not(:disabled):active{opacity:.7}
+.link:disabled{color:var(--label3)}
+.mi[hidden]{display:none}
 
 /* ---------- menu bar ---------- */
-.mb-area{width:460px;max-width:100%;height:270px;position:relative;font:13px/1.2 var(--sf)}
+.mb-area{width:460px;max-width:100%;height:296px;position:relative;font:13px/1.2 var(--sf)}
 .menubar{height:26px;border-radius:8px;background:var(--menubar);box-shadow:0 0 0 .5px var(--sep);display:flex;justify-content:flex-end;align-items:center;gap:4px;padding:0 10px;color:var(--label)}
 .mb-item{display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 7px;border-radius:5px;font-variant-numeric:tabular-nums}
 .mb-item.open{background:var(--fill2)}
@@ -207,6 +211,8 @@ const t=(()=>{
   const ls=new Set();let total=0,rem=0,msgTimer;
   const t={
     state:'idle',minutes:45,custom:false,action:'sleep',restore:true,menuTitle:true,message:'',
+    // Update notice: installed version, the newer release found (or ''), automatic checks.
+    version:'0.1.2',update:'0.2.0',updates:true,checking:false,checked:false,
     screen:{on:true,before:20,length:15,min:10},
     sound:{on:true,before:15,length:10,min:20},
     on(f){ls.add(f);f()},emit(){ls.forEach(f=>f())},
@@ -336,6 +342,11 @@ function buildSettings(host,px){
       </div>
       <h3 class="sec-h">Menu bar</h3>
       <div class="group"><div class="row"><span id="${px}-mt">Show time remaining in the menu bar</span><button type="button" class="switch" role="switch" data-menutitle aria-labelledby="${px}-mt"></button></div></div>
+      <h3 class="sec-h">Updates</h3>
+      <div class="group">
+        <div class="row"><span id="${px}-up">Check for updates automatically</span><button type="button" class="switch" role="switch" data-updates aria-labelledby="${px}-up"></button></div>
+        <div class="row"><span class="row-text"><span>Nightcap ${t.version}</span><span class="cap" data-upcap></span></span><button type="button" class="link" data-uplink></button></div>
+      </div>
     </div>
    </div><p class="surface-cap">Settings (⌘,)</p></div>`);
   const w=host.querySelector(`#${px}-set`);
@@ -345,6 +356,10 @@ function buildSettings(host,px){
     if(b.hasAttribute('data-on')){t[g.dataset.kind].on=!t[g.dataset.kind].on}
     else if(b.hasAttribute('data-restore'))t.restore=!t.restore;
     else if(b.hasAttribute('data-menutitle'))t.menuTitle=!t.menuTitle;
+    else if(b.hasAttribute('data-updates'))t.updates=!t.updates;
+    else if(b.hasAttribute('data-uplink')){if(t.update)return;
+      // Check Now: the demo finds no newer release.
+      t.checking=true;t.emit();setTimeout(()=>{t.checking=false;t.checked=true;t.emit()},900);return}
     else return;t.emit()});
   w.addEventListener('change',e=>{const el=e.target,g=el.closest('[data-kind]');
     if(el.dataset.action!==undefined){t.action=el.value}
@@ -363,6 +378,9 @@ function buildSettings(host,px){
       g.querySelector('[data-f=length]').innerHTML=opts(LEN,f.length,v=>v===1?'1 minute':`${v} minutes`,v=>v>f.before)})}
     const a=w.querySelector('[data-action]');if(a.value!==t.action)a.value=t.action;
     setSwitch(w.querySelector('[data-restore]'),t.restore);setSwitch(w.querySelector('[data-menutitle]'),t.menuTitle);
+    setSwitch(w.querySelector('[data-updates]'),t.updates);
+    w.querySelector('[data-upcap]').textContent=t.checking?'Checking…':t.update?`Version ${t.update} is available`:t.checked?'Up to date':'Not checked yet';
+    const link=w.querySelector('[data-uplink]');link.textContent=t.update?'Download':'Check Now';link.disabled=t.checking;
   });
 }
 
@@ -372,6 +390,7 @@ function buildMenuBar(host,px){
    <div class="mb-area" id="${px}-mb">
     <div class="menubar"><span class="mb-item open">${ICON.moonMb}<span data-title></span></span><span class="mb-item">${ICON.cc}</span><span class="mb-item" data-clock></span></div>
     <div class="menu" role="menu" aria-label="Nightcap menu"><div data-items></div><div class="msep"></div>
+      <button type="button" class="mi" role="menuitem" data-download hidden>Download Nightcap ${t.update}</button>
       <button type="button" class="mi" role="menuitem" data-open>Open Nightcap</button>
       <button type="button" class="mi" role="menuitem" data-settings>Settings…<kbd>⌘,</kbd></button>
       <div class="msep"></div>
@@ -396,6 +415,8 @@ function buildMenuBar(host,px){
   });
   t.on(()=>{
     w.querySelector('[data-title]').textContent=t.active&&t.menuTitle?fmtDur(t.remaining):'';
+    // Offered only while automatic checks are on.
+    w.querySelector('[data-download]').hidden=!(t.update&&t.updates);
     w.querySelector('[data-clock]').textContent=new Date(simNow).toLocaleString('en-US',{weekday:'short',hour:'numeric',minute:'2-digit'}).replace(',','');
     const info=w.querySelector('[data-info]');
     if(info)info.textContent=t.state==='paused'?`Paused, ${fmtDur(t.remaining)} left`:`${ACTIONS[t.action].label} at ${fmtClock(t.endMs())}`;

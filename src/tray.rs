@@ -9,11 +9,13 @@ use std::{
 };
 
 use crate::engine::{Command, EngineHandle, Snapshot, TimerState};
+use crate::updates::Release;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayAction {
     OpenWindow,
     OpenSettings,
+    DownloadUpdate,
     Quit,
 }
 
@@ -27,7 +29,7 @@ impl Tray {
     /// Must be called on the main thread after the event loop exists.
     /// `wake` can be called from any thread; request a root viewport repaint from it.
     pub fn new(engine: EngineHandle, wake: Arc<dyn Fn() + Send + Sync>) -> anyhow::Result<Self> {
-        let display = Display::new(&engine.snapshot(), false);
+        let display = Display::new(&engine.snapshot(), false, None);
         let (sender, actions) = mpsc::channel();
         let dispatch = Arc::new(Dispatch {
             engine,
@@ -42,9 +44,19 @@ impl Tray {
         })
     }
 
-    /// Changes native items only when the state, displayed second, or title preference changes.
-    pub fn update(&mut self, snapshot: &Snapshot, show_time_in_menu_bar: bool) {
-        let display = Display::new(snapshot, show_time_in_menu_bar);
+    /// Changes native items only when the state, displayed second, title preference,
+    /// or available update changes.
+    pub fn update(
+        &mut self,
+        snapshot: &Snapshot,
+        show_time_in_menu_bar: bool,
+        update: Option<&Release>,
+    ) {
+        let display = Display::new(
+            snapshot,
+            show_time_in_menu_bar,
+            update.map(|release| release.version.to_string()),
+        );
         if self.display != display {
             self.native.update(&display);
             self.display = display;
@@ -115,10 +127,12 @@ struct Display {
     state: TimerState,
     time: String,
     show_time: bool,
+    /// Version of a newer release, offered above Open Nightcap.
+    update: Option<String>,
 }
 
 impl Display {
-    fn new(snapshot: &Snapshot, show_time: bool) -> Self {
+    fn new(snapshot: &Snapshot, show_time: bool, update: Option<String>) -> Self {
         let seconds = snapshot.menu_seconds();
         Self {
             state: snapshot.state,
@@ -128,7 +142,14 @@ impl Display {
                 format!("{}:{:02}", seconds / 60, seconds % 60)
             },
             show_time,
+            update,
         }
+    }
+
+    fn update_label(&self) -> Option<String> {
+        self.update
+            .as_ref()
+            .map(|version| format!("Download Nightcap {version}"))
     }
 
     fn active(&self) -> bool {
@@ -255,6 +276,8 @@ mod native {
         cancel: MenuItem,
         active_separator: PredefinedMenuItem,
         active_visible: bool,
+        update_item: MenuItem,
+        update_visible: bool,
         _events: Arc<Events>,
         #[cfg(target_os = "macos")]
         _app_menu: Menu,
@@ -282,6 +305,11 @@ mod native {
                 (add.id().clone(), Action::Add),
                 (cancel.id().clone(), Action::Cancel),
             ]);
+            let update_item = MenuItem::new("", true, None);
+            items.push((
+                update_item.id().clone(),
+                Action::Ui(TrayAction::DownloadUpdate),
+            ));
             menu.append(&PredefinedMenuItem::separator())?;
             let modifier = if cfg!(target_os = "macos") {
                 Modifiers::META
@@ -373,6 +401,8 @@ mod native {
                 cancel,
                 active_separator: PredefinedMenuItem::separator(),
                 active_visible: false,
+                update_item,
+                update_visible: false,
                 _events: events,
                 #[cfg(target_os = "macos")]
                 _app_menu: app_menu,
@@ -403,6 +433,27 @@ mod native {
                     }
                 }
                 self.active_visible = display.active();
+            }
+            let update = display.update_label();
+            if let Some(label) = &update {
+                self.update_item.set_text(label);
+            }
+            if update.is_some() != self.update_visible {
+                if update.is_some() {
+                    // Just after the separator above Open Nightcap: the header,
+                    // five presets, and the active items when they are shown.
+                    let index = 7 + if self.active_visible { 5 } else { 0 };
+                    if let Err(error) = self.menu.insert(&self.update_item, index) {
+                        log::warn!("Adding the update menu item failed: {error}");
+                    } else {
+                        self.update_visible = true;
+                    }
+                } else {
+                    if let Err(error) = self.menu.remove(&self.update_item) {
+                        log::warn!("Removing the update menu item failed: {error}");
+                    }
+                    self.update_visible = false;
+                }
             }
             for preset in &self.presets {
                 preset.set_enabled(!display.active());
@@ -474,7 +525,11 @@ mod native {
             self.dispatch.run(Action::Ui(TrayAction::OpenWindow));
         }
         fn menu_about_to_show(&mut self) {
-            self.display = Display::new(&self.dispatch.engine.snapshot(), self.display.show_time);
+            self.display = Display::new(
+                &self.dispatch.engine.snapshot(),
+                self.display.show_time,
+                self.display.update.take(),
+            );
         }
         fn menu(&self) -> Vec<MenuItem<Self>> {
             let mut menu = vec![Self::item("Start Timer", false, Action::Start(15))];
@@ -495,6 +550,13 @@ mod native {
                 ]);
             }
             menu.push(MenuItem::Separator);
+            if let Some(label) = self.display.update_label() {
+                menu.push(Self::item(
+                    &label,
+                    true,
+                    Action::Ui(TrayAction::DownloadUpdate),
+                ));
+            }
             menu.push(Self::item(
                 "Open Nightcap",
                 true,
@@ -586,13 +648,28 @@ mod tests {
             remaining: Duration::from_millis(754_001),
             ..Default::default()
         };
-        assert_eq!(Display::new(&snapshot, true).status(), "Sleeping in 12:35");
+        assert_eq!(
+            Display::new(&snapshot, true, None).status(),
+            "Sleeping in 12:35"
+        );
         snapshot.state = TimerState::Paused;
-        assert_eq!(Display::new(&snapshot, true).pause_label(), "Resume");
+        assert_eq!(Display::new(&snapshot, true, None).pause_label(), "Resume");
         snapshot.state = TimerState::Finishing;
-        assert!(!Display::new(&snapshot, true).controllable());
+        assert!(!Display::new(&snapshot, true, None).controllable());
         snapshot.state = TimerState::Idle;
-        assert_eq!(Display::new(&snapshot, true).time, "");
+        assert_eq!(Display::new(&snapshot, true, None).time, "");
+    }
+
+    #[test]
+    fn display_offers_an_available_update() {
+        let snapshot = Snapshot::default();
+        assert_eq!(Display::new(&snapshot, true, None).update_label(), None);
+        let update = Display::new(&snapshot, true, Some("0.2.0".into()));
+        assert_eq!(
+            update.update_label().as_deref(),
+            Some("Download Nightcap 0.2.0")
+        );
+        assert_ne!(update, Display::new(&snapshot, true, None));
     }
 
     #[test]
@@ -642,5 +719,7 @@ mod tests {
         }
         dispatch.run(Action::Ui(TrayAction::OpenSettings));
         assert_eq!(receiver.try_recv().unwrap(), TrayAction::OpenSettings);
+        dispatch.run(Action::Ui(TrayAction::DownloadUpdate));
+        assert_eq!(receiver.try_recv().unwrap(), TrayAction::DownloadUpdate);
     }
 }

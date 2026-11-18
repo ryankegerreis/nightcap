@@ -2,7 +2,9 @@
 
 A sleep timer for your computer, like the one on a TV. Set a time, and Nightcap slowly dims the screen and lowers the volume, then puts the computer to sleep.
 
-Nightcap is built in Rust with [egui](https://github.com/emilk/egui) and runs on macOS, Windows and Linux. It works offline and needs no account.
+Nightcap is built in Rust with [egui](https://github.com/emilk/egui) and runs on macOS, Windows and Linux. It needs no account. About once a day it asks
+GitHub, using the system's `curl`, whether a newer version exists; the request
+carries only Nightcap's version number. Turn this off under Settings → Updates.
 
 > **Status:** working desktop app. Timer, fades, menu bar/tray controls, Settings, and overlay fallback are integrated. macOS has been exercised with real brightness and volume fades; Windows has native UI, volume, restoration and overlay checks. Linux has native engine and isolated X11/tray checks, with unresolved overlay input and Settings issues. See the platform hardening reports for coverage and limitations.
 
@@ -18,6 +20,7 @@ Nightcap is built in Rust with [egui](https://github.com/emilk/egui) and runs on
 - **Restore:** put brightness and volume back when you cancel the timer or wake the computer.
 - **Menu bar and system tray:** start, pause, resume, extend and cancel timers without opening the window. Closing the window keeps the timer running; Open Nightcap brings it back. Quit restores faded levels when restoration is enabled.
 - **Overlay fallback:** on displays that don't support brightness control, dim the root window’s monitor with a passive, transparent overlay. It keeps updating while the main window is hidden.
+- **Update notice:** Settings → Updates shows the installed version and whether a newer one is out, with Check Now and Download buttons. When an update exists, the menu bar or tray menu also offers it. Nightcap never installs anything itself; Download opens this platform's file from the release in your browser.
 - **Native appearance:** system light/dark theme, runtime system fonts on macOS/Windows, thin countdown digits in fixed-width cells, and separate Settings (gear button or ⌘, on macOS). Preferences are saved in the OS configuration directory.
 
 ## Design
@@ -109,6 +112,12 @@ when restoration is enabled.
 wall time, and wake detection stays unscaled. The default is `1`; invalid,
 non-finite or non-positive values are logged and fall back to real time. Speed
 alone does not disable power actions, so use both variables for previews.
+
+`NIGHTCAP_CURRENT_VERSION=<version>` (debug builds only) makes Nightcap report
+that version to its update check, so `NIGHTCAP_CURRENT_VERSION=0.1.0 cargo run`
+previews the update notice against the real latest release. The check runs 10
+seconds after launch, or at once with Settings → Updates → Check Now. Run
+`cargo test --lib updates -- --ignored` to check GitHub's redirect from a terminal.
 
 ## Platform notes
 
