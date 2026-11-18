@@ -1,9 +1,9 @@
 # Linux verification run — 2026-10-19
 
 Nightcap builds and its engine and tray commands work on this host. Desktop
-verification remains incomplete: the native X11 run reproduced blocked pointer
-input under the overlay and delayed Settings propagation. Those issues remain
-unfixed; passing engine tests do not establish that the desktop experience works.
+verification remains incomplete. The initial native X11 run reproduced blocked
+pointer input under the overlay and delayed Settings propagation. The overlay
+update below addresses the click-through issue. The Settings issue remains open.
 
 ## Environment
 
@@ -96,9 +96,7 @@ release workflow; a Linux pull-request job is outside this change.
 - The extracted optimized executable reproduced the overlay failure below.
   Tray Cancel cleared the overlay, restored volume and allowed graceful quit.
 
-## Unresolved findings
-
-### Overlay blocks pointer input in Openbox
+## Overlay input regression and fix
 
 With default dimming enabled, start a 15-minute timer using:
 
@@ -116,11 +114,40 @@ one on its Openbox parent. This supports the explanation that the window manager
 parent intercepts input despite the client's mouse-passthrough setting. Keyboard
 Ctrl+Q and D-Bus tray commands still worked and restored levels.
 
-The default WGPU renderer also logged that the active surface did not support a
-transparent composite alpha mode. The screen visibly dimmed, but correct overlay
-opacity and composition were not established. These results apply to this isolated
-Openbox/software-rendering setup; GNOME Wayland and hardware GPU behavior remain
-unverified.
+The old overlay also depended on WGPU surface transparency, which was unavailable
+in that software-rendered session.
+
+The Linux fallback now uses an unmanaged 32-bit X11 window. Nightcap verifies an
+empty X Shape input region before mapping it and requires an active compositor to
+blend its alpha. The overlay does not use the WGPU surface. Without those
+capabilities, including on native Wayland, Nightcap keeps the overlay hidden and
+shows that screen dimming is unavailable in the main window and Settings when
+hardware brightness cannot be used.
+
+- On Xvfb with Openbox and xcompmgr, synthesized clicks reached both application
+  windows beneath the overlay. The overlay was a direct child of the X root,
+  had an empty input region, and contained the requested nonzero alpha.
+- In the running Nightcap app on the same X11 session, a pointer click on Cancel
+  cleared the visible overlay. During a new fade, exiting xcompmgr hid the
+  overlay, and restarting xcompmgr brought it back.
+- The X11 regression also checks that the overlay sits above both click targets
+  and remaps after a simulated gap with no active monitors.
+- With Openbox and no compositor, the overlay stayed unmapped and both windows
+  received clicks.
+- In a headless GNOME Shell 50.1 Wayland session, the timer started and canceled
+  through the isolated tray host. The Wayland protocol trace showed no overlay
+  window. The main-window test covers the unavailable-dimming message.
+- KDE and GNOME X11 were unavailable on this host. The X11 and Wayland sessions
+  used software rendering, so physical GPU rendering remains unverified.
+
+On an isolated test X11 display, run the native regression with the environment
+variable set to `1` for a composited display or `0` for one without a compositor.
+
+```sh
+NIGHTCAP_X11_TEST_COMPOSITED=1 cargo test --lib native_overlay_checks_input_alpha_and_cleanup -- --ignored
+```
+
+## Unresolved findings
 
 ### Settings changes wait for a main-window event
 

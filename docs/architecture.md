@@ -37,6 +37,8 @@ src/
                      always-on-top, mouse-passthrough black viewport with variable alpha.
                      Windows uses a native black layered popup instead, with the alpha
                      as its window opacity, covering the root window's monitor
+    x11_overlay.rs   native Linux overlay on composited X11 with a verified empty
+                     input region, independent of egui's renderer
 ```
 
 ## Core types (in `settings.rs` / `engine.rs`)
@@ -71,6 +73,9 @@ window is hidden and egui is not repainting. It owns the platform backends.
   gap over 5 s while Finishing (30 s while Running/Paused), plus native macOS workspace wake notifications).
 - If hardware brightness is unsupported, the dim fade drives `overlay_alpha` instead
   (max alpha 0.9 at target 0 %, mapped linearly).
+  The Linux UI requires a composited X11 display with RandR and X Shape support
+  before mapping its unmanaged ARGB window. The root monitor is selected with
+  RandR. Native Wayland reports overlay dimming as unavailable.
   A failed native write rebases overlay opacity against the last successful native
   level, avoiding an abrupt absolute-brightness jump while retaining restoration.
   A `platform::Partial` error means some displays took the level, so native fading

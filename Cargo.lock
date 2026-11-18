@@ -2158,6 +2158,7 @@ dependencies = [
  "webbrowser",
  "windows",
  "winit",
+ "x11rb",
 ]
 
 [[package]]
