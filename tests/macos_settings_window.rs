@@ -217,11 +217,17 @@ fn main() {
         settings.screen().is_some(),
         "saved-frame fallback must recover a usable display"
     );
-    assert_eq!(
-        settings.frame().origin.x,
-        visible.origin.x + 140.0,
+    let recovered = settings.frame();
+    assert!(
+        recovered.origin.x != visible.origin.x + 100.0 && recovered.origin.x >= visible.origin.x,
         "saved-frame fallback must still position Settings when screen() is nil"
     );
+    if recovered.size.width <= visible.size.width {
+        assert!(
+            recovered.origin.x + recovered.size.width <= visible.origin.x + visible.size.width,
+            "saved-frame fallback must keep Settings on the recovered display"
+        );
+    }
     no_screen.setTitle(&NSString::from_str("Closed Nightcap"));
     no_screen.close();
     main.setTitle(&NSString::from_str("Nightcap"));
@@ -268,6 +274,17 @@ fn main() {
                     .collectionBehavior()
                     .contains(NSWindowCollectionBehavior::MoveToActiveSpace)
             );
+            let (over, under) = (settings.frame(), root.frame());
+            let area = root.screen().expect("root is on a display").visibleFrame();
+            if over.size.width + 24.0 <= area.size.width {
+                assert!(
+                    over.origin.x > under.origin.x
+                        || over.origin.x + over.size.width < under.origin.x + under.size.width
+                        || over.origin.y > under.origin.y
+                        || over.origin.y + over.size.height < under.origin.y + under.size.height,
+                    "Settings must not open fully covering Nightcap: Metal stalls for a second"
+                );
+            }
             settings.orderFront(None);
         } else {
             settings.orderOut(None);

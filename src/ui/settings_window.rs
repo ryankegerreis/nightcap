@@ -573,21 +573,64 @@ fn screen_distance_squared(
     dx * dx + dy * dy
 }
 
+/// How much of the main window Settings leaves showing when it opens.
+#[cfg(target_os = "macos")]
+const UNCOVERED_ROOT_STRIP: f64 = 24.0;
+
+/// Centers Settings on the main window, then moves it just enough to leave a strip
+/// of that window showing, as wide as the screen allows up to `UNCOVERED_ROOT_STRIP`.
+/// AppKit still reports a newly covered window as visible, so drawing it blocks the
+/// UI thread for a second in Metal's `nextDrawable`.
 #[cfg(target_os = "macos")]
 fn opening_origin(
     root: objc2_foundation::NSRect,
     size: objc2_foundation::NSSize,
     visible: objc2_foundation::NSRect,
 ) -> objc2_foundation::NSPoint {
-    let x = (root.origin.x + (root.size.width - size.width) / 2.0).clamp(
-        visible.origin.x,
-        visible.origin.x + (visible.size.width - size.width).max(0.0),
-    );
+    use objc2_foundation::NSPoint;
+
+    let min_x = visible.origin.x;
+    let max_x = min_x + (visible.size.width - size.width).max(0.0);
     // Keep the title bar reachable even if Settings is taller than the screen.
-    let top_aligned_y = visible.origin.y + visible.size.height - size.height;
-    let y = (root.origin.y + (root.size.height - size.height) / 2.0)
-        .clamp(visible.origin.y.min(top_aligned_y), top_aligned_y);
-    objc2_foundation::NSPoint::new(x, y)
+    let max_y = visible.origin.y + visible.size.height - size.height;
+    let min_y = visible.origin.y.min(max_y);
+    let centered = NSPoint::new(
+        (root.origin.x + (root.size.width - size.width) / 2.0).clamp(min_x, max_x),
+        (root.origin.y + (root.size.height - size.height) / 2.0).clamp(min_y, max_y),
+    );
+
+    // Settings opens on this display, so the strip is measured on it too.
+    let left = root.origin.x.max(visible.origin.x);
+    let right = (root.origin.x + root.size.width).min(visible.origin.x + visible.size.width);
+    let bottom = root.origin.y.max(visible.origin.y);
+    let top = (root.origin.y + root.size.height).min(visible.origin.y + visible.size.height);
+    if left >= right || bottom >= top {
+        return centered;
+    }
+    let strip = UNCOVERED_ROOT_STRIP;
+    let uncovered = |origin: NSPoint| {
+        (origin.x - left)
+            .max(right - (origin.x + size.width))
+            .max(origin.y - bottom)
+            .max(top - (origin.y + size.height))
+            .clamp(0.0, strip)
+    };
+    let mut best = centered;
+    for candidate in [
+        NSPoint::new(left + strip, centered.y),
+        NSPoint::new(right - strip - size.width, centered.y),
+        NSPoint::new(centered.x, bottom + strip),
+        NSPoint::new(centered.x, top - strip - size.height),
+    ] {
+        let candidate = NSPoint::new(
+            candidate.x.clamp(min_x, max_x),
+            candidate.y.clamp(min_y, max_y),
+        );
+        if uncovered(candidate) > uncovered(best) {
+            best = candidate;
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -604,13 +647,13 @@ mod tests {
                 NSPoint::new(-1800.0, 150.0),
                 NSRect::new(NSPoint::new(-1920.0, 0.0), NSSize::new(1920.0, 1050.0)),
                 NSSize::new(460.0, 700.0),
-                NSPoint::new(-1860.0, 80.0),
+                NSPoint::new(-1776.0, 80.0),
             ),
             (
                 NSPoint::new(100.0, 1300.0),
                 NSRect::new(NSPoint::new(0.0, 1080.0), NSSize::new(1920.0, 1000.0)),
                 NSSize::new(460.0, 700.0),
-                NSPoint::new(40.0, 1230.0),
+                NSPoint::new(124.0, 1230.0),
             ),
             (
                 NSPoint::new(20.0, 20.0),
@@ -627,6 +670,121 @@ mod tests {
                 ),
                 expected
             );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod opening_placement {
+        use super::super::{UNCOVERED_ROOT_STRIP, opening_origin};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        const SETTINGS: NSSize = NSSize::new(460.0, 700.0);
+        const ROOT: NSSize = NSSize::new(340.0, 560.0);
+
+        fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
+            NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+        }
+
+        /// The widest strip of `root`'s on-screen area that Settings leaves showing.
+        fn uncovered_strip(root: NSRect, origin: NSPoint, size: NSSize, visible: NSRect) -> f64 {
+            let left = root.origin.x.max(visible.origin.x);
+            let right =
+                (root.origin.x + root.size.width).min(visible.origin.x + visible.size.width);
+            let bottom = root.origin.y.max(visible.origin.y);
+            let top =
+                (root.origin.y + root.size.height).min(visible.origin.y + visible.size.height);
+            [
+                origin.x - left,
+                right - (origin.x + size.width),
+                origin.y - bottom,
+                top - (origin.y + size.height),
+            ]
+            .into_iter()
+            .fold(f64::MIN, f64::max)
+        }
+
+        #[test]
+        fn settings_moves_left_when_the_main_window_is_at_the_right_screen_edge() {
+            let root = rect(1560.0, 200.0, ROOT.width, ROOT.height);
+            let visible = rect(0.0, 0.0, 1920.0, 1050.0);
+            assert_eq!(
+                opening_origin(root, SETTINGS, visible),
+                NSPoint::new(1416.0, 130.0)
+            );
+        }
+
+        #[test]
+        fn settings_stays_centered_over_a_main_window_it_cannot_cover() {
+            let root = rect(100.0, 100.0, 800.0, 900.0);
+            let visible = rect(0.0, 0.0, 1920.0, 1050.0);
+            assert_eq!(
+                opening_origin(root, SETTINGS, visible),
+                NSPoint::new(270.0, 200.0)
+            );
+        }
+
+        #[test]
+        fn settings_moves_vertically_when_the_screen_is_too_narrow_to_move_sideways() {
+            let root = rect(0.0, 200.0, ROOT.width, ROOT.height);
+            let visible = rect(0.0, 0.0, 470.0, 1200.0);
+            let origin = opening_origin(root, SETTINGS, visible);
+            assert!(uncovered_strip(root, origin, SETTINGS, visible) >= UNCOVERED_ROOT_STRIP);
+            assert!(origin.y >= 0.0 && origin.y + SETTINGS.height <= 1200.0);
+        }
+
+        #[test]
+        fn the_uncovered_strip_is_on_screen_when_the_main_window_hangs_off_the_edge() {
+            let root = rect(-200.0, 200.0, ROOT.width, ROOT.height);
+            let visible = rect(0.0, 0.0, 1920.0, 1050.0);
+            let origin = opening_origin(root, SETTINGS, visible);
+            assert!(uncovered_strip(root, origin, SETTINGS, visible) >= UNCOVERED_ROOT_STRIP);
+        }
+
+        #[test]
+        fn a_resized_settings_window_leaves_the_widest_strip_the_screen_allows() {
+            let root = rect(20.0, 200.0, ROOT.width, ROOT.height);
+            let visible = rect(0.0, 0.0, 1440.0, 860.0);
+            let size = NSSize::new(1400.0, 850.0);
+            assert_eq!(
+                opening_origin(root, size, visible),
+                NSPoint::new(40.0, 10.0)
+            );
+        }
+
+        #[test]
+        fn settings_keeps_its_title_bar_reachable_when_nothing_can_stay_uncovered() {
+            let root = rect(20.0, 20.0, ROOT.width, ROOT.height);
+            let visible = rect(0.0, 0.0, 800.0, 500.0);
+            let size = NSSize::new(900.0, 700.0);
+            assert_eq!(
+                opening_origin(root, size, visible),
+                NSPoint::new(0.0, -200.0)
+            );
+        }
+
+        #[test]
+        fn wherever_the_main_window_sits_settings_fits_and_leaves_a_strip_showing() {
+            let visible = rect(-300.0, 40.0, 1440.0, 860.0);
+            for column in 0..=44 {
+                for row in 0..=30 {
+                    let root = rect(
+                        visible.origin.x + f64::from(column) * 25.0,
+                        visible.origin.y + f64::from(row) * 10.0,
+                        ROOT.width,
+                        ROOT.height,
+                    );
+                    let origin = opening_origin(root, SETTINGS, visible);
+                    assert!(
+                        uncovered_strip(root, origin, SETTINGS, visible) >= UNCOVERED_ROOT_STRIP,
+                        "main window at {:?} was covered by Settings at {origin:?}",
+                        root.origin
+                    );
+                    assert!(origin.x >= visible.origin.x);
+                    assert!(origin.x + SETTINGS.width <= visible.origin.x + visible.size.width);
+                    assert!(origin.y >= visible.origin.y);
+                    assert!(origin.y + SETTINGS.height <= visible.origin.y + visible.size.height);
+                }
+            }
         }
     }
 
