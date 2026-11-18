@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/ryankegerreis/nightcap/compare/v0.1.2...v0.2.0) (2026-11-18)
+
+
+### Features
+
+* show when a new version is available ([4027b0f](https://github.com/ryankegerreis/nightcap/commit/4027b0f0cdb59236289291f4b99594d3a6bdaa4f))
+
 ## [0.1.2](https://github.com/ryankegerreis/nightcap/compare/v0.1.1...v0.1.2) (2026-11-17)
 
 
