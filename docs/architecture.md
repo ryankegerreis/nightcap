@@ -14,6 +14,7 @@ src/
                      running copy's window and exits
   settings.rs        Settings struct (serde), load/save JSON in the OS config dir
   fade.rs            pure fade math: level at time t for a fade plan (unit tested)
+  dimming.rs         screen dimming: picks native brightness or the overlay, carries the fade
   engine.rs          timer engine thread: state machine, drives fades, fires the end action
   platform/
     mod.rs           traits Brightness, Volume, Power + `fn backends() -> Backends`
@@ -63,18 +64,22 @@ src/
 window is hidden and egui is not repainting. It owns the platform backends.
 
 - Commands (via `std::sync::mpsc`): `Start { duration }`, `Pause`, `Resume`, `Cancel`,
-  `AddMinutes(u32)`, `UpdateSettings(Settings)`, `SystemWoke`, `Shutdown`.
+  `AddMinutes(u32)`, `UpdateSettings(Settings)`, `OverlayAvailable(bool)`, `SystemWoke`,
+  `Shutdown`.
 - Shared snapshot (`Arc<Mutex<Snapshot>>`): `state: Idle | Running | Paused | Finishing`,
   `total`, `remaining`, `ends_at` (wall clock, for "10:20 PM"), current brightness /
-  volume percent applied, `overlay_alpha: f32` (0 = no overlay), backend capability flags
-  (`brightness_supported`, `volume_supported`, `hibernate_supported`), last error string.
+  volume percent applied, `dimming: DimStatus` (the dimming method, level and overlay
+  alpha), backend capability flags (`volume_supported`, `hibernate_supported`), last error string.
   Hibernate availability is checked once at startup and includes permission to request it.
 - Ticks about every 250 ms. Uses `Instant` for remaining time; captures original
   brightness/volume when a fade begins and restores them on Cancel (if the restore
   setting is on), and after the end action when the machine wakes (detect a wall-clock
   gap over 5 s while Finishing (30 s while Running/Paused), plus native macOS workspace wake notifications).
-- If hardware brightness is unsupported, the dim fade drives `overlay_alpha` instead
-  (max alpha 0.9 at target 0 %, mapped linearly).
+- `dimming.rs` owns screen dimming. It prefers native brightness and otherwise drives
+  `overlay_alpha` (max alpha 0.9 at target 0 %, mapped linearly). The UI thread owns the
+  overlay's window and reports whether it can draw with `OverlayAvailable`. With neither
+  method working, `DimMethod::Unavailable` tells the UI to say so; the alpha keeps following
+  the fade, so an overlay that returns resumes at the level the fade has reached.
   The Linux UI requires a composited X11 display with RandR and X Shape support
   before mapping its unmanaged ARGB window. The root monitor is selected with
   RandR. Native Wayland reports overlay dimming as unavailable.

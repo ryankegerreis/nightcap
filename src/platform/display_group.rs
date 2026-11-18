@@ -560,7 +560,7 @@ mod tests {
         clock.advance_minutes(15);
         engine.tick();
         assert!(!written(&hardware).is_empty());
-        assert_eq!(engine.snapshot().overlay_alpha, 0.0);
+        assert_eq!(engine.snapshot().dimming.overlay_alpha, 0.0);
     }
 
     #[test]

@@ -34,6 +34,8 @@ pub struct NightcapApp {
     tray: Option<Tray>,
     updates: UpdateChecker,
     overlay: overlay::Overlay,
+    /// What the engine last heard about the overlay.
+    overlay_reported: Option<bool>,
     root_visible: bool,
     quitting: bool,
     close_request_handled: bool,
@@ -74,6 +76,7 @@ impl NightcapApp {
             tray,
             updates,
             overlay: overlay::Overlay::new(),
+            overlay_reported: None,
             root_visible: true,
             quitting: false,
             close_request_handled: false,
@@ -268,15 +271,16 @@ impl eframe::App for NightcapApp {
             });
             self.activations = Some(activations);
         }
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
-        self.overlay.follow_root(frame);
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-        let _ = frame;
-        #[cfg(target_os = "linux")]
-        self.overlay
-            .sync(ctx, snapshot.overlay_alpha, self.root_visible);
-        #[cfg(not(target_os = "linux"))]
-        self.overlay.sync(ctx, snapshot.overlay_alpha);
+        let overlay_available = self.overlay.update(
+            ctx,
+            frame,
+            snapshot.dimming.overlay_alpha,
+            self.root_visible,
+        );
+        if self.overlay_reported != Some(overlay_available) {
+            self.overlay_reported = Some(overlay_available);
+            self.send(Command::OverlayAvailable(overlay_available));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -300,15 +304,14 @@ impl eframe::App for NightcapApp {
         let updates = self.updates.status();
         let tokens = theme::tokens(ui.ctx());
         ui.painter().rect_filled(ui.max_rect(), 0.0, tokens.window);
-        #[cfg(not(target_os = "linux"))]
-        self.overlay.show(ui.ctx(), snapshot.overlay_alpha);
+        self.overlay.register(ui.ctx());
         if !self.root_visible {
             let outcome = settings_window::show(
                 ui.ctx(),
                 &mut self.settings_open,
                 &mut self.settings_opening_pending,
                 &mut self.settings,
-                settings_view(&snapshot, &updates, self.overlay.available()),
+                settings_view(&snapshot, &updates),
             );
             if self.settings_outcome(outcome) {
                 self.mark_settings_dirty();
@@ -339,7 +342,6 @@ impl eframe::App for NightcapApp {
                         duration_min: &mut self.duration_min,
                         custom: &mut self.custom_duration,
                         notice: notice.as_deref(),
-                        overlay_available: self.overlay.available(),
                     },
                 );
             });
@@ -374,7 +376,7 @@ impl eframe::App for NightcapApp {
             &mut self.settings_open,
             &mut self.settings_opening_pending,
             &mut self.settings,
-            settings_view(&snapshot, &updates, self.overlay.available()),
+            settings_view(&snapshot, &updates),
         );
         if self.settings_outcome(outcome) {
             settings_changed = true;
@@ -415,11 +417,9 @@ impl eframe::App for NightcapApp {
 fn settings_view<'a>(
     snapshot: &crate::engine::Snapshot,
     updates: &'a UpdateStatus,
-    overlay_available: bool,
 ) -> settings_window::SettingsView<'a> {
     settings_window::SettingsView {
-        brightness_supported: snapshot.brightness_supported,
-        overlay_available,
+        dimming: snapshot.dimming.method,
         volume_supported: snapshot.volume_supported,
         hibernate_supported: snapshot.hibernate_supported,
         updates,

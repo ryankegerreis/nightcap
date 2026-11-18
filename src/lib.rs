@@ -1,5 +1,6 @@
 //! Core timer, settings, and platform contracts for Nightcap.
 
+pub mod dimming;
 pub mod engine;
 pub mod fade;
 pub mod instance;

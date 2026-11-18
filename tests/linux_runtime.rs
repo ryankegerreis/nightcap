@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result, ensure};
 use nightcap::{
+    dimming::DimMethod,
     engine::{Clock, ClockReading, Command, Engine, TimerState},
     platform::{self, Backends, Power},
     settings::{EndAction, Settings},
@@ -194,7 +195,7 @@ fn native_discovery_and_worker_reads() -> Result<()> {
         let mut engine = Engine::new(Settings::default(), backends, TestClock::new());
         let snapshot = engine.snapshot();
         ensure!(snapshot.state == TimerState::Idle);
-        ensure!(snapshot.brightness_supported == brightness);
+        ensure!((snapshot.dimming.method == DimMethod::Native) == brightness);
         ensure!(snapshot.volume_supported == volume);
         ensure!(snapshot.hibernate_supported == hibernate);
         ensure!(snapshot.last_error.is_none());
@@ -376,11 +377,11 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
         tolerances,
     )?;
     if original.brightness.is_none() {
-        ensure!((faded.overlay_alpha - 0.225).abs() < 0.001);
+        ensure!((faded.dimming.overlay_alpha - 0.225).abs() < 0.001);
     }
     println!(
         "faded levels: {lowered:?}; overlay alpha={}",
-        faded.overlay_alpha
+        faded.dimming.overlay_alpha
     );
     engine.command(Command::Pause);
     clock.advance(120);
@@ -395,7 +396,7 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
     ensure!(engine.snapshot().remaining == Duration::from_secs(1440));
     engine.command(Command::Cancel);
     ensure!(engine.snapshot().state == TimerState::Idle);
-    ensure!(engine.snapshot().overlay_alpha == 0.0);
+    ensure!(engine.snapshot().dimming.overlay_alpha == 0.0);
     Levels::observe(&mut observer)?.assert_matches(original, tolerances)?;
     ensure!(actions.lock().unwrap().is_empty());
 
@@ -429,7 +430,7 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
         )?;
         engine.command(Command::SystemWoke);
         ensure!(engine.snapshot().state == TimerState::Idle);
-        ensure!(engine.snapshot().overlay_alpha == 0.0);
+        ensure!(engine.snapshot().dimming.overlay_alpha == 0.0);
         Levels::observe(&mut observer)?.assert_matches(original, tolerances)?;
     }
 
@@ -442,7 +443,7 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
     engine.tick();
     let retained = engine.snapshot();
     engine.command(Command::Cancel);
-    ensure!(engine.snapshot().overlay_alpha == retained.overlay_alpha);
+    ensure!(engine.snapshot().dimming.overlay_alpha == retained.dimming.overlay_alpha);
     Levels::observe(&mut observer)?.assert_matches(lowered, tolerances)?;
     restore.restore()?;
 
@@ -455,7 +456,7 @@ fn native_fades_controls_completion_and_restoration() -> Result<()> {
     engine.tick();
     ensure!(!engine.command(Command::Shutdown));
     ensure!(engine.snapshot().state == TimerState::Idle);
-    ensure!(engine.snapshot().overlay_alpha == 0.0);
+    ensure!(engine.snapshot().dimming.overlay_alpha == 0.0);
     ensure!(engine.snapshot().last_error.is_none());
     Levels::observe(&mut observer)?.assert_matches(original, tolerances)?;
     println!(

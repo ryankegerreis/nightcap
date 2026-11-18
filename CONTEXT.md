@@ -23,3 +23,11 @@ _Avoid_: Monitor, screen, panel
 **Display group**:
 All captured displays of one fade, faded and restored together while each keeps its own proportion.
 _Avoid_: Display set, monitor list
+
+**Dimming method**:
+How the screen is dimmed right now: native brightness, the overlay, or unavailable when neither works.
+_Avoid_: Dim mode, backend
+
+**Overlay**:
+A click-through black window over the screen that dims it when native brightness cannot.
+_Avoid_: Dimmer, shade

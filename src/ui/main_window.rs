@@ -6,6 +6,7 @@ use chrono::Timelike;
 
 use eframe::egui::{self, Align2, FontId, Id, Margin, Pos2, Rect, Sense, Vec2, pos2, vec2};
 
+use crate::dimming::DimMethod;
 use crate::engine::{Command, Snapshot, TimerState};
 use crate::settings::{EndAction, FadeSettings, Settings};
 
@@ -25,7 +26,6 @@ pub struct MainView<'a> {
     pub duration_min: &'a mut u32,
     pub custom: &'a mut bool,
     pub notice: Option<&'a str>,
-    pub overlay_available: bool,
 }
 
 pub struct MainOutcome {
@@ -42,7 +42,6 @@ pub fn show(ui: &mut egui::Ui, view: MainView<'_>) -> MainOutcome {
         duration_min,
         custom,
         notice,
-        overlay_available,
     } = view;
     let mut outcome = MainOutcome {
         open_settings: false,
@@ -84,7 +83,7 @@ pub fn show(ui: &mut egui::Ui, view: MainView<'_>) -> MainOutcome {
                         idle,
                         &mut outcome,
                     );
-                    notes(ui, snapshot, overlay_available);
+                    notes(ui, snapshot);
                 });
         });
 
@@ -266,7 +265,7 @@ fn options_group(
             );
         });
         group.row(true, |ui| {
-            let subtitle = fade_caption(&settings.dim, snapshot, snapshot.brightness_percent);
+            let subtitle = dim_caption(&settings.dim, snapshot);
             widgets::split_stacked(
                 ui,
                 |ui| widgets::title_and_caption(ui, "Dim screen", &subtitle),
@@ -308,10 +307,10 @@ fn options_group(
     });
 }
 
-fn notes(ui: &mut egui::Ui, snapshot: &Snapshot, overlay_available: bool) {
+fn notes(ui: &mut egui::Ui, snapshot: &Snapshot) {
     let mut lines = Vec::new();
-    if !snapshot.brightness_supported {
-        lines.push(super::overlay::fallback_message(overlay_available).to_owned());
+    if let Some(message) = super::overlay::fallback_message(snapshot.dimming.method) {
+        lines.push(message.to_owned());
     }
     if !snapshot.volume_supported {
         lines.push("Volume control isn’t available on this device.".to_owned());
@@ -421,6 +420,14 @@ pub fn format_clock(time: chrono::DateTime<chrono::Local>) -> String {
     )
 }
 
+/// A screen that cannot dim says so rather than describing a fade it won't show.
+fn dim_caption(fade: &FadeSettings, snapshot: &Snapshot) -> String {
+    if fade.enabled && snapshot.dimming.method == DimMethod::Unavailable {
+        return "Unavailable".to_owned();
+    }
+    fade_caption(fade, snapshot, snapshot.dimming.percent)
+}
+
 pub fn fade_caption(fade: &FadeSettings, snapshot: &Snapshot, current: Option<f32>) -> String {
     if !fade.enabled {
         return "Off".to_owned();
@@ -520,7 +527,6 @@ mod tests {
                         duration_min: duration,
                         custom: &mut custom,
                         notice: None,
-                        overlay_available: true,
                     },
                 ));
             },
@@ -543,7 +549,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(Default::default(), |ui| {
             theme::install(ui.ctx());
-            notes(ui, &Snapshot::default(), false);
+            notes(ui, &Snapshot::default());
         });
         output.textures_delta.clear();
         assert!(text_position(&output, "Screen dimming is unavailable on this desktop.").is_some());
@@ -715,7 +721,6 @@ mod tests {
                         duration_min: &mut duration,
                         custom: &mut custom,
                         notice: None,
-                        overlay_available: true,
                     },
                 );
             },
@@ -783,6 +788,25 @@ mod tests {
             "Now 42%, going to 10%"
         );
     }
+
+    #[test]
+    fn dim_row_says_when_the_screen_cannot_dim() {
+        let fade = FadeSettings::default();
+        let mut snapshot = Snapshot {
+            state: TimerState::Running,
+            ..Snapshot::default()
+        };
+        snapshot.dimming.percent = Some(70.0);
+        assert_eq!(dim_caption(&fade, &snapshot), "Unavailable");
+        let off = FadeSettings {
+            enabled: false,
+            ..fade
+        };
+        assert_eq!(dim_caption(&off, &snapshot), "Off");
+        snapshot.dimming.method = DimMethod::Overlay;
+        assert_eq!(dim_caption(&fade, &snapshot), "Now 70%, going to 10%");
+    }
+
     #[test]
     fn active_ring_uses_the_engine_total_for_tray_timers_and_extensions() {
         let mut snapshot = Snapshot {

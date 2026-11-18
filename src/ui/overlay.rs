@@ -2,12 +2,11 @@
 //!
 //! The integrator must enable transparency on NativeOptions' root viewport and return
 //! `[0.0; 4]` from App::clear_color (all viewports share that clear color). Paint the
-//! normal windows' backgrounds explicitly. Call `show` on every root UI pass.
-//! Register the hidden child on the first root UI pass, before the root can close.
-//! Logic-only updates can then reveal it without revealing or focusing the root.
+//! normal windows' backgrounds explicitly. Call `update` on every logic pass and
+//! `register` on every root UI pass. Registering the hidden child before the root can
+//! close lets logic-only updates reveal it without revealing or focusing the root.
 //!
 //! Windows uses a native layered window instead of a viewport (see `dimmer`).
-//! There, call `follow_root` before `sync` so the dimming covers the root's monitor.
 //! Linux uses a native, unmanaged X11 window when compositing and input shaping
 //! are available.
 
@@ -17,6 +16,7 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 
+use crate::dimming::DimMethod;
 use eframe::egui::Context;
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 use eframe::egui::{
@@ -70,9 +70,54 @@ impl Overlay {
         }
     }
 
+    /// Applies `alpha` over the root's monitor, returning whether the overlay can dim.
+    /// Keeps dimming while the root is hidden, when only logic passes run.
+    pub fn update(
+        &mut self,
+        ctx: &Context,
+        root: &eframe::Frame,
+        alpha: f32,
+        root_visible: bool,
+    ) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = root_visible;
+            self.follow_root(root);
+            let alpha = normalized(alpha);
+            let available = self.dimmer.apply(alpha);
+            // A paused timer with a hidden root has nothing else to wake this pass.
+            if let Some(delay) = show_retry_delay(alpha, available) {
+                ctx.request_repaint_after(delay);
+            }
+            available
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.follow_root(root);
+            self.sync(ctx, alpha, root_visible);
+            self.x11_available
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (root, root_visible);
+            self.sync(ctx, alpha);
+            true
+        }
+    }
+
+    /// Call from every root UI pass. Zero alpha keeps the child hidden, ready for a
+    /// fade started from the tray while the root is hidden. macOS uses a separate
+    /// viewport without entering a fullscreen Space.
+    pub fn register(&mut self, ctx: &Context) {
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        self.show_viewport(ctx);
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let _ = ctx;
+    }
+
     /// The dimming covers the monitor that holds this window, hidden or not.
     #[cfg(target_os = "windows")]
-    pub fn follow_root(&mut self, root: &impl raw_window_handle::HasWindowHandle) {
+    fn follow_root(&mut self, root: &impl raw_window_handle::HasWindowHandle) {
         use raw_window_handle::RawWindowHandle;
         if let Ok(RawWindowHandle::Win32(handle)) = root.window_handle().map(|h| h.as_raw()) {
             self.dimmer.follow(handle.hwnd.get());
@@ -80,7 +125,7 @@ impl Overlay {
     }
 
     #[cfg(target_os = "linux")]
-    pub fn follow_root(&mut self, root: &impl raw_window_handle::HasWindowHandle) {
+    fn follow_root(&mut self, root: &impl raw_window_handle::HasWindowHandle) {
         use raw_window_handle::RawWindowHandle;
         let anchor = root
             .window_handle()
@@ -96,24 +141,6 @@ impl Overlay {
         self.x11_anchor = anchor;
         self.x11_layer = None;
         self.x11_retry = None;
-    }
-
-    pub fn available(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        return self.x11_available;
-        #[cfg(not(target_os = "linux"))]
-        true
-    }
-
-    /// Call from every root App::ui pass. Zero alpha keeps the child hidden, ready
-    /// for a fade started from the tray while the root is hidden.
-    /// Covers the root's monitor. macOS uses a separate viewport without entering
-    /// a fullscreen Space.
-    #[cfg(not(target_os = "linux"))]
-    pub fn show(&mut self, ctx: &Context, alpha: f32) {
-        self.sync(ctx, alpha);
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-        self.show_viewport(ctx);
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -158,7 +185,7 @@ impl Overlay {
 
     /// Logic-only updates keep an existing child alive when the root is hidden.
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    pub fn sync(&mut self, ctx: &Context, alpha: f32) {
+    fn sync(&mut self, ctx: &Context, alpha: f32) {
         let alpha = normalized(alpha);
         let previous = self.alpha.swap(alpha.to_bits(), Ordering::Relaxed);
         if self.registered && previous != alpha.to_bits() {
@@ -168,14 +195,8 @@ impl Overlay {
         }
     }
 
-    /// Logic-only updates keep dimming while the root is hidden.
-    #[cfg(target_os = "windows")]
-    pub fn sync(&mut self, _ctx: &Context, alpha: f32) {
-        self.dimmer.apply(normalized(alpha));
-    }
-
     #[cfg(target_os = "linux")]
-    pub fn sync(&mut self, ctx: &Context, alpha: f32, root_visible: bool) {
+    fn sync(&mut self, ctx: &Context, alpha: f32, root_visible: bool) {
         use std::time::{Duration, Instant};
 
         let alpha = normalized(alpha);
@@ -206,8 +227,9 @@ impl Overlay {
                     }
                 }
             }
-            if alpha > 0.0 || (root_visible && !available) {
+            if alpha > 0.0 || root_visible {
                 // Poll faster during a fade, including when the main window is hidden.
+                // An idle visible window still notices a compositor that comes or goes.
                 let poll_interval = if alpha > 0.0 {
                     Duration::from_millis(250)
                 } else {
@@ -245,11 +267,36 @@ fn x11_retry_delay_doubles_until_it_reaches_the_cap() {
     assert_eq!(x11_retry_delay(None), Duration::from_secs(2));
 }
 
-pub(super) fn fallback_message(overlay_available: bool) -> &'static str {
-    if overlay_available {
-        "This display doesn’t support brightness control. Nightcap will dim it with an overlay instead."
-    } else {
-        "Screen dimming is unavailable on this desktop."
+/// The Windows overlay's opacity for an alpha within `0.0..=1.0`.
+#[cfg(any(target_os = "windows", test))]
+fn opacity(alpha: f32) -> u8 {
+    (alpha * 255.0).round() as u8
+}
+
+/// When to try again to show a Windows overlay that dimming still needs.
+#[cfg(any(target_os = "windows", test))]
+fn show_retry_delay(alpha: f32, available: bool) -> Option<std::time::Duration> {
+    (opacity(alpha) > 0 && !available).then_some(std::time::Duration::from_secs(2))
+}
+
+#[cfg(test)]
+#[test]
+fn a_failed_overlay_retries_only_while_dimming_still_needs_it() {
+    use std::time::Duration;
+    assert_eq!(show_retry_delay(0.5, false), Some(Duration::from_secs(2)));
+    assert_eq!(show_retry_delay(0.5, true), None, "recovered");
+    assert_eq!(show_retry_delay(0.0, false), None, "nothing to dim");
+    assert_eq!(show_retry_delay(0.001, false), None, "rounds to hidden");
+}
+
+/// Explains a screen that cannot dim through its own brightness.
+pub(super) fn fallback_message(method: DimMethod) -> Option<&'static str> {
+    match method {
+        DimMethod::Native => None,
+        DimMethod::Overlay => Some(
+            "This display doesn’t support brightness control. Nightcap will dim it with an overlay instead.",
+        ),
+        DimMethod::Unavailable => Some("Screen dimming is unavailable on this desktop."),
     }
 }
 
@@ -324,8 +371,9 @@ fn monitor_builder(ctx: &Context) -> ViewportBuilder {
 /// and moving it afterwards leaves a caption strip over a transparent surface.
 #[cfg(target_os = "windows")]
 mod dimmer {
-    use std::{marker::PhantomData, sync::Once};
+    use std::{marker::PhantomData, sync::Mutex};
 
+    use anyhow::{Context as _, ensure};
     use windows::{
         Win32::{
             Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
@@ -356,6 +404,8 @@ mod dimmer {
         root: Option<isize>,
         /// Applied opacity; zero while hidden.
         opacity: u8,
+        /// The last attempt to show the window failed.
+        failed: bool,
         _thread_bound: PhantomData<*const ()>,
     }
 
@@ -406,8 +456,10 @@ mod dimmer {
         // SAFETY: plain Win32 calls; the class's black brush paints the whole client.
         unsafe {
             let instance = HINSTANCE(GetModuleHandleW(None)?.0);
-            static REGISTER: Once = Once::new();
-            REGISTER.call_once(|| {
+            // Only a success is remembered, so a later retry can register the class.
+            static REGISTERED: Mutex<bool> = Mutex::new(false);
+            let mut registered = REGISTERED.lock().unwrap_or_else(|error| error.into_inner());
+            if !*registered {
                 let class = WNDCLASSEXW {
                     cbSize: size_of::<WNDCLASSEXW>() as u32,
                     lpfnWndProc: Some(procedure),
@@ -417,12 +469,11 @@ mod dimmer {
                     ..Default::default()
                 };
                 if RegisterClassExW(&class) == 0 {
-                    log::warn!(
-                        "Registering the dimming overlay class failed: {}",
-                        windows::core::Error::from_thread()
-                    );
+                    return Err(windows::core::Error::from_thread());
                 }
-            });
+                *registered = true;
+            }
+            drop(registered);
             // Transparent + layered passes input through; no-activate keeps focus put.
             CreateWindowExW(
                 WS_EX_LAYERED
@@ -461,35 +512,52 @@ mod dimmer {
             }
         }
 
-        /// `alpha` is already within `0.0..=1.0`. Unchanged values cost three cheap
-        /// queries. Bounds are compared with the window's actual rectangle, since
-        /// display changes also move it from the window procedure.
-        pub(super) fn apply(&mut self, alpha: f32) {
-            let opacity = (alpha * 255.0).round() as u8;
+        /// `alpha` is already within `0.0..=1.0`. Returns whether the overlay can dim:
+        /// a failure stays reported until a later non-zero alpha shows the window.
+        pub(super) fn apply(&mut self, alpha: f32) -> bool {
+            let opacity = super::opacity(alpha);
             if opacity == 0 {
                 self.hide();
-                return;
+                return !self.failed;
             }
-            let Some(window) = self.window() else {
-                return;
-            };
+            match self.show(opacity) {
+                Ok(()) => self.failed = false,
+                Err(error) => {
+                    // Retries repeat until it works, so log only the first failure.
+                    if !self.failed {
+                        log::warn!("Showing the dimming overlay failed: {error:#}");
+                    }
+                    self.failed = true;
+                }
+            }
+            !self.failed
+        }
+
+        /// Unchanged values cost three cheap queries. Bounds are compared with the
+        /// window's actual rectangle, since display changes also move it from the
+        /// window procedure.
+        fn show(&mut self, opacity: u8) -> anyhow::Result<()> {
+            let window = self.window().context("creating its window")?;
             let bounds = self.monitor_bounds();
             // SAFETY: `window` is this dimmer's live window, on its creating thread.
             unsafe {
-                if opacity != self.opacity
-                    && let Err(error) =
-                        SetLayeredWindowAttributes(window, COLORREF(0), opacity, LWA_ALPHA)
-                {
-                    log::warn!("Setting the dimming opacity failed: {error}");
-                    return;
+                // A failed attempt may have left a different opacity on the window.
+                if opacity != self.opacity || self.failed {
+                    SetLayeredWindowAttributes(window, COLORREF(0), opacity, LWA_ALPHA)
+                        .context("setting its opacity")?;
                 }
                 let mut current = RECT::default();
                 let moved = GetWindowRect(window, &mut current).is_err() || bounds != Some(current);
+                // A shown window stays useful if its monitor briefly cannot be read.
+                ensure!(
+                    self.opacity != 0 || bounds.is_some(),
+                    "reading its monitor's bounds"
+                );
                 if (self.opacity == 0 || moved)
                     && let Some(rect) = bounds
                 {
                     // Cover the root's monitor above other topmost windows, without focus.
-                    if let Err(error) = SetWindowPos(
+                    SetWindowPos(
                         window,
                         Some(HWND_TOPMOST),
                         rect.left,
@@ -497,13 +565,12 @@ mod dimmer {
                         rect.right - rect.left,
                         rect.bottom - rect.top,
                         SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                    ) {
-                        log::warn!("Showing the dimming overlay failed: {error}");
-                        return;
-                    }
+                    )
+                    .context("placing it over the monitor")?;
                 }
             }
             self.opacity = opacity;
+            Ok(())
         }
 
         fn hide(&mut self) {
@@ -526,17 +593,14 @@ mod dimmer {
             })
         }
 
-        fn window(&mut self) -> Option<HWND> {
-            if self.window.is_none() {
-                match create() {
-                    Ok(window) => {
-                        self.window = Some(window.0 as isize);
-                        self.share_root();
-                    }
-                    Err(error) => log::warn!("Creating the dimming overlay failed: {error}"),
-                }
+        fn window(&mut self) -> windows::core::Result<HWND> {
+            if let Some(window) = self.window {
+                return Ok(HWND(window as _));
             }
-            self.window.map(|window| HWND(window as _))
+            let window = create()?;
+            self.window = Some(window.0 as isize);
+            self.share_root();
+            Ok(window)
         }
     }
 
@@ -670,13 +734,20 @@ fn install_macos_focus_guard() {
 mod tests {
     use super::*;
 
+    fn root_pass(ctx: &Context, overlay: &mut Overlay, alpha: f32) -> egui::FullOutput {
+        ctx.run_ui(Default::default(), |ui| {
+            overlay.sync(ui.ctx(), alpha);
+            overlay.register(ui.ctx());
+        })
+    }
+
     #[test]
     fn zero_or_invalid_alpha_registers_a_hidden_passive_viewport() {
         let ctx = Context::default();
         ctx.set_embed_viewports(false);
         let mut overlay = Overlay::new();
         for alpha in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            let mut output = ctx.run_ui(Default::default(), |ui| overlay.show(ui.ctx(), alpha));
+            let mut output = root_pass(&ctx, &mut overlay, alpha);
             output.textures_delta.clear();
             assert_eq!(
                 output.viewport_output[&overlay.id].builder.visible,
@@ -690,7 +761,7 @@ mod tests {
         let ctx = Context::default();
         ctx.set_embed_viewports(false);
         let mut overlay = Overlay::new();
-        let mut output = ctx.run_ui(Default::default(), |ui| overlay.show(ui.ctx(), 0.6));
+        let mut output = root_pass(&ctx, &mut overlay, 0.6);
         output.textures_delta.clear();
         let child = &output.viewport_output[&overlay.id];
         assert!(child.class == ViewportClass::Deferred);
@@ -700,7 +771,7 @@ mod tests {
         assert_eq!(child.builder.mouse_passthrough, Some(true));
         assert_eq!(child.builder.taskbar, Some(false));
         assert_eq!(child.builder.window_level, Some(WindowLevel::AlwaysOnTop));
-        let mut output = ctx.run_ui(Default::default(), |ui| overlay.show(ui.ctx(), 0.0));
+        let mut output = root_pass(&ctx, &mut overlay, 0.0);
         output.textures_delta.clear();
         assert_eq!(
             output.viewport_output[&overlay.id].builder.visible,
@@ -712,7 +783,7 @@ mod tests {
         let ctx = Context::default();
         ctx.set_embed_viewports(false);
         let mut overlay = Overlay::new();
-        let mut output = ctx.run_ui(Default::default(), |ui| overlay.show(ui.ctx(), 0.0));
+        let mut output = root_pass(&ctx, &mut overlay, 0.0);
         output.textures_delta.clear();
         for (alpha, visible) in [(0.6, true), (0.0, false)] {
             let output = ctx.run_logic(&Default::default(), |ctx| overlay.sync(ctx, alpha));

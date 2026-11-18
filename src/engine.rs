@@ -12,8 +12,9 @@ use std::{
 };
 
 use crate::{
-    fade::FadePlan,
-    platform::{Backends, Disconnected, Partial},
+    dimming::{DimStatus, ScreenDimming},
+    fade::{FadePlan, FadeTrack, valid_level},
+    platform::{Backends, Disconnected},
     settings::Settings,
 };
 
@@ -104,12 +105,16 @@ pub enum TimerState {
 
 #[derive(Clone, Debug)]
 pub enum Command {
-    Start { duration: Duration },
+    Start {
+        duration: Duration,
+    },
     Pause,
     Resume,
     Cancel,
     AddMinutes(u32),
     UpdateSettings(Settings),
+    /// Whether the UI can currently draw the dimming overlay.
+    OverlayAvailable(bool),
     SystemWoke,
     Shutdown,
 }
@@ -121,10 +126,8 @@ pub struct Snapshot {
     pub total: Duration,
     pub remaining: Duration,
     pub ends_at: Option<chrono::DateTime<chrono::Local>>,
-    pub brightness_percent: Option<f32>,
+    pub dimming: DimStatus,
     pub volume_percent: Option<f32>,
-    pub overlay_alpha: f32,
-    pub brightness_supported: bool,
     pub volume_supported: bool,
     pub hibernate_supported: bool,
     pub last_error: Option<String>,
@@ -201,33 +204,6 @@ impl Drop for HandleInner {
     }
 }
 
-#[derive(Default)]
-struct FadeTrack {
-    original: Option<f32>,
-    from: Option<f32>,
-    last: Option<f32>,
-    overlay: bool,
-    overlay_reference: Option<f32>,
-    unavailable: bool,
-}
-
-impl FadeTrack {
-    /// A kept original means its restore failed, possibly for only some displays.
-    /// The next fade starts from that original rather than the last faded level.
-    fn reset(&self, keep_original: bool) -> Self {
-        Self {
-            original: self.original.filter(|_| keep_original),
-            ..Self::default()
-        }
-    }
-
-    fn level(&self, plan: FadePlan, elapsed: Duration, target: u8) -> f32 {
-        let from = self.from.unwrap_or(1.0);
-        plan.level_at(elapsed, from, f32::from(target) / 100.0)
-            .min(self.last.unwrap_or(from))
-    }
-}
-
 pub struct Engine<C: Clock = SystemClock> {
     clock: C,
     backends: Backends,
@@ -237,8 +213,9 @@ pub struct Engine<C: Clock = SystemClock> {
     window_visible: Arc<AtomicBool>,
     repaint: Box<dyn Fn() + Send>,
     last_time: ClockReading,
-    brightness: FadeTrack,
+    dimming: ScreenDimming,
     volume: FadeTrack,
+    volume_unavailable: bool,
     restore_after: Option<SystemTime>,
     restore_failures: u32,
 }
@@ -311,10 +288,11 @@ impl<C: Clock + 'static> Engine<C> {
 }
 
 impl<C: Clock> Engine<C> {
-    pub fn new(mut settings: Settings, backends: Backends, clock: C) -> Self {
+    pub fn new(mut settings: Settings, mut backends: Backends, clock: C) -> Self {
         settings.apply_hibernate_availability(backends.hibernate_supported);
+        let dimming = ScreenDimming::new(backends.brightness.take());
         let snapshot = Snapshot {
-            brightness_supported: backends.brightness.is_some(),
+            dimming: dimming.status(),
             volume_supported: backends.volume.is_some(),
             hibernate_supported: backends.hibernate_supported,
             ..Snapshot::default()
@@ -329,8 +307,9 @@ impl<C: Clock> Engine<C> {
             snapshot,
             repaint: Box::new(|| {}),
             last_time,
-            brightness: FadeTrack::default(),
+            dimming,
             volume: FadeTrack::default(),
+            volume_unavailable: false,
             restore_after: None,
             restore_failures: 0,
         }
@@ -349,7 +328,7 @@ impl<C: Clock> Engine<C> {
                 self.snapshot.total = duration;
                 self.snapshot.remaining = duration;
                 self.snapshot.last_error = None;
-                self.snapshot.brightness_supported = self.backends.brightness.is_some();
+                self.dimming.begin_timer();
                 self.snapshot.volume_supported = self.backends.volume.is_some();
             }
             Command::Pause
@@ -378,6 +357,9 @@ impl<C: Clock> Engine<C> {
             Command::UpdateSettings(mut settings) => {
                 settings.apply_hibernate_availability(self.snapshot.hibernate_supported);
                 self.settings = settings;
+            }
+            Command::OverlayAvailable(available) => {
+                self.dimming.set_overlay_available(available);
             }
             Command::Shutdown => {
                 self.cancel();
@@ -462,69 +444,17 @@ impl<C: Clock> Engine<C> {
         let elapsed = self.snapshot.total.saturating_sub(self.snapshot.remaining);
         let dim = self.settings.dim;
         let dim_plan = FadePlan::new(self.snapshot.total, &dim);
-        if dim.enabled && elapsed >= dim_plan.start_offset {
-            self.apply_brightness(dim_plan, elapsed, dim.target_percent);
+        if dim.enabled
+            && elapsed >= dim_plan.start_offset
+            && let Err(error) = self.dimming.fade(dim_plan, elapsed, dim.target_percent)
+        {
+            self.report(error);
         }
         let volume = self.settings.volume;
         let volume_plan = FadePlan::new(self.snapshot.total, &volume);
-        if volume.enabled && elapsed >= volume_plan.start_offset && !self.volume.unavailable {
+        if volume.enabled && elapsed >= volume_plan.start_offset && !self.volume_unavailable {
             self.apply_volume(volume_plan, elapsed, volume.target_percent);
         }
-    }
-
-    fn apply_brightness(&mut self, plan: FadePlan, elapsed: Duration, target: u8) {
-        if self.brightness.from.is_none() {
-            let original = if let Some(level) = self.brightness.original {
-                Some(Ok(level))
-            } else {
-                self.backends
-                    .brightness
-                    .as_mut()
-                    .map(|backend| backend.get().and_then(valid_level))
-            };
-            match original {
-                Some(Ok(level)) => {
-                    self.brightness.original.get_or_insert(level);
-                    self.brightness.from = Some(level);
-                    self.brightness.last = Some(level);
-                    self.snapshot.brightness_percent = Some(level * 100.0);
-                }
-                result => {
-                    if let Some(Err(error)) = result {
-                        self.report_error("reading brightness", error);
-                    }
-                    self.brightness.overlay = true;
-                    self.brightness.from = Some(1.0 - self.snapshot.overlay_alpha / 0.9);
-                    self.snapshot.brightness_supported = false;
-                }
-            }
-        }
-        let level = self.brightness.level(plan, elapsed, target);
-        if !self.brightness.overlay
-            && self.brightness.last != Some(level)
-            && let Some(backend) = self.backends.brightness.as_mut()
-            && let Err(error) = backend.set(level)
-        {
-            // Displays that took the level keep fading natively.
-            let partial = error.is::<Partial>();
-            self.report_error("setting brightness", error);
-            if !partial {
-                self.snapshot.brightness_supported = false;
-                self.brightness.overlay = true;
-                self.brightness.overlay_reference = self.brightness.last;
-            }
-        }
-        if self.brightness.overlay {
-            let reference = self.brightness.overlay_reference.unwrap_or(1.0);
-            let relative = if reference > 0.0 {
-                level / reference
-            } else {
-                1.0
-            };
-            self.snapshot.overlay_alpha = 0.9 * (1.0 - relative.clamp(0.0, 1.0));
-        }
-        self.brightness.last = Some(level);
-        self.snapshot.brightness_percent = Some(level * 100.0);
     }
 
     fn apply_volume(&mut self, plan: FadePlan, elapsed: Duration, target: u8) {
@@ -548,7 +478,7 @@ impl<C: Clock> Engine<C> {
                     if let Some(Err(error)) = result {
                         self.report_error("reading volume", error);
                     }
-                    self.volume.unavailable = true;
+                    self.volume_unavailable = true;
                     self.snapshot.volume_supported = false;
                     return;
                 }
@@ -560,7 +490,7 @@ impl<C: Clock> Engine<C> {
             && let Err(error) = backend.set(level)
         {
             self.report_error("setting volume", error);
-            self.volume.unavailable = true;
+            self.volume_unavailable = true;
             self.snapshot.volume_supported = false;
             return;
         }
@@ -569,22 +499,8 @@ impl<C: Clock> Engine<C> {
     }
 
     fn restore(&mut self) {
-        if let Some(level) = self.brightness.original
-            && let Some(backend) = self.backends.brightness.as_mut()
-        {
-            match backend.restore(level) {
-                Ok(()) => {
-                    self.brightness.original = None;
-                    self.snapshot.brightness_percent = Some(level * 100.0);
-                }
-                Err(error) => {
-                    // A display that is gone has nothing left to restore.
-                    if error.is::<Disconnected>() {
-                        self.brightness.original = None;
-                    }
-                    self.report_error("restoring brightness", error);
-                }
-            }
+        if let Err(error) = self.dimming.restore() {
+            self.report(error);
         }
         if let Some(level) = self.volume.original
             && let Some(backend) = self.backends.volume.as_mut()
@@ -603,7 +519,7 @@ impl<C: Clock> Engine<C> {
                 }
             }
         }
-        let pending = self.brightness.original.is_some() || self.volume.original.is_some();
+        let pending = self.dimming.restore_pending() || self.volume.original.is_some();
         self.restore_failures = if pending {
             self.restore_failures + 1
         } else {
@@ -612,16 +528,12 @@ impl<C: Clock> Engine<C> {
         if self.restore_failures >= RESTORE_ATTEMPTS {
             // Stop polling for a device that never recovers, and let later fades recapture.
             log::warn!("giving up restoring levels after {RESTORE_ATTEMPTS} attempts");
-            self.brightness.original = None;
+            self.dimming.abandon_restore();
             self.volume.original = None;
             self.restore_failures = 0;
         }
-        self.restore_after = (self.brightness.original.is_some() || self.volume.original.is_some())
+        self.restore_after = (self.dimming.restore_pending() || self.volume.original.is_some())
             .then(|| self.last_time.wall + RESTORE_RETRY);
-        self.snapshot.overlay_alpha = 0.0;
-        if self.brightness.overlay {
-            self.snapshot.brightness_percent = None;
-        }
     }
 
     fn cancel(&mut self) {
@@ -629,8 +541,9 @@ impl<C: Clock> Engine<C> {
             self.restore();
         }
         let keep = self.settings.restore_on_cancel_or_wake;
-        self.brightness = self.brightness.reset(keep);
+        self.dimming.end_fade(keep);
         self.volume = self.volume.reset(keep);
+        self.volume_unavailable = false;
         if !keep {
             self.restore_after = None;
         }
@@ -640,13 +553,18 @@ impl<C: Clock> Engine<C> {
         self.snapshot.ends_at = None;
     }
 
-    fn report_error(&mut self, context: &str, error: anyhow::Error) {
-        let message = format!("{context}: {error:#}");
+    fn report_error(&mut self, context: &'static str, error: anyhow::Error) {
+        self.report(error.context(context));
+    }
+
+    fn report(&mut self, error: anyhow::Error) {
+        let message = format!("{error:#}");
         log::warn!("{message}");
         self.snapshot.last_error = Some(message);
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
+        self.snapshot.dimming = self.dimming.status();
         let mut shared = self
             .shared
             .lock()
@@ -669,19 +587,16 @@ impl<C: Clock> Engine<C> {
         }
         previous.state != self.snapshot.state
             || previous.menu_seconds() != self.snapshot.menu_seconds()
-            || previous.overlay_alpha.to_bits() != self.snapshot.overlay_alpha.to_bits()
+            || previous.dimming.overlay_alpha.to_bits()
+                != self.snapshot.dimming.overlay_alpha.to_bits()
     }
-}
-
-fn valid_level(level: f32) -> anyhow::Result<f32> {
-    anyhow::ensure!(level.is_finite(), "backend returned a non-finite level");
-    Ok(level.clamp(0.0, 1.0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        dimming::DimMethod,
         platform::fallback::{MockBrightness, MockPower, MockVolume},
         settings::{EndAction, FadeSettings},
     };
@@ -955,14 +870,14 @@ mod tests {
         let mut h = Harness::new(preferences(), false);
         h.start();
         h.advance(60);
-        close(h.engine.snapshot().overlay_alpha, 0.0);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.0);
         h.advance(30);
-        close(h.engine.snapshot().overlay_alpha, 0.36);
-        assert!(!h.engine.snapshot().brightness_supported);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.36);
+        assert_eq!(h.engine.snapshot().dimming.method, DimMethod::Overlay);
         h.advance(30);
-        close(h.engine.snapshot().overlay_alpha, 0.72);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.72);
         h.engine.command(Command::Cancel);
-        close(h.engine.snapshot().overlay_alpha, 0.0);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.0);
     }
 
     #[test]
@@ -971,10 +886,20 @@ mod tests {
         h.brightness.state.lock().unwrap().fail_get = true;
         h.start();
         h.advance(90);
-        close(h.engine.snapshot().overlay_alpha, 0.36);
-        assert!(!h.engine.snapshot().brightness_supported);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.36);
+        assert_eq!(h.engine.snapshot().dimming.method, DimMethod::Overlay);
         assert!(h.engine.snapshot().last_error.is_some());
         assert_eq!(h.brightness.state.lock().unwrap().get_calls, 1);
+    }
+
+    #[test]
+    fn overlay_reports_reach_an_idle_snapshot() {
+        let mut h = Harness::new(preferences(), false);
+        assert_eq!(h.engine.snapshot().dimming.method, DimMethod::Overlay);
+        h.engine.command(Command::OverlayAvailable(false));
+        assert_eq!(h.engine.snapshot().dimming.method, DimMethod::Unavailable);
+        h.engine.command(Command::OverlayAvailable(true));
+        assert_eq!(h.engine.snapshot().dimming.method, DimMethod::Overlay);
     }
 
     #[test]
@@ -1080,7 +1005,7 @@ mod tests {
         h.clock.advance(Duration::from_secs(1));
         h.engine.tick();
         close(h.brightness(), 0.8);
-        assert_eq!(h.engine.brightness.original, None);
+        assert!(!h.engine.dimming.restore_pending());
         assert_eq!(h.engine.volume.original, Some(0.6));
         h.volume.state.lock().unwrap().fail_set = false;
         h.clock.advance(Duration::from_secs(5));
@@ -1141,8 +1066,8 @@ mod tests {
         h.start();
         h.advance(90);
         close(h.brightness(), 0.5);
-        close(h.engine.snapshot().overlay_alpha, 0.0);
-        assert!(h.engine.snapshot().brightness_supported);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.0);
+        assert_eq!(h.engine.snapshot().dimming.method, DimMethod::Native);
         assert!(h.engine.snapshot().last_error.is_some());
         h.advance(30);
         close(h.brightness(), 0.2);
@@ -1165,11 +1090,11 @@ mod tests {
         h.advance(150);
         h.brightness.state.lock().unwrap().partial_set = true;
         h.engine.command(Command::Cancel);
-        assert_eq!(h.engine.brightness.original, Some(0.8));
+        assert!(h.engine.dimming.restore_pending());
         h.brightness.state.lock().unwrap().partial_set = false;
         h.clock.advance(Duration::from_secs(5));
         h.engine.tick();
-        assert_eq!(h.engine.brightness.original, None);
+        assert!(!h.engine.dimming.restore_pending());
         assert!(!h.engine.needs_tick());
     }
 
@@ -1211,7 +1136,7 @@ mod tests {
             h.engine.tick();
         }
         assert!(!h.engine.needs_tick());
-        assert_eq!(h.engine.brightness.original, None);
+        assert!(!h.engine.dimming.restore_pending());
         let sets = h.brightness.state.lock().unwrap().set_calls.len();
         h.clock.advance(RESTORE_RETRY);
         h.engine.tick();
@@ -1368,13 +1293,13 @@ mod tests {
         h.start();
         h.advance(61);
         close(h.brightness(), 0.1);
-        close(h.engine.snapshot().overlay_alpha, 0.015);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.015);
         h.advance(29);
-        close(h.engine.snapshot().overlay_alpha, 0.45);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.45);
         h.brightness.state.lock().unwrap().fail_set = false;
         h.engine.command(Command::Cancel);
         close(h.brightness(), 0.1);
-        close(h.engine.snapshot().overlay_alpha, 0.0);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.0);
     }
 
     #[test]
@@ -1383,12 +1308,12 @@ mod tests {
         h.brightness.state.lock().unwrap().fail_set = true;
         h.start();
         h.advance(90);
-        assert!(!h.engine.snapshot().brightness_supported);
-        assert!(h.engine.snapshot().overlay_alpha > 0.0);
+        assert_eq!(h.engine.snapshot().dimming.method, DimMethod::Overlay);
+        assert!(h.engine.snapshot().dimming.overlay_alpha > 0.0);
         h.brightness.state.lock().unwrap().fail_set = false;
         h.engine.command(Command::Cancel);
         close(h.brightness(), 0.8);
-        close(h.engine.snapshot().overlay_alpha, 0.0);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.0);
     }
 
     #[test]
@@ -1398,7 +1323,7 @@ mod tests {
         let mut h = Harness::new(settings, false);
         h.start();
         h.advance(120);
-        close(h.engine.snapshot().overlay_alpha, 0.9);
+        close(h.engine.snapshot().dimming.overlay_alpha, 0.9);
     }
 
     #[test]
@@ -1534,11 +1459,11 @@ mod tests {
         assert!(engine.should_wake_ui(&previous));
 
         engine.snapshot.remaining = previous.remaining;
-        engine.snapshot.overlay_alpha = 0.25;
+        engine.snapshot.dimming.overlay_alpha = 0.25;
         assert!(engine.should_wake_ui(&previous));
 
-        engine.snapshot.overlay_alpha = previous.overlay_alpha;
-        engine.snapshot.brightness_percent = Some(40.0);
+        engine.snapshot.dimming.overlay_alpha = previous.dimming.overlay_alpha;
+        engine.snapshot.dimming.percent = Some(40.0);
         assert!(!engine.should_wake_ui(&previous));
 
         engine
