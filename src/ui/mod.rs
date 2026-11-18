@@ -17,12 +17,15 @@ use crate::tray::{Tray, TrayAction};
 use crate::updates::{UpdateChecker, UpdateStatus};
 
 use self::main_window::{MAX_MINUTES, MIN_MINUTES, PRESETS};
+pub use self::window_lifecycle::Activation;
+use self::window_lifecycle::{WindowLifecycle, WindowRequest};
 
 pub mod main_window;
 pub mod overlay;
 pub mod settings_window;
 pub mod theme;
 pub mod widgets;
+mod window_lifecycle;
 #[cfg(target_os = "linux")]
 mod x11_overlay;
 
@@ -36,16 +39,11 @@ pub struct NightcapApp {
     overlay: overlay::Overlay,
     /// What the engine last heard about the overlay.
     overlay_reported: Option<bool>,
-    root_visible: bool,
-    quitting: bool,
-    close_request_handled: bool,
+    windows: WindowLifecycle,
     observed_total: Duration,
     settings: Settings,
     duration_min: u32,
     custom_duration: bool,
-    settings_open: bool,
-    settings_opening_pending: bool,
-    settings_focus_pending: u8,
     save_after: Option<Instant>,
     notice: Option<StatusNote>,
     ctx: Option<egui::Context>,
@@ -66,7 +64,8 @@ impl NightcapApp {
         tray: Option<Tray>,
         updates: UpdateChecker,
     ) -> Self {
-        set_activation_policy(true);
+        window_lifecycle::set_activation_policy(true);
+        let windows = WindowLifecycle::new(tray.is_some());
         let duration_min = settings.last_duration_min.clamp(MIN_MINUTES, MAX_MINUTES);
         let custom_duration = !PRESETS.contains(&duration_min);
         Self {
@@ -77,16 +76,11 @@ impl NightcapApp {
             updates,
             overlay: overlay::Overlay::new(),
             overlay_reported: None,
-            root_visible: true,
-            quitting: false,
-            close_request_handled: false,
+            windows,
             observed_total: Duration::ZERO,
             settings,
             duration_min,
             custom_duration,
-            settings_open: false,
-            settings_opening_pending: false,
-            settings_focus_pending: 0,
             save_after: None,
             notice: None,
             ctx: None,
@@ -102,11 +96,9 @@ impl NightcapApp {
     }
 
     pub fn open_settings(&mut self) {
-        self.settings_open = true;
-        self.settings_opening_pending = true;
-        self.settings_focus_pending = 2;
-        if let Some(ctx) = &self.ctx {
-            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        let requests = self.windows.open_settings();
+        if let Some(ctx) = self.ctx.clone() {
+            self.perform(&ctx, requests);
         }
     }
 
@@ -114,45 +106,10 @@ impl NightcapApp {
         &self.engine
     }
 
-    fn open_window(&mut self, ctx: &egui::Context, focus: bool) {
-        self.root_visible = true;
-        self.engine.set_window_visible(true);
-        set_activation_policy(true);
-        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd_to(
-            egui::ViewportId::ROOT,
-            egui::ViewportCommand::Minimized(false),
-        );
-        if focus {
-            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+    fn perform(&self, ctx: &egui::Context, requests: Vec<WindowRequest>) {
+        for request in requests {
+            window_lifecycle::perform(ctx, &self.engine, request);
         }
-        ctx.request_repaint_of(egui::ViewportId::ROOT);
-    }
-
-    fn hide_window(&mut self, ctx: &egui::Context) {
-        self.root_visible = false;
-        self.engine.set_window_visible(false);
-        if self.settings_open {
-            ctx.send_viewport_cmd_to(
-                settings_window::viewport_id(),
-                egui::ViewportCommand::Visible(false),
-            );
-            self.settings_open = false;
-        }
-        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
-        ctx.send_viewport_cmd_to(
-            egui::ViewportId::ROOT,
-            egui::ViewportCommand::Visible(false),
-        );
-        set_activation_policy(false);
-    }
-
-    fn quit(&mut self, ctx: &egui::Context) {
-        if !self.quitting {
-            self.quitting = true;
-            self.send(Command::Shutdown);
-        }
-        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
     }
 
     fn send(&self, command: Command) {
@@ -204,7 +161,7 @@ impl eframe::App for NightcapApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         theme::install(ctx);
         self.ctx = Some(ctx.clone());
-        self.engine.set_window_visible(self.root_visible);
+        self.engine.set_window_visible(self.windows.root_visible());
         self.flush_save();
         let snapshot = self.engine.snapshot();
         if snapshot.state != TimerState::Idle && snapshot.total != self.observed_total {
@@ -231,51 +188,41 @@ impl eframe::App for NightcapApp {
             Vec::new()
         };
         for action in actions {
-            match action {
-                TrayAction::OpenWindow => self.open_window(ctx, true),
-                TrayAction::OpenSettings => {
-                    if !self.root_visible {
-                        self.open_window(ctx, false);
-                    }
-                    self.open_settings();
-                }
-                TrayAction::Quit => self.quit(ctx),
-            }
+            let requests = match action {
+                TrayAction::OpenWindow => self.windows.show_root(true),
+                TrayAction::OpenSettings => self.windows.open_settings_from_tray(),
+                TrayAction::Quit => self.windows.quit(),
+            };
+            self.perform(ctx, requests);
         }
         // Hidden input retains the last UI's key events: only consume shortcuts
         // while visible. Native app-menu shortcuts use the tray queue above.
-        if self.root_visible
+        if self.windows.root_visible()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Q))
         {
-            self.quit(ctx);
+            let requests = self.windows.quit();
+            self.perform(ctx, requests);
         }
-        // Logic-only passes retain pending input until the root renders again.
-        // Handle each native close once so its stale event cannot hide a tray reopen.
         let close_requested = ctx.input(|input| input.viewport().close_requested());
-        let new_close = close_edge(close_requested, &mut self.close_request_handled);
-        if new_close
-            || (self.root_visible
-                && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W)))
-        {
-            if self.tray.is_some() && !self.quitting {
-                self.hide_window(ctx);
-            } else {
-                self.quit(ctx);
-            }
-        }
+        let requests = self.windows.close(close_requested, || {
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::W))
+        });
+        self.perform(ctx, requests);
         // After this pass's Quit and close handling, so a quitting app refuses.
-        if let Some(activations) = self.activations.take() {
-            let quitting = self.quitting;
-            answer_activations(&activations, quitting, Instant::now(), || {
-                self.open_window(ctx, true)
-            });
-            self.activations = Some(activations);
+        if let Some(activations) = &self.activations {
+            let engine = &self.engine;
+            self.windows
+                .answer_activations(activations, Instant::now(), |requests| {
+                    for request in requests {
+                        window_lifecycle::perform(ctx, engine, request);
+                    }
+                });
         }
         let overlay_available = self.overlay.update(
             ctx,
             frame,
             snapshot.dimming.overlay_alpha,
-            self.root_visible,
+            self.windows.root_visible(),
         );
         if self.overlay_reported != Some(overlay_available) {
             self.overlay_reported = Some(overlay_available);
@@ -286,7 +233,7 @@ impl eframe::App for NightcapApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         theme::install(ui.ctx());
         self.ctx = Some(ui.ctx().clone());
-        self.engine.set_window_visible(self.root_visible);
+        self.engine.set_window_visible(self.windows.root_visible());
         self.flush_save();
         if self
             .notice
@@ -305,11 +252,12 @@ impl eframe::App for NightcapApp {
         let tokens = theme::tokens(ui.ctx());
         ui.painter().rect_filled(ui.max_rect(), 0.0, tokens.window);
         self.overlay.register(ui.ctx());
-        if !self.root_visible {
+        if !self.windows.root_visible() {
+            let (open, opening) = self.windows.settings_flags();
             let outcome = settings_window::show(
                 ui.ctx(),
-                &mut self.settings_open,
-                &mut self.settings_opening_pending,
+                open,
+                opening,
                 &mut self.settings,
                 settings_view(&snapshot, &updates),
             );
@@ -371,28 +319,19 @@ impl eframe::App for NightcapApp {
             }
             self.send(command);
         }
+        let (open, opening) = self.windows.settings_flags();
         let outcome = settings_window::show(
             ui.ctx(),
-            &mut self.settings_open,
-            &mut self.settings_opening_pending,
+            open,
+            opening,
             &mut self.settings,
             settings_view(&snapshot, &updates),
         );
         if self.settings_outcome(outcome) {
             settings_changed = true;
         }
-        if self.settings_focus_pending > 0 && self.settings_open && !self.settings_opening_pending {
-            // The immediate child's creation frame can still carry root window
-            // commands. Focus on the following frame, once those have drained.
-            self.settings_focus_pending -= 1;
-            if self.settings_focus_pending == 0 {
-                ui.ctx().send_viewport_cmd_to(
-                    settings_window::viewport_id(),
-                    egui::ViewportCommand::Focus,
-                );
-            }
-            ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
-        }
+        let requests = self.windows.settings_frame_shown();
+        self.perform(ui.ctx(), requests);
         if settings_changed {
             self.mark_settings_dirty();
         }
@@ -424,40 +363,6 @@ fn settings_view<'a>(
         hibernate_supported: snapshot.hibernate_supported,
         updates,
     }
-}
-
-/// A later launch's request to show the window: its reply, and when it expires.
-pub type Activation = (mpsc::Sender<bool>, Instant);
-
-/// Answers every pending, unexpired launch request, calling `show` first unless
-/// quitting. A refused launch starts its own copy once this one has exited.
-/// Expired requests are dropped: their launch has already given up waiting.
-fn answer_activations(
-    activations: &mpsc::Receiver<Activation>,
-    quitting: bool,
-    now: Instant,
-    show: impl FnOnce(),
-) {
-    let pending: Vec<_> = activations
-        .try_iter()
-        .filter(|&(_, expires)| now <= expires)
-        .map(|(reply, _)| reply)
-        .collect();
-    if pending.is_empty() {
-        return;
-    }
-    if !quitting {
-        show();
-    }
-    for reply in pending {
-        let _ = reply.send(!quitting);
-    }
-}
-
-fn close_edge(requested: bool, handled: &mut bool) -> bool {
-    let edge = requested && !*handled;
-    *handled = requested;
-    edge
 }
 
 /// Requests root repaints from the engine, tray, and later launches, on any thread.
@@ -545,24 +450,6 @@ pub fn window_builder(title: &str) -> egui::ViewportBuilder {
     builder
 }
 
-fn set_activation_policy(visible: bool) {
-    #[cfg(target_os = "macos")]
-    if let Some(mtm) = objc2::MainThreadMarker::new() {
-        use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-        let app = NSApplication::sharedApplication(mtm);
-        let policy = if visible {
-            NSApplicationActivationPolicy::Regular
-        } else {
-            NSApplicationActivationPolicy::Accessory
-        };
-        if app.activationPolicy() != policy {
-            app.setActivationPolicy(policy);
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = visible;
-}
-
 fn in_app_bundle() -> bool {
     cfg!(target_os = "macos")
         && std::env::current_exe()
@@ -629,46 +516,6 @@ pub fn install_app_icon() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn retained_close_event_is_handled_once_and_a_new_close_is_handled() {
-        let mut handled = false;
-        assert!(close_edge(true, &mut handled));
-        for _ in 0..100 {
-            assert!(!close_edge(true, &mut handled));
-        }
-        assert!(!close_edge(false, &mut handled));
-        assert!(close_edge(true, &mut handled));
-    }
-
-    #[test]
-    fn launch_requests_are_refused_while_quitting_shown_otherwise_and_expire() {
-        let now = Instant::now();
-        let later = now + Duration::from_secs(5);
-        let (requests, activations) = mpsc::channel();
-        let request = |expires| {
-            let (reply, shown) = mpsc::channel();
-            requests.send((reply, expires)).unwrap();
-            shown
-        };
-        let answer = |quitting| {
-            let mut showed = false;
-            answer_activations(&activations, quitting, now, || showed = true);
-            showed
-        };
-        // Requested and quit before the same pass: nothing shown, both refused.
-        let replies = [request(later), request(later)];
-        assert!(!answer(true));
-        assert!(replies.iter().all(|shown| shown.try_recv() == Ok(false)));
-        let shown = request(later);
-        assert!(answer(false));
-        assert_eq!(shown.try_recv(), Ok(true));
-        assert!(!answer(false), "nothing pending");
-        // A launch that has given up must not open the window afterwards.
-        let expired = request(now - Duration::from_millis(1));
-        assert!(!answer(false));
-        assert!(expired.try_recv().is_err());
-    }
 
     #[test]
     fn rebuilt_window_builders_send_no_repeated_icon_commands() {

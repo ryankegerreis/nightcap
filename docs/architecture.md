@@ -31,6 +31,7 @@ src/
                      UpdateStatus: checking, available release, checked, failed (manual)
   ui/
     mod.rs           NightcapApp: eframe::App, routes between main window and settings
+    window_lifecycle.rs  when the windows open, hide and close, and when the app quits
     theme.rs         colors, fonts, spacing tokens taken from the mockup (light + dark)
     widgets.rs       custom widgets: progress ring, segmented control, toggle switch,
                      grouped list rows, stepper/select rows, round Start/Cancel buttons
