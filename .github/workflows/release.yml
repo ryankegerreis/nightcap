@@ -53,7 +53,7 @@ jobs:
       - run: cargo test --locked
       - run: scripts/bundle-macos.sh --universal --dmg
       - run: mkdir dist && cp target/release/bundle/Nightcap.dmg dist/Nightcap-macOS.dmg
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: dist/*
@@ -77,7 +77,7 @@ jobs:
           Copy-Item target/release/nightcap.exe pkg/Nightcap.exe
           Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE pkg/
           Compress-Archive -Path pkg/* -DestinationPath dist/Nightcap-Windows-x64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: dist/*
@@ -104,7 +104,7 @@ jobs:
           mkdir -p dist pkg/nightcap
           cp target/release/nightcap README.md LICENSE-MIT LICENSE-APACHE pkg/nightcap/
           tar -C pkg -czf dist/Nightcap-Linux-x86_64.tar.gz nightcap
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/*
@@ -113,7 +113,7 @@ jobs:
     needs: [release-please, macos, windows, linux]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
