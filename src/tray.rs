@@ -525,6 +525,8 @@ mod native {
         dispatch: Arc<Dispatch>,
         display: Display,
         icon: ksni::Icon,
+        /// Flipped when a different release replaces the offer; see `NativeTray::update`.
+        id_epoch: bool,
     }
 
     impl Service {
@@ -622,6 +624,17 @@ mod native {
                     .into(),
                 );
             }
+            if self.id_epoch {
+                // Hidden; present or absent only to change the layout.
+                menu.push(
+                    StandardItem {
+                        visible: false,
+                        enabled: false,
+                        ..Default::default()
+                    }
+                    .into(),
+                );
+            }
             menu
         }
     }
@@ -644,6 +657,7 @@ mod native {
                 handle: Service {
                     dispatch,
                     display: display.clone(),
+                    id_epoch: false,
                     icon: ksni::Icon {
                         width: 32,
                         height: 32,
@@ -655,20 +669,16 @@ mod native {
             })
         }
         pub(super) fn update(&mut self, display: &Display) {
-            if replaces_offer(self.offer.as_ref(), display.update.as_ref()) {
-                // ksni keeps an item's D-Bus ID when only its label changes, so a
-                // host still showing the old offer would run the new callback.
-                // Dropping the item for one update changes the layout, which
-                // expires every ID; a click on the old item is then ignored.
-                let without = Display {
-                    update: None,
-                    ..display.clone()
-                };
-                self.handle.update(|service| service.display = without);
-            }
+            // ksni keeps an item's D-Bus ID when only its label changes, so a host
+            // still showing the old offer would run the new callback. Toggling a
+            // hidden item changes the layout in the same update, which expires
+            // every ID; a click on the old item is then ignored.
+            let new_ids = replaces_offer(self.offer.as_ref(), display.update.as_ref());
             self.offer = display.update.clone();
-            self.handle
-                .update(|service| service.display = display.clone());
+            self.handle.update(|service| {
+                service.display = display.clone();
+                service.id_epoch ^= new_ids;
+            });
         }
     }
 
