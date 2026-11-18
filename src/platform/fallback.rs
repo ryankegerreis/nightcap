@@ -29,6 +29,8 @@ pub struct MockLevelState {
     pub level: f32,
     pub get_calls: usize,
     pub set_calls: Vec<f32>,
+    /// Levels that arrived through `Brightness::restore`, also listed in `set_calls`.
+    pub restore_calls: Vec<f32>,
     pub fail_get: bool,
     pub fail_set: bool,
     /// Writes still apply but report that some displays failed.
@@ -38,7 +40,7 @@ pub struct MockLevelState {
 }
 
 macro_rules! mock_level {
-    ($name:ident, $control:ident) => {
+    ($name:ident) => {
         #[derive(Clone, Debug)]
         pub struct $name {
             pub state: Arc<Mutex<MockLevelState>>,
@@ -55,8 +57,8 @@ macro_rules! mock_level {
             }
         }
 
-        impl $control for $name {
-            fn get(&mut self) -> Result<f32> {
+        impl $name {
+            fn read(&mut self) -> Result<f32> {
                 let mut state = self.state.lock().unwrap();
                 state.get_calls += 1;
                 if state.fail_get {
@@ -65,7 +67,7 @@ macro_rules! mock_level {
                 Ok(state.level)
             }
 
-            fn set(&mut self, level: f32) -> Result<()> {
+            fn write(&mut self, level: f32) -> Result<()> {
                 let mut state = self.state.lock().unwrap();
                 state.set_calls.push(level);
                 if state.disconnected {
@@ -84,8 +86,33 @@ macro_rules! mock_level {
     };
 }
 
-mock_level!(MockBrightness, Brightness);
-mock_level!(MockVolume, Volume);
+mock_level!(MockBrightness);
+mock_level!(MockVolume);
+
+impl Brightness for MockBrightness {
+    fn get(&mut self) -> Result<f32> {
+        self.read()
+    }
+
+    fn set(&mut self, level: f32) -> Result<()> {
+        self.write(level)
+    }
+
+    fn restore(&mut self, level: f32) -> Result<()> {
+        self.state.lock().unwrap().restore_calls.push(level);
+        self.write(level)
+    }
+}
+
+impl Volume for MockVolume {
+    fn get(&mut self) -> Result<f32> {
+        self.read()
+    }
+
+    fn set(&mut self, level: f32) -> Result<()> {
+        self.write(level)
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct MockPowerState {

@@ -173,7 +173,11 @@ impl RestoreHardware {
 
     fn restore(&mut self) -> Result<()> {
         let brightness = match (self.controls.brightness.as_mut(), self.original.brightness) {
-            (Some(backend), Some(level)) => backend.set(level),
+            (Some(backend), Some(level)) => {
+                // A fade step ends the restored state, so the restore writes every display again.
+                let _ = backend.set(level);
+                backend.restore(level)
+            }
             _ => Ok(()),
         };
         let volume = match (self.controls.volume.as_mut(), self.original.volume) {

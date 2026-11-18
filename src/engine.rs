@@ -1149,6 +1149,16 @@ mod tests {
     }
 
     #[test]
+    fn canceling_returns_brightness_through_restore_rather_than_a_fade_write() {
+        let mut h = Harness::new(preferences(), true);
+        h.start();
+        h.advance(150);
+        assert!(h.brightness.state.lock().unwrap().restore_calls.is_empty());
+        h.engine.command(Command::Cancel);
+        assert_eq!(h.brightness.state.lock().unwrap().restore_calls, [0.8]);
+    }
+
+    #[test]
     fn partially_restored_brightness_is_retried_until_every_display_returns() {
         let mut h = Harness::new(preferences(), true);
         h.start();
