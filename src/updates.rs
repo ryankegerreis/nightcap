@@ -6,9 +6,10 @@
 //! that a failed manual check is reported in Settings.
 
 use std::{
+    cmp::Ordering,
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard,
         mpsc::{self, RecvTimeoutError},
     },
     time::{Duration, SystemTime},
@@ -49,8 +50,8 @@ impl Release {
 fn asset_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("macos", _) => Some("Nightcap-macOS.dmg"),
-        // Windows on Arm runs the x64 build under emulation.
-        ("windows", _) => Some("Nightcap-Windows-x64.zip"),
+        // Arm builds are not published (and Windows 10 on Arm cannot emulate x64).
+        ("windows", "x86_64") => Some("Nightcap-Windows-x64.zip"),
         ("linux", "x86_64") => Some("Nightcap-Linux-x86_64.tar.gz"),
         _ => None,
     }
@@ -85,10 +86,11 @@ impl UpdateStatus {
     pub fn caption(&self) -> String {
         if self.checking {
             "Checking…".into()
+        } else if self.failed {
+            // Download stays offered for a release found earlier.
+            "Couldn’t check for updates".into()
         } else if let Some(release) = &self.available {
             format!("Version {} is available", release.version)
-        } else if self.failed {
-            "Couldn’t check for updates".into()
         } else if self.checked {
             "Up to date".into()
         } else {
@@ -112,6 +114,14 @@ pub fn current_version() -> Version {
         }
     }
     built
+}
+
+/// Opens a link in the default browser. Unlike `egui::Context::open_url`, this
+/// works from the tray while every Nightcap window is hidden.
+pub fn open_in_browser(url: &str) {
+    if let Err(error) = webbrowser::open(url) {
+        log::warn!("Could not open {url}: {error}");
+    }
 }
 
 /// Reads the redirect GitHub sends for `/releases/latest`: the last response in
@@ -146,8 +156,9 @@ pub fn parse_latest(headers: &str) -> Option<Release> {
     })
 }
 
+/// Semver precedence, which ignores build metadata: `0.1.2+abc` is not newer than `0.1.2`.
 pub fn newer(current: &Version, latest: &Version) -> bool {
-    latest > current
+    latest.cmp_precedence(current) == Ordering::Greater
 }
 
 /// When the next automatic check is due after one finishes at `now`.
@@ -176,10 +187,22 @@ enum Request {
 type Fetch = Box<dyn Fn() -> Result<String> + Send>;
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
+/// State shared by the handle and the worker, under one lock so a check is
+/// reserved exactly once.
+struct Shared {
+    status: UpdateStatus,
+    /// A manual check is waiting for, or riding on, the next result: its failure is shown.
+    manual: bool,
+}
+
+fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Handle to the update-check thread. Dropping it lets the thread end at its next
 /// wake; it is never joined, so quitting does not wait for curl.
 pub struct UpdateChecker {
-    status: Arc<Mutex<UpdateStatus>>,
+    shared: Arc<Mutex<Shared>>,
     requests: mpsc::Sender<Request>,
     enabled: bool,
 }
@@ -203,10 +226,13 @@ impl UpdateChecker {
         fetch: Fetch,
         wake: Wake,
     ) -> Self {
-        let status = Arc::new(Mutex::new(UpdateStatus::new(current)));
+        let shared = Arc::new(Mutex::new(Shared {
+            status: UpdateStatus::new(current),
+            manual: false,
+        }));
         let (requests, receiver) = mpsc::channel();
         let worker = Worker {
-            status: Arc::clone(&status),
+            shared: Arc::clone(&shared),
             fetch,
             wake,
         };
@@ -217,17 +243,14 @@ impl UpdateChecker {
             log::warn!("Update checks unavailable: {error}");
         }
         Self {
-            status,
+            shared,
             requests,
             enabled,
         }
     }
 
     pub fn status(&self) -> UpdateStatus {
-        self.status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        lock(&self.shared).status.clone()
     }
 
     /// Turning checks on checks right away. Repeating the current value does nothing.
@@ -239,20 +262,26 @@ impl UpdateChecker {
     }
 
     /// Checks now, whether or not automatic checks are on, and reports a failure.
+    /// A check already under way answers this request too.
     pub fn check_now(&self) {
-        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-        if status.checking {
+        let mut shared = lock(&self.shared);
+        shared.manual = true;
+        if shared.status.checking {
             return;
         }
         // Shown at once, so a second click cannot queue another check.
-        status.checking = true;
-        drop(status);
-        let _ = self.requests.send(Request::CheckNow);
+        shared.status.checking = true;
+        if self.requests.send(Request::CheckNow).is_err() {
+            log::info!("Update check failed: the update thread is not running");
+            shared.manual = false;
+            shared.status.checking = false;
+            shared.status.failed = true;
+        }
     }
 }
 
 struct Worker {
-    status: Arc<Mutex<UpdateStatus>>,
+    shared: Arc<Mutex<Shared>>,
     fetch: Fetch,
     wake: Wake,
 }
@@ -261,7 +290,7 @@ impl Worker {
     fn run(self, requests: mpsc::Receiver<Request>, mut enabled: bool, first_delay: Duration) {
         let mut due = enabled.then(|| SystemTime::now() + first_delay);
         loop {
-            let manual = match requests.recv_timeout(wait_for(SystemTime::now(), due)) {
+            match requests.recv_timeout(wait_for(SystemTime::now(), due)) {
                 Ok(Request::SetEnabled(on)) => {
                     if on != enabled {
                         enabled = on;
@@ -269,25 +298,26 @@ impl Worker {
                     }
                     continue;
                 }
-                Ok(Request::CheckNow) => true,
+                // An automatic check that started just before the click already answered it.
+                Ok(Request::CheckNow) if !lock(&self.shared).manual => continue,
+                Ok(Request::CheckNow) => {}
                 Err(RecvTimeoutError::Timeout) => {
                     if !due.is_some_and(|due| SystemTime::now() >= due) {
                         continue;
                     }
-                    false
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
-            };
-            let succeeded = self.check(manual);
+            }
+            let succeeded = self.check();
             due = enabled.then(|| next_due(SystemTime::now(), succeeded));
         }
     }
 
-    fn check(&self, manual: bool) -> bool {
+    fn check(&self) -> bool {
         let current = {
-            let mut status = self.lock();
-            status.checking = true;
-            status.current.clone()
+            let mut shared = lock(&self.shared);
+            shared.status.checking = true;
+            shared.status.current.clone()
         };
         (self.wake)();
         let result = (self.fetch)().and_then(|headers| {
@@ -295,7 +325,10 @@ impl Worker {
         });
         let succeeded = result.is_ok();
         {
-            let mut status = self.lock();
+            let mut shared = lock(&self.shared);
+            // Clicks during the request share its result.
+            let manual = std::mem::take(&mut shared.manual);
+            let status = &mut shared.status;
             status.checking = false;
             match result {
                 Ok(release) => {
@@ -312,10 +345,6 @@ impl Worker {
         }
         (self.wake)();
         succeeded
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, UpdateStatus> {
-        self.status.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -446,6 +475,9 @@ mod tests {
         assert!(newer(&current, &version("0.2.0-beta.1")));
         assert!(!newer(&version("0.2.0"), &version("0.2.0-beta.1")));
         assert!(newer(&version("0.9.0"), &version("0.10.0")));
+        // Build metadata carries no precedence.
+        assert!(!newer(&current, &version("0.1.2+build.5")));
+        assert!(!newer(&version("0.1.2+a"), &version("0.1.2+b")));
     }
 
     #[test]
@@ -454,7 +486,7 @@ mod tests {
             ("macos", "aarch64", Some("Nightcap-macOS.dmg")),
             ("macos", "x86_64", Some("Nightcap-macOS.dmg")),
             ("windows", "x86_64", Some("Nightcap-Windows-x64.zip")),
-            ("windows", "aarch64", Some("Nightcap-Windows-x64.zip")),
+            ("windows", "aarch64", None),
             ("linux", "x86_64", Some("Nightcap-Linux-x86_64.tar.gz")),
             ("linux", "aarch64", None),
             ("freebsd", "x86_64", None),
@@ -510,6 +542,9 @@ mod tests {
             page_url: String::new(),
         });
         assert_eq!(status.caption(), "Version 0.2.0 is available");
+        status.failed = true;
+        assert_eq!(status.caption(), "Couldn’t check for updates");
+        status.failed = false;
         status.checking = true;
         assert_eq!(status.caption(), "Checking…");
     }
@@ -602,11 +637,59 @@ mod tests {
         harness.checker.set_enabled(true);
         let status = harness.finish(tag("0.2.0"));
         assert_eq!(status.available.unwrap().version, version("0.2.0"));
-        // A later failure keeps the known release.
+        // A later manual failure is shown and keeps the known release.
         harness.checker.check_now();
         let status = harness.finish(Err(anyhow::anyhow!("offline")));
         assert!(status.failed);
-        assert_eq!(status.caption(), "Version 0.2.0 is available");
+        assert_eq!(status.caption(), "Couldn’t check for updates");
+        assert_eq!(status.available.unwrap().version, version("0.2.0"));
+    }
+
+    #[test]
+    fn a_click_during_an_automatic_check_shares_its_result() {
+        let harness = Harness::new(true, Duration::ZERO);
+        // The automatic check is waiting on its response.
+        harness.woken.recv_timeout(Duration::from_secs(5)).unwrap();
+        harness.checker.check_now();
+        harness
+            .responses
+            .send(Err(anyhow::anyhow!("offline")))
+            .unwrap();
+        harness.woken.recv_timeout(Duration::from_secs(5)).unwrap();
+        let status = harness.checker.status();
+        assert!(!status.checking && status.failed);
+        // No second request.
+        harness.quiet();
+    }
+
+    #[test]
+    fn a_click_already_answered_by_an_automatic_check_is_skipped() {
+        let harness = Harness::new(false, Duration::ZERO);
+        // The click's request arrives after a check that started first took it.
+        lock(&harness.checker.shared).manual = false;
+        harness.checker.requests.send(Request::CheckNow).unwrap();
+        harness.quiet();
+        // A real click still runs.
+        harness.checker.check_now();
+        assert!(harness.finish(tag("0.1.2")).checked);
+    }
+
+    #[test]
+    fn check_now_without_a_worker_reports_a_failure() {
+        let (requests, receiver) = mpsc::channel();
+        drop(receiver);
+        let checker = UpdateChecker {
+            shared: Arc::new(Mutex::new(Shared {
+                status: UpdateStatus::new(version("0.1.2")),
+                manual: false,
+            })),
+            requests,
+            enabled: true,
+        };
+        checker.check_now();
+        let status = checker.status();
+        assert!(!status.checking);
+        assert_eq!(status.caption(), "Couldn’t check for updates");
     }
 
     #[test]

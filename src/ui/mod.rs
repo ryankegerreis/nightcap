@@ -176,7 +176,7 @@ impl NightcapApp {
             self.updates.check_now();
         }
         if let Some(url) = outcome.download {
-            open_url(&url);
+            crate::updates::open_in_browser(&url);
         }
         outcome.changed
     }
@@ -233,11 +233,6 @@ impl eframe::App for NightcapApp {
                         self.open_window(ctx, false);
                     }
                     self.open_settings();
-                }
-                TrayAction::DownloadUpdate => {
-                    if let Some(release) = &updates.available {
-                        open_url(&release.download_url());
-                    }
                 }
                 TrayAction::Quit => self.quit(ctx),
             }
@@ -418,14 +413,6 @@ fn settings_view<'a>(
         volume_supported: snapshot.volume_supported,
         hibernate_supported: snapshot.hibernate_supported,
         updates,
-    }
-}
-
-/// Opens a link in the default browser. Unlike `egui::Context::open_url`, this
-/// works from the tray while every Nightcap window is hidden.
-fn open_url(url: &str) {
-    if let Err(error) = webbrowser::open(url) {
-        log::warn!("Could not open {url}: {error}");
     }
 }
 

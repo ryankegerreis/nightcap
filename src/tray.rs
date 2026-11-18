@@ -4,7 +4,7 @@
 //! let the tray (and its engine handle) be dropped without leaving a worker alive.
 
 use std::{
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 
@@ -15,7 +15,6 @@ use crate::updates::Release;
 pub enum TrayAction {
     OpenWindow,
     OpenSettings,
-    DownloadUpdate,
     Quit,
 }
 
@@ -35,6 +34,8 @@ impl Tray {
             engine,
             sender,
             wake,
+            download: Mutex::new(None),
+            open: Arc::new(crate::updates::open_in_browser),
         });
         let native = native::NativeTray::new(dispatch, &display)?;
         Ok(Self {
@@ -55,7 +56,10 @@ impl Tray {
         let display = Display::new(
             snapshot,
             show_time_in_menu_bar,
-            update.map(|release| release.version.to_string()),
+            update.map(|release| Offer {
+                version: release.version.to_string(),
+                url: release.download_url(),
+            }),
         );
         if self.display != display {
             self.native.update(&display);
@@ -83,6 +87,10 @@ enum Action {
     TogglePause,
     Add,
     Cancel,
+    /// Opens the download that the menu item showed when it was clicked.
+    /// ksni builds its item with the URL in the closure instead.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    Download,
     Ui(TrayAction),
 }
 
@@ -90,10 +98,30 @@ struct Dispatch {
     engine: EngineHandle,
     sender: mpsc::Sender<TrayAction>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    /// The download URL of the update item currently in the native menu. Set on
+    /// the thread that delivers its clicks, together with the item's label.
+    download: Mutex<Option<String>>,
+    open: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl Dispatch {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    fn set_download(&self, url: Option<String>) {
+        *self.download.lock().unwrap_or_else(|e| e.into_inner()) = url;
+    }
+
     fn run(&self, action: Action) {
+        if let Action::Download = action {
+            let url = self
+                .download
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Some(url) = url {
+                (self.open)(&url);
+            }
+            return;
+        }
         let state = self.engine.snapshot().state;
         let command = match action {
             Action::Ui(action) => {
@@ -123,16 +151,22 @@ impl Dispatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct Offer {
+    version: String,
+    url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Display {
     state: TimerState,
     time: String,
     show_time: bool,
-    /// Version of a newer release, offered above Open Nightcap.
-    update: Option<String>,
+    /// A newer release, offered above Open Nightcap.
+    update: Option<Offer>,
 }
 
 impl Display {
-    fn new(snapshot: &Snapshot, show_time: bool, update: Option<String>) -> Self {
+    fn new(snapshot: &Snapshot, show_time: bool, update: Option<Offer>) -> Self {
         let seconds = snapshot.menu_seconds();
         Self {
             state: snapshot.state,
@@ -149,7 +183,7 @@ impl Display {
     fn update_label(&self) -> Option<String> {
         self.update
             .as_ref()
-            .map(|version| format!("Download Nightcap {version}"))
+            .map(|offer| format!("Download Nightcap {}", offer.version))
     }
 
     fn active(&self) -> bool {
@@ -278,7 +312,7 @@ mod native {
         active_visible: bool,
         update_item: MenuItem,
         update_visible: bool,
-        _events: Arc<Events>,
+        events: Arc<Events>,
         #[cfg(target_os = "macos")]
         _app_menu: Menu,
     }
@@ -306,10 +340,7 @@ mod native {
                 (cancel.id().clone(), Action::Cancel),
             ]);
             let update_item = MenuItem::new("", true, None);
-            items.push((
-                update_item.id().clone(),
-                Action::Ui(TrayAction::DownloadUpdate),
-            ));
+            items.push((update_item.id().clone(), Action::Download));
             menu.append(&PredefinedMenuItem::separator())?;
             let modifier = if cfg!(target_os = "macos") {
                 Modifiers::META
@@ -403,7 +434,7 @@ mod native {
                 active_visible: false,
                 update_item,
                 update_visible: false,
-                _events: events,
+                events,
                 #[cfg(target_os = "macos")]
                 _app_menu: app_menu,
             };
@@ -438,6 +469,10 @@ mod native {
             if let Some(label) = &update {
                 self.update_item.set_text(label);
             }
+            // Menu clicks arrive on this thread, so a click opens what the label showed.
+            self.events
+                .dispatch
+                .set_download(display.update.as_ref().map(|offer| offer.url.clone()));
             if update.is_some() != self.update_visible {
                 if update.is_some() {
                     // Just after the separator above Open Nightcap: the header,
@@ -550,12 +585,18 @@ mod native {
                 ]);
             }
             menu.push(MenuItem::Separator);
-            if let Some(label) = self.display.update_label() {
-                menu.push(Self::item(
-                    &label,
-                    true,
-                    Action::Ui(TrayAction::DownloadUpdate),
-                ));
+            if let (Some(label), Some(offer)) = (self.display.update_label(), &self.display.update)
+            {
+                // Bound to this menu's URL, not whatever is current when clicked.
+                let url = offer.url.clone();
+                menu.push(
+                    StandardItem {
+                        label,
+                        activate: Box::new(move |service: &mut Self| (service.dispatch.open)(&url)),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
             }
             menu.push(Self::item(
                 "Open Nightcap",
@@ -664,7 +705,14 @@ mod tests {
     fn display_offers_an_available_update() {
         let snapshot = Snapshot::default();
         assert_eq!(Display::new(&snapshot, true, None).update_label(), None);
-        let update = Display::new(&snapshot, true, Some("0.2.0".into()));
+        let update = Display::new(
+            &snapshot,
+            true,
+            Some(Offer {
+                version: "0.2.0".into(),
+                url: "https://example.invalid/0.2.0".into(),
+            }),
+        );
         assert_eq!(
             update.update_label().as_deref(),
             Some("Download Nightcap 0.2.0")
@@ -698,10 +746,14 @@ mod tests {
         )
         .unwrap();
         let (sender, receiver) = mpsc::channel();
+        let (opened_tx, opened) = mpsc::channel::<String>();
+        let opened_tx = Mutex::new(opened_tx);
         let dispatch = Dispatch {
             engine,
             sender,
             wake: Arc::new(|| {}),
+            download: Mutex::new(None),
+            open: Arc::new(move |url| opened_tx.lock().unwrap().send(url.to_owned()).unwrap()),
         };
         for (action, expected) in [
             (Action::Start(30), TimerState::Running),
@@ -719,7 +771,12 @@ mod tests {
         }
         dispatch.run(Action::Ui(TrayAction::OpenSettings));
         assert_eq!(receiver.try_recv().unwrap(), TrayAction::OpenSettings);
-        dispatch.run(Action::Ui(TrayAction::DownloadUpdate));
-        assert_eq!(receiver.try_recv().unwrap(), TrayAction::DownloadUpdate);
+        // Download opens the URL the item showed, without a UI round trip.
+        dispatch.run(Action::Download);
+        assert!(opened.try_recv().is_err());
+        dispatch.set_download(Some("https://example.invalid/0.2.0".into()));
+        dispatch.run(Action::Download);
+        assert_eq!(opened.try_recv().unwrap(), "https://example.invalid/0.2.0");
+        assert!(receiver.try_recv().is_err());
     }
 }
