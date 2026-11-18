@@ -628,6 +628,7 @@ mod native {
 
     pub(super) struct NativeTray {
         handle: Handle<Service>,
+        offer: Option<Offer>,
     }
 
     impl NativeTray {
@@ -650,9 +651,22 @@ mod native {
                     },
                 }
                 .spawn()?,
+                offer: display.update.clone(),
             })
         }
         pub(super) fn update(&mut self, display: &Display) {
+            if replaces_offer(self.offer.as_ref(), display.update.as_ref()) {
+                // ksni keeps an item's D-Bus ID when only its label changes, so a
+                // host still showing the old offer would run the new callback.
+                // Dropping the item for one update changes the layout, which
+                // expires every ID; a click on the old item is then ignored.
+                let without = Display {
+                    update: None,
+                    ..display.clone()
+                };
+                self.handle.update(|service| service.display = without);
+            }
+            self.offer = display.update.clone();
             self.handle
                 .update(|service| service.display = display.clone());
         }
@@ -663,6 +677,13 @@ mod native {
             self.handle.shutdown();
         }
     }
+}
+
+/// A different release replacing one already offered, as opposed to one appearing,
+/// disappearing, or staying the same.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn replaces_offer(old: Option<&Offer>, new: Option<&Offer>) -> bool {
+    matches!((old, new), (Some(old), Some(new)) if old != new)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -718,6 +739,20 @@ mod tests {
             Some("Download Nightcap 0.2.0")
         );
         assert_ne!(update, Display::new(&snapshot, true, None));
+    }
+
+    #[test]
+    fn only_a_different_offer_replaces_the_linux_item() {
+        let offer = |version: &str| Offer {
+            version: version.into(),
+            url: format!("https://example.invalid/{version}"),
+        };
+        let (old, new) = (offer("0.2.0"), offer("0.3.0"));
+        assert!(replaces_offer(Some(&old), Some(&new)));
+        assert!(!replaces_offer(Some(&old), Some(&old)));
+        assert!(!replaces_offer(None, Some(&new)));
+        assert!(!replaces_offer(Some(&old), None));
+        assert!(!replaces_offer(None, None));
     }
 
     #[test]

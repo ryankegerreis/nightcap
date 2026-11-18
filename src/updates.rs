@@ -118,9 +118,19 @@ pub fn current_version() -> Version {
 
 /// Opens a link in the default browser. Unlike `egui::Context::open_url`, this
 /// works from the tray while every Nightcap window is hidden.
+/// A text-mode browser can keep `webbrowser::open` waiting until it exits, so
+/// open from a thread of its own instead of the tray's or the UI's.
 pub fn open_in_browser(url: &str) {
-    if let Err(error) = webbrowser::open(url) {
-        log::warn!("Could not open {url}: {error}");
+    let url = url.to_owned();
+    let spawned = std::thread::Builder::new()
+        .name("nightcap-open-url".into())
+        .spawn(move || {
+            if let Err(error) = webbrowser::open(&url) {
+                log::warn!("Could not open {url}: {error}");
+            }
+        });
+    if let Err(error) = spawned {
+        log::warn!("Could not open the browser: {error}");
     }
 }
 
@@ -187,6 +197,16 @@ enum Request {
 type Fetch = Box<dyn Fn() -> Result<String> + Send>;
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
+/// Worker steps that tests observe or hold; a no-op otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// An automatic check is due and not yet reserved.
+    Due,
+    /// A Check Now request that an earlier check already answered.
+    Skipped,
+}
+type Probe = Box<dyn Fn(Step) + Send>;
+
 /// State shared by the handle and the worker, under one lock so a check is
 /// reserved exactly once.
 struct Shared {
@@ -216,6 +236,7 @@ impl UpdateChecker {
             FIRST_CHECK_DELAY,
             Box::new(fetch_headers),
             wake,
+            Box::new(|_| {}),
         )
     }
 
@@ -225,6 +246,7 @@ impl UpdateChecker {
         first_delay: Duration,
         fetch: Fetch,
         wake: Wake,
+        probe: Probe,
     ) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             status: UpdateStatus::new(current),
@@ -235,6 +257,7 @@ impl UpdateChecker {
             shared: Arc::clone(&shared),
             fetch,
             wake,
+            probe,
         };
         if let Err(error) = std::thread::Builder::new()
             .name("nightcap-updates".into())
@@ -284,6 +307,7 @@ struct Worker {
     shared: Arc<Mutex<Shared>>,
     fetch: Fetch,
     wake: Wake,
+    probe: Probe,
 }
 
 impl Worker {
@@ -299,12 +323,16 @@ impl Worker {
                     continue;
                 }
                 // An automatic check that started just before the click already answered it.
-                Ok(Request::CheckNow) if !lock(&self.shared).manual => continue,
+                Ok(Request::CheckNow) if !lock(&self.shared).manual => {
+                    (self.probe)(Step::Skipped);
+                    continue;
+                }
                 Ok(Request::CheckNow) => {}
                 Err(RecvTimeoutError::Timeout) => {
                     if !due.is_some_and(|due| SystemTime::now() >= due) {
                         continue;
                     }
+                    (self.probe)(Step::Due);
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -554,18 +582,26 @@ mod tests {
         checker: UpdateChecker,
         woken: mpsc::Receiver<()>,
         responses: mpsc::Sender<Result<String>>,
+        fetches: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl Harness {
         fn new(enabled: bool, first_delay: Duration) -> Self {
+            Self::with_probe(enabled, first_delay, Box::new(|_| {}))
+        }
+
+        fn with_probe(enabled: bool, first_delay: Duration, probe: Probe) -> Self {
             let (responses, pending) = mpsc::channel::<Result<String>>();
             let pending = Mutex::new(pending);
             let (wake, woken) = mpsc::channel();
+            let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::clone(&fetches);
             let checker = UpdateChecker::spawn_with(
                 enabled,
                 version("0.1.2"),
                 first_delay,
                 Box::new(move || {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     pending
                         .lock()
                         .unwrap()
@@ -575,12 +611,18 @@ mod tests {
                 Arc::new(move || {
                     let _ = wake.send(());
                 }),
+                probe,
             );
             Self {
                 checker,
                 woken,
                 responses,
+                fetches,
             }
+        }
+
+        fn fetches(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         /// One check: the start and finish wakes, with `response` returned between them.
@@ -660,18 +702,40 @@ mod tests {
         assert!(!status.checking && status.failed);
         // No second request.
         harness.quiet();
+        assert_eq!(harness.fetches(), 1);
     }
 
     #[test]
-    fn a_click_already_answered_by_an_automatic_check_is_skipped() {
-        let harness = Harness::new(false, Duration::ZERO);
-        // The click's request arrives after a check that started first took it.
-        lock(&harness.checker.shared).manual = false;
-        harness.checker.requests.send(Request::CheckNow).unwrap();
-        harness.quiet();
-        // A real click still runs.
+    fn a_click_just_as_an_automatic_check_falls_due_sends_one_request() {
+        let (step_tx, steps) = mpsc::channel();
+        let (release, held) = mpsc::channel::<()>();
+        let harness = Harness::with_probe(
+            true,
+            Duration::ZERO,
+            Box::new(move |step| {
+                let _ = step_tx.send(step);
+                if step == Step::Due {
+                    // Hold the worker between the deadline and reserving the check.
+                    let _ = held.recv_timeout(Duration::from_secs(5));
+                }
+            }),
+        );
+        let next = || steps.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(next(), Step::Due);
+        assert!(!harness.checker.status().checking);
+        harness.checker.check_now();
+        release.send(()).unwrap();
+        // The automatic check answers the click, failure included.
+        let status = harness.finish(Err(anyhow::anyhow!("offline")));
+        assert!(status.failed);
+        // Then the click's own request is consumed without a second fetch.
+        assert_eq!(next(), Step::Skipped);
+        assert_eq!(harness.fetches(), 1);
+        assert!(!harness.checker.status().checking);
+        // A later click still checks.
         harness.checker.check_now();
         assert!(harness.finish(tag("0.1.2")).checked);
+        assert_eq!(harness.fetches(), 2);
     }
 
     #[test]
