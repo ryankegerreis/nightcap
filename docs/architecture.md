@@ -36,7 +36,10 @@ src/
     widgets.rs       custom widgets: progress ring, segmented control, toggle switch,
                      grouped list rows, stepper/select rows, round Start/Cancel buttons
     main_window.rs   the main timer window
-    settings_window.rs  Settings window (separate viewport, opened by gear icon / Cmd+,)
+    settings_window.rs  Settings window (separate viewport, opened by gear icon / Cmd+,).
+                     On macOS it opens leaving a strip of the main window showing when the
+                     screen has room: drawing a newly covered window can stall the UI
+                     thread for about a second in Metal
     overlay.rs       fallback dimming overlay: fullscreen, borderless, transparent,
                      always-on-top, mouse-passthrough black viewport with variable alpha.
                      Windows uses a native black layered popup instead, with the alpha
