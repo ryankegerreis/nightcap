@@ -7,28 +7,20 @@ use std::{
     process::Command,
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 use super::{
     Backends, Brightness, Power, Volume,
     display_group::{CapturedDisplay, DisplayDriver, DisplayGroup, DisplayWrite},
-    normalized,
+    normalized, process,
 };
 use crate::settings::EndAction;
 
 fn command(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()
-        .with_context(|| format!("running {program}"))?;
-    ensure!(
-        output.status.success(),
-        "{program} failed ({}): {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    String::from_utf8(output.stdout).with_context(|| format!("decoding {program} output"))
+    process::run(
+        Command::new(program).args(args).env("LC_ALL", "C"),
+        process::TIMEOUT,
+    )
 }
 
 fn parse_wpctl(output: &str) -> Result<f32> {
@@ -320,38 +312,63 @@ fn logind_allows_hibernate(output: &str) -> bool {
 
 impl Power for LinuxPower {
     fn perform(&mut self, action: EndAction) -> Result<()> {
-        let (verb, method) = match action {
-            EndAction::Sleep => ("suspend", "Suspend"),
-            EndAction::Hibernate => ("hibernate", "Hibernate"),
-            EndAction::Shutdown => ("poweroff", "PowerOff"),
-        };
-        if let Err(error) = command("systemctl", &[verb]) {
-            log::debug!("systemctl {verb} failed: {error:#}; trying loginctl");
-            if let Err(fallback) = command("loginctl", &[verb]) {
-                // Modern loginctl versions do not expose these power verbs; call logind
-                // directly when the compatibility command is unavailable.
-                if let Err(dbus) = command(
-                    "busctl",
-                    &[
-                        "--system",
-                        "--timeout=10",
-                        "--allow-interactive-authorization=no",
-                        "call",
-                        "org.freedesktop.login1",
-                        "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager",
-                        method,
-                        "b",
-                        "false",
-                    ],
-                ) {
-                    bail!(
-                        "systemctl {verb}: {error:#}; loginctl fallback: {fallback:#}; logind fallback: {dbus:#}"
-                    );
-                }
-            }
-        }
-        Ok(())
+        // The exit status is the answer: a request that succeeded counts as accepted
+        // whatever it printed.
+        send_power_request(
+            action,
+            Path::new("/run/systemd/system").exists(),
+            |program, args| {
+                process::succeeds(
+                    Command::new(program).args(args).env("LC_ALL", "C"),
+                    process::POWER_TIMEOUT,
+                )
+            },
+        )
+    }
+}
+
+/// Sends the single request `power_request` chooses; its failure is final.
+fn send_power_request(
+    action: EndAction,
+    systemd_booted: bool,
+    send: impl FnOnce(&str, &[&str]) -> Result<()>,
+) -> Result<()> {
+    let (program, args) = power_request(action, systemd_booted);
+    send(program, &args).with_context(|| format!("requesting {action:?} with {program}"))
+}
+
+/// The one request for `action`, chosen before anything is sent. A request that
+/// failed may still have been accepted (a D-Bus reply can time out while logind
+/// suspends), so none is ever followed by another: that could put the machine to
+/// sleep again just after it wakes. Older systemctl versions retry a timed-out
+/// logind call by starting the sleep target themselves, so systemd hosts call
+/// logind directly. Hosts without systemd as init (elogind) use its loginctl,
+/// which has these verbs. Neither may stop to ask for a password: an unattended
+/// timer cannot answer one, and it would hold the request until morning.
+fn power_request(action: EndAction, systemd_booted: bool) -> (&'static str, Vec<&'static str>) {
+    let (verb, method) = match action {
+        EndAction::Sleep => ("suspend", "Suspend"),
+        EndAction::Hibernate => ("hibernate", "Hibernate"),
+        EndAction::Shutdown => ("poweroff", "PowerOff"),
+    };
+    if systemd_booted {
+        (
+            "busctl",
+            vec![
+                "--system",
+                "--timeout=10",
+                "--allow-interactive-authorization=no",
+                "call",
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                method,
+                "b",
+                "false",
+            ],
+        )
+    } else {
+        ("loginctl", vec!["--no-ask-password", verb])
     }
 }
 
@@ -386,6 +403,40 @@ pub fn backends() -> Backends {
 mod tests {
     use super::*;
     use crate::platform::Partial;
+    use anyhow::bail;
+
+    #[test]
+    fn each_end_action_is_one_unattended_request_to_the_hosts_login_manager() {
+        for (action, verb, method) in [
+            (EndAction::Sleep, "suspend", "Suspend"),
+            (EndAction::Hibernate, "hibernate", "Hibernate"),
+            (EndAction::Shutdown, "poweroff", "PowerOff"),
+        ] {
+            let (program, args) = power_request(action, true);
+            assert_eq!(program, "busctl");
+            assert!(args.contains(&"--allow-interactive-authorization=no"));
+            assert_eq!(args[args.len() - 3..], [method, "b", "false"]);
+            let (program, args) = power_request(action, false);
+            assert_eq!(
+                (program, args),
+                ("loginctl", vec!["--no-ask-password", verb])
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_power_request_is_never_followed_by_another() {
+        for systemd_booted in [true, false] {
+            let mut sent = Vec::new();
+            let error = send_power_request(EndAction::Sleep, systemd_booted, |program, _| {
+                sent.push(program.to_owned());
+                bail!("Call failed: Connection timed out")
+            })
+            .unwrap_err();
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        }
+    }
 
     #[test]
     fn hibernate_requires_logind_to_allow_it_without_authentication() {
