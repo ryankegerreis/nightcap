@@ -10,8 +10,9 @@ Windows selects eframe's OpenGL renderer for transparent and hidden viewports.
 ```
 src/
   main.rs            app entry: builds NativeOptions, wires engine + tray + UI
-  instance.rs        one Nightcap per session (Windows): a later launch shows the
-                     running copy's window and exits
+  instance.rs        one Nightcap per session on Windows, and per user on Linux (a lock
+                     and socket in $XDG_RUNTIME_DIR): a later launch shows the running
+                     copy's window and exits
   settings.rs        Settings struct (serde), load/save JSON in the OS config dir
   fade.rs            pure fade math: level at time t for a fade plan (unit tested)
   dimming.rs         screen dimming: picks native brightness or the overlay, carries the fade
