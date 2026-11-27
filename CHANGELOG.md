@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/ryankegerreis/nightcap/compare/v0.2.2...v0.2.3) (2026-11-27)
+
+
+### Bug Fixes
+
+* keep preferences, the overlay, power requests and relaunches reliable ([#32](https://github.com/ryankegerreis/nightcap/issues/32)) ([6a16216](https://github.com/ryankegerreis/nightcap/commit/6a16216a95677aeec5e8efa7825983edc0d20fd6))
+
 ## [0.2.2](https://github.com/ryankegerreis/nightcap/compare/v0.2.1...v0.2.2) (2026-11-18)
 
 
