@@ -47,6 +47,9 @@ objc2-foundation = "0.3.2"
 objc2-app-kit = "0.3.2"
 objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
+
+# Only the Intel IODisplay brightness fallback uses it.
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
 core-foundation = "0.10.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]

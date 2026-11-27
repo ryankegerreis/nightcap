@@ -12,7 +12,7 @@ pub mod fallback;
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 mod process;
 #[cfg(target_os = "windows")]
 pub mod windows;
