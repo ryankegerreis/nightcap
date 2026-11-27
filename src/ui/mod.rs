@@ -40,7 +40,8 @@ pub struct NightcapApp {
     /// What the engine last heard about the overlay.
     overlay_reported: Option<bool>,
     windows: WindowLifecycle,
-    observed_total: Duration,
+    /// The last timer start this window has seen (`Snapshot::started`).
+    observed_start: u64,
     settings: Settings,
     duration_min: u32,
     custom_duration: bool,
@@ -77,7 +78,7 @@ impl NightcapApp {
             overlay: overlay::Overlay::new(),
             overlay_reported: None,
             windows,
-            observed_total: Duration::ZERO,
+            observed_start: 0,
             settings,
             duration_min,
             custom_duration,
@@ -164,17 +165,14 @@ impl eframe::App for NightcapApp {
         self.engine.set_window_visible(self.windows.root_visible());
         self.flush_save();
         let snapshot = self.engine.snapshot();
-        if snapshot.state != TimerState::Idle && snapshot.total != self.observed_total {
-            self.duration_min = (snapshot.total.as_secs() / 60)
-                .clamp(u64::from(MIN_MINUTES), u64::from(MAX_MINUTES))
-                as u32;
+        if let Some(minutes) = started_minutes(&mut self.observed_start, &snapshot) {
+            self.duration_min = minutes;
             self.custom_duration = !PRESETS.contains(&self.duration_min);
             if self.settings.last_duration_min != self.duration_min {
                 self.settings.last_duration_min = self.duration_min;
                 self.mark_settings_dirty();
             }
         }
-        self.observed_total = snapshot.total;
         let updates = self.updates.status();
         // Settings still reports a manual check while automatic checks are off.
         let offered = updates
@@ -353,6 +351,17 @@ impl eframe::App for NightcapApp {
     }
 }
 
+/// The length of a timer started since the last pass, wherever it was started, for
+/// the duration picker and the next launch. "+15 Minutes" extends that timer without
+/// changing the length the user chose, so this reads the start length, not the total.
+fn started_minutes(observed: &mut u64, snapshot: &crate::engine::Snapshot) -> Option<u32> {
+    let started = snapshot.started != std::mem::replace(observed, snapshot.started);
+    (started && snapshot.state != TimerState::Idle && !snapshot.length.is_zero()).then(|| {
+        (snapshot.length.as_secs() / 60).clamp(u64::from(MIN_MINUTES), u64::from(MAX_MINUTES))
+            as u32
+    })
+}
+
 fn settings_view<'a>(
     snapshot: &crate::engine::Snapshot,
     updates: &'a UpdateStatus,
@@ -516,6 +525,40 @@ pub fn install_app_icon() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tray_timer_sets_the_length_but_extending_it_does_not() {
+        use crate::engine::Snapshot;
+        let minutes = |value: u64| Duration::from_secs(value * 60);
+        let timer = |started, state, length, total| Snapshot {
+            started,
+            state,
+            length: minutes(length),
+            total: minutes(total),
+            ..Snapshot::default()
+        };
+        let mut observed = 0;
+        assert_eq!(started_minutes(&mut observed, &Snapshot::default()), None);
+        // Started from the tray (or the window).
+        let started = timer(1, TimerState::Running, 30, 30);
+        assert_eq!(started_minutes(&mut observed, &started), Some(30));
+        assert_eq!(started_minutes(&mut observed, &started), None, "seen once");
+        // +15 Minutes, running or paused.
+        let extended = timer(1, TimerState::Paused, 30, 45);
+        assert_eq!(started_minutes(&mut observed, &extended), None);
+        // Canceled and restarted longer before the window looked again.
+        let restarted = timer(2, TimerState::Running, 90, 90);
+        assert_eq!(started_minutes(&mut observed, &restarted), Some(90));
+        // Started and extended before the window looked: the start length counts.
+        let extended_early = timer(3, TimerState::Running, 45, 60);
+        assert_eq!(started_minutes(&mut observed, &extended_early), Some(45));
+        // Started and canceled unseen, or seen only once it was idle.
+        let canceled = timer(4, TimerState::Idle, 0, 0);
+        assert_eq!(started_minutes(&mut observed, &canceled), None);
+        // Bounded like the picker.
+        let long = timer(5, TimerState::Running, 900, 900);
+        assert_eq!(started_minutes(&mut observed, &long), Some(720));
+    }
 
     #[test]
     fn rebuilt_window_builders_send_no_repeated_icon_commands() {
