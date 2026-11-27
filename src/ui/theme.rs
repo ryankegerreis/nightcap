@@ -1,7 +1,5 @@
 //! System light/dark colors, typography, and spacing tokens from the design mockup.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use eframe::egui::{self, Color32, CornerRadius, FontId, Margin, Shadow, Stroke, TextStyle, Theme};
 
 /// Colors taken from `docs/design/mockup.html` (`.light` / `.dark`).
@@ -81,12 +79,14 @@ pub fn tokens(ctx: &egui::Context) -> ThemeTokens {
     ThemeTokens::for_theme(ctx.theme())
 }
 
-/// Install both palettes once. [`egui::ThemePreference::System`] then picks between them.
+/// Install both palettes once per context. [`egui::ThemePreference::System`] then picks
+/// between them. A process-wide flag would leave every later context unstyled.
 pub fn install(ctx: &egui::Context) {
-    static INSTALLED: AtomicBool = AtomicBool::new(false);
-    if INSTALLED.swap(true, Ordering::Relaxed) {
+    let installed = egui::Id::new("nightcap-theme-installed");
+    if ctx.data(|data| data.get_temp::<bool>(installed).is_some()) {
         return;
     }
+    ctx.data_mut(|data| data.insert_temp(installed, true));
     ctx.style_mut_of(Theme::Light, |style| apply(&ThemeTokens::light(), style));
     ctx.style_mut_of(Theme::Dark, |style| apply(&ThemeTokens::dark(), style));
 }
@@ -206,14 +206,20 @@ pub fn install_fonts(ctx: &egui::Context) {
         "/System/Library/Fonts/HelveticaNeue.ttc",
     ];
     #[cfg(target_os = "windows")]
-    let paths = [r"C:\Windows\Fonts\segoeui.ttf"];
+    let fonts = std::env::var_os("SystemRoot")
+        .map_or_else(|| r"C:\Windows".into(), std::path::PathBuf::from)
+        .join("Fonts");
+    #[cfg(target_os = "windows")]
+    let paths = [fonts.join("segoeui.ttf")];
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let paths: [&str; 0] = [];
     let mut definitions = egui::FontDefinitions::default();
-    if let Some((path, bytes)) = paths
-        .iter()
-        .find_map(|path| std::fs::read(path).ok().map(|bytes| (*path, bytes)))
-    {
+    if let Some((path, bytes)) = paths.iter().find_map(|path| {
+        let path = std::path::Path::new(path);
+        std::fs::read(path)
+            .ok()
+            .map(|bytes| (path.display().to_string(), bytes))
+    }) {
         let regular = shared_font(bytes);
         let mut light = regular.clone();
         if let Some(weight) = light
@@ -230,7 +236,7 @@ pub fn install_fonts(ctx: &egui::Context) {
                 light.index = 5; // HelveticaNeue-UltraLight
             }
             #[cfg(target_os = "windows")]
-            if let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeuil.ttf") {
+            if let Ok(bytes) = std::fs::read(fonts.join("segoeuil.ttf")) {
                 light = shared_font(bytes);
             }
         }
@@ -255,4 +261,21 @@ pub fn install_fonts(ctx: &egui::Context) {
         .families
         .insert(egui::FontFamily::Name("countdown".into()), countdown);
     ctx.set_fonts(definitions);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_context_gets_both_palettes() {
+        for _ in 0..2 {
+            let ctx = egui::Context::default();
+            install(&ctx);
+            for theme in [Theme::Light, Theme::Dark] {
+                let text = ctx.style_of(theme).visuals.override_text_color;
+                assert_eq!(text, Some(ThemeTokens::for_theme(theme).label), "{theme:?}");
+            }
+        }
+    }
 }

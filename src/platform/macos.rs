@@ -12,7 +12,7 @@ use anyhow::{Context, Result, ensure};
 use super::{
     Backends, Brightness, Power, Volume,
     display_group::{CapturedDisplay, DisplayDriver, DisplayGroup, DisplayWrite},
-    normalized,
+    normalized, process,
 };
 use crate::settings::EndAction;
 
@@ -492,17 +492,7 @@ fn status(code: i32, operation: &str) -> Result<()> {
 }
 
 fn command(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("running {program}"))?;
-    ensure!(
-        output.status.success(),
-        "{program} failed ({}): {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    String::from_utf8(output.stdout).with_context(|| format!("decoding {program} output"))
+    process::run(Command::new(program).args(args), process::TIMEOUT)
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -517,9 +507,12 @@ struct MacPower;
 impl Power for MacPower {
     fn perform(&mut self, action: EndAction) -> Result<()> {
         if action == EndAction::Shutdown {
-            command(
-                "osascript",
-                &["-e", "tell application \"System Events\" to shut down"],
+            // An unanswered Automation prompt would otherwise hold the timer for
+            // AppleScript's two-minute event timeout.
+            process::succeeds(
+                Command::new("/usr/bin/osascript")
+                    .args(["-e", "tell application \"System Events\" to shut down"]),
+                process::POWER_TIMEOUT,
             )
             .context("requesting shutdown (System Events may require Automation permission)")?;
             return Ok(());
@@ -542,8 +535,11 @@ impl Power for MacPower {
         };
         if let Err(error) = native {
             log::debug!("IOKit sleep unavailable: {error:#}; trying pmset");
-            command("pmset", &["sleepnow"])
-                .with_context(|| format!("IOKit sleep failed: {error:#}; pmset fallback"))?;
+            process::succeeds(
+                Command::new("/usr/bin/pmset").arg("sleepnow"),
+                process::POWER_TIMEOUT,
+            )
+            .with_context(|| format!("IOKit sleep failed: {error:#}; pmset fallback"))?;
         }
         Ok(())
     }

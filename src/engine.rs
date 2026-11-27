@@ -123,6 +123,11 @@ pub enum Command {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
     pub state: TimerState,
+    /// Counts the timers started since launch, so a new timer can be told apart from
+    /// an extended one even by an observer that missed the idle state in between.
+    pub started: u64,
+    /// The length the current timer was started with. `total` also counts added minutes.
+    pub length: Duration,
     pub total: Duration,
     pub remaining: Duration,
     pub ends_at: Option<chrono::DateTime<chrono::Local>>,
@@ -325,6 +330,8 @@ impl<C: Clock> Engine<C> {
                 self.restore_after = None;
                 self.restore_failures = 0;
                 self.snapshot.state = TimerState::Running;
+                self.snapshot.started = self.snapshot.started.wrapping_add(1);
+                self.snapshot.length = duration;
                 self.snapshot.total = duration;
                 self.snapshot.remaining = duration;
                 self.snapshot.last_error = None;
@@ -548,6 +555,7 @@ impl<C: Clock> Engine<C> {
             self.restore_after = None;
         }
         self.snapshot.state = TimerState::Idle;
+        self.snapshot.length = Duration::ZERO;
         self.snapshot.total = Duration::ZERO;
         self.snapshot.remaining = Duration::ZERO;
         self.snapshot.ends_at = None;
@@ -828,6 +836,23 @@ mod tests {
         close(h.brightness(), 0.2);
         h.engine.command(Command::Cancel);
         close(h.brightness(), 0.8);
+    }
+
+    #[test]
+    fn each_start_is_numbered_and_keeps_its_length_through_extensions() {
+        let mut h = Harness::new(preferences(), true);
+        assert_eq!(h.engine.snapshot().started, 0);
+        h.start();
+        h.engine.command(Command::AddMinutes(15));
+        let snapshot = h.engine.snapshot();
+        assert_eq!(snapshot.started, 1);
+        assert_eq!(snapshot.length, Duration::from_secs(180));
+        assert_eq!(snapshot.total, Duration::from_secs(180 + 15 * 60));
+        h.engine.command(Command::Cancel);
+        assert_eq!(h.engine.snapshot().started, 1);
+        assert_eq!(h.engine.snapshot().length, Duration::ZERO);
+        h.start();
+        assert_eq!(h.engine.snapshot().started, 2);
     }
 
     #[test]
@@ -1199,6 +1224,59 @@ mod tests {
             close(h.volume(), 0.4);
             assert_eq!(h.engine.snapshot().state, TimerState::Idle);
         }
+    }
+
+    #[test]
+    fn without_restoration_cancel_and_wake_still_remove_the_overlay() {
+        for wake in [false, true] {
+            let mut settings = preferences();
+            settings.restore_on_cancel_or_wake = false;
+            let mut h = Harness::new(settings, false);
+            h.start();
+            h.advance(150);
+            assert!(h.engine.snapshot().dimming.overlay_alpha > 0.5);
+            if wake {
+                h.clock.jump_wall(60);
+                h.engine.tick();
+            } else {
+                h.engine.command(Command::Cancel);
+            }
+            let snapshot = h.engine.snapshot();
+            assert_eq!(snapshot.state, TimerState::Idle);
+            // Volume keeps its faded level, as the setting asks.
+            close(h.volume(), 0.4);
+            // Nothing but Nightcap could take its own window away.
+            close(snapshot.dimming.overlay_alpha, 0.0);
+            assert_eq!(snapshot.dimming.percent, None);
+            // The next timer fades from an undimmed screen.
+            h.start();
+            h.advance(90);
+            close(h.engine.snapshot().dimming.overlay_alpha, 0.36);
+        }
+    }
+
+    #[test]
+    fn without_restoration_a_wake_after_native_failure_clears_only_the_overlay() {
+        let mut settings = preferences();
+        settings.restore_on_cancel_or_wake = false;
+        let mut h = Harness::new(settings, true);
+        h.start();
+        h.advance(90);
+        let last_written = h.brightness();
+        close(last_written, 0.5);
+        // Native writes fail partway, so the overlay carries the rest of the fade.
+        h.brightness.state.lock().unwrap().fail_set = true;
+        h.advance(90);
+        let snapshot = h.engine.snapshot();
+        assert_eq!(snapshot.state, TimerState::Finishing);
+        assert!(snapshot.dimming.overlay_alpha > 0.0);
+        h.engine.command(Command::SystemWoke);
+        let snapshot = h.engine.snapshot();
+        assert_eq!(snapshot.state, TimerState::Idle);
+        close(snapshot.dimming.overlay_alpha, 0.0);
+        assert_eq!(snapshot.dimming.percent, None);
+        close(h.brightness(), last_written);
+        assert!(h.brightness.state.lock().unwrap().restore_calls.is_empty());
     }
 
     #[test]

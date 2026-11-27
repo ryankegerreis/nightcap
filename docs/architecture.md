@@ -10,8 +10,9 @@ Windows selects eframe's OpenGL renderer for transparent and hidden viewports.
 ```
 src/
   main.rs            app entry: builds NativeOptions, wires engine + tray + UI
-  instance.rs        one Nightcap per session (Windows): a later launch shows the
-                     running copy's window and exits
+  instance.rs        one Nightcap per session on Windows, and per user on Linux (a lock
+                     and socket in $XDG_RUNTIME_DIR): a later launch shows the running
+                     copy's window and exits
   settings.rs        Settings struct (serde), load/save JSON in the OS config dir
   fade.rs            pure fade math: level at time t for a fade plan (unit tested)
   dimming.rs         screen dimming: picks native brightness or the overlay, carries the fade
@@ -108,7 +109,11 @@ pub trait Power: Send { fn perform(&mut self, action: EndAction) -> Result<()>; 
 ```
 Levels are `0.0..=1.0`. `Result` is `anyhow::Result`. Native OS APIs are preferred;
 well-known OS command-line tools are an acceptable fallback (e.g. `pmset sleepnow`,
-`systemctl suspend`, `wpctl`/`pactl`/`amixer`, `/sys/class/backlight`).
+`wpctl`/`pactl`/`amixer`, `/sys/class/backlight`). Tools run with a deadline
+(`platform/process.rs`), so one that hangs cannot stall the engine. A Linux end action
+is exactly one request, never retried another way, since a failed one may still have
+been accepted: logind's Manager method through `busctl` on systemd hosts, elogind's
+`loginctl` otherwise. Without that client the end action fails and levels are restored.
 
 Every OS implements `Brightness` through `DisplayGroup`. Its adapters implement
 `DisplayDriver`: they capture each display's level and native range, and write the

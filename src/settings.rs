@@ -8,7 +8,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
 
 pub const MIN_DURATION_MIN: u32 = 1;
 pub const MAX_DURATION_MIN: u32 = 720;
@@ -127,7 +128,7 @@ impl Settings {
                 // Windows editors and PowerShell 5's UTF-8 output start with a BOM,
                 // which serde_json rejects; that would reset and overwrite every setting.
                 let json = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
-                serde_json::from_slice::<Self>(json).context("parsing settings JSON")
+                Self::from_json(json)
             });
         match result {
             Ok(mut settings) => {
@@ -139,6 +140,40 @@ impl Settings {
                 Self::default()
             }
         }
+    }
+
+    /// The typed schema decides what a valid file means. When it rejects the file,
+    /// each preference is read on its own: a missing or invalid value keeps its
+    /// default, so one bad field (a hand edit, or a value a newer Nightcap wrote)
+    /// cannot reset every other preference, which the next save would then overwrite.
+    /// Raw values are left unparsed until read, so even a number no type can hold
+    /// (`1e400`) only affects its own field, or none if Nightcap does not know it.
+    fn from_json(json: &[u8]) -> Result<Self> {
+        let error = match serde_json::from_slice::<Self>(json) {
+            Ok(settings) => return Ok(settings),
+            Err(error) => error,
+        };
+        let fields: Fields<'_> = serde_json::from_slice(json)
+            .with_context(|| format!("parsing settings JSON ({error})"))?;
+        log::warn!("Recovering settings one by one: {error}");
+        let defaults = Self::default();
+        Ok(Self {
+            dim: fade(&fields, "dim", defaults.dim),
+            volume: fade(&fields, "volume", defaults.volume),
+            end_action: field(&fields, "end_action", defaults.end_action),
+            restore_on_cancel_or_wake: field(
+                &fields,
+                "restore_on_cancel_or_wake",
+                defaults.restore_on_cancel_or_wake,
+            ),
+            show_time_in_menu_bar: field(
+                &fields,
+                "show_time_in_menu_bar",
+                defaults.show_time_in_menu_bar,
+            ),
+            last_duration_min: field(&fields, "last_duration_min", defaults.last_duration_min),
+            check_for_updates: field(&fields, "check_for_updates", defaults.check_for_updates),
+        })
     }
 
     fn save_to(&self, path: &Path) -> Result<()> {
@@ -156,6 +191,57 @@ impl Settings {
             .context("flushing settings")?;
         temporary.persist(path).context("replacing settings file")?;
         Ok(())
+    }
+}
+
+/// An object's members, each still unparsed JSON.
+type Fields<'a> = std::collections::BTreeMap<String, &'a RawValue>;
+
+fn field<T: DeserializeOwned>(fields: &Fields<'_>, name: &str, default: T) -> T {
+    read(fields.get(name).copied(), name, default)
+}
+
+/// `label` names the value in the log, e.g. `dim.target_percent`.
+fn read<T: DeserializeOwned>(value: Option<&RawValue>, label: &str, default: T) -> T {
+    match value {
+        None => default,
+        Some(value) => serde_json::from_str(value.get()).unwrap_or_else(|error| {
+            log::warn!("Ignoring the saved {label} setting: {error}");
+            default
+        }),
+    }
+}
+
+/// A fade the typed schema accepts loads whole; otherwise each of its fields falls
+/// back to that fade's own default, not to `FadeSettings::default`.
+fn fade(fields: &Fields<'_>, name: &str, default: FadeSettings) -> FadeSettings {
+    let Some(raw) = fields.get(name) else {
+        return default;
+    };
+    if let Ok(fade) = serde_json::from_str(raw.get()) {
+        return fade;
+    }
+    let fade: Fields<'_> = match serde_json::from_str(raw.get()) {
+        Ok(fade) => fade,
+        Err(error) => {
+            log::warn!("Ignoring the saved {name} settings: {error}");
+            return default;
+        }
+    };
+    let value = |key: &str| (fade.get(key).copied(), format!("{name}.{key}"));
+    let (enabled, label) = value("enabled");
+    let enabled = read(enabled, &label, default.enabled);
+    let (before, label) = value("start_before_min");
+    let start_before_min = read(before, &label, default.start_before_min);
+    let (over, label) = value("over_min");
+    let over_min = read(over, &label, default.over_min);
+    let (target, label) = value("target_percent");
+    let target_percent = read(target, &label, default.target_percent);
+    FadeSettings {
+        enabled,
+        start_before_min,
+        over_min,
+        target_percent,
     }
 }
 
@@ -269,6 +355,190 @@ mod tests {
         assert_eq!(loaded.last_duration_min, 60);
         // Files saved before update checks existed turn them on.
         assert!(loaded.check_for_updates);
+    }
+
+    #[test]
+    fn every_field_survives_a_save_and_load() {
+        // Every value differs from its default, so a field `from_json` forgot fails here.
+        let settings = Settings {
+            dim: FadeSettings {
+                enabled: false,
+                start_before_min: 30,
+                over_min: 20,
+                target_percent: 35,
+            },
+            volume: FadeSettings {
+                enabled: false,
+                start_before_min: 45,
+                over_min: 30,
+                target_percent: 40,
+            },
+            end_action: EndAction::Shutdown,
+            restore_on_cancel_or_wake: false,
+            show_time_in_menu_bar: false,
+            last_duration_min: 120,
+            check_for_updates: false,
+        };
+        let json = serde_json::to_value(&settings).unwrap();
+        let defaults = serde_json::to_value(Settings::default()).unwrap();
+        for (key, value) in json.as_object().unwrap() {
+            assert_ne!(Some(value), defaults.get(key), "{key} matches its default");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        settings.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path), settings);
+    }
+
+    #[test]
+    fn an_invalid_value_resets_only_that_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "dim": {"enabled": false, "start_before_min": 30, "over_min": 20, "target_percent": 300},
+                "volume": {"target_percent": 5},
+                "end_action": "Lock",
+                "restore_on_cancel_or_wake": false,
+                "show_time_in_menu_bar": "yes",
+                "last_duration_min": -5,
+                "check_for_updates": false,
+                "added_by_a_newer_version": true
+            }"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        let defaults = Settings::default();
+        // Out of range for its type: that one field takes the dim default.
+        assert_eq!(
+            loaded.dim,
+            FadeSettings {
+                enabled: false,
+                start_before_min: 30,
+                over_min: 20,
+                target_percent: defaults.dim.target_percent,
+            }
+        );
+        // A partial fade keeps the volume defaults, not the dim ones.
+        assert_eq!(
+            loaded.volume,
+            FadeSettings {
+                target_percent: 5,
+                ..defaults.volume
+            }
+        );
+        assert_eq!(loaded.end_action, EndAction::Sleep);
+        assert!(!loaded.restore_on_cancel_or_wake);
+        assert_eq!(loaded.show_time_in_menu_bar, defaults.show_time_in_menu_bar);
+        assert_eq!(loaded.last_duration_min, defaults.last_duration_min);
+        assert!(!loaded.check_for_updates);
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_an_object_uses_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for json in ["[]", "null", "42", "\"text\""] {
+            std::fs::write(&path, json).unwrap();
+            assert_eq!(Settings::load_from(&path), Settings::default(), "{json}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_fade_resets_only_that_fade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for dim in ["7", "null", "\"off\"", "[false]"] {
+            std::fs::write(
+                &path,
+                format!(r#"{{"dim": {dim}, "last_duration_min": 90, "check_for_updates": null}}"#),
+            )
+            .unwrap();
+            let loaded = Settings::load_from(&path);
+            assert_eq!(loaded.dim, Settings::default().dim, "{dim}");
+            assert_eq!(loaded.last_duration_min, 90, "{dim}");
+            assert!(loaded.check_for_updates, "{dim}");
+        }
+    }
+
+    #[test]
+    fn a_number_no_setting_can_hold_affects_only_its_own_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Unknown: ignored, as the typed schema always has.
+        std::fs::write(
+            &path,
+            r#"{"last_duration_min": 90, "from_a_newer_version": 1e400}"#,
+        )
+        .unwrap();
+        assert_eq!(Settings::load_from(&path).last_duration_min, 90);
+        // Unknown, while an invalid dim sends loading down the field-by-field path,
+        // which must still read every valid value.
+        std::fs::write(
+            &path,
+            r#"{"dim": 7, "from_a_newer_version": 1e400, "last_duration_min": 90,
+                "end_action": "Shutdown", "restore_on_cancel_or_wake": false,
+                "show_time_in_menu_bar": false, "check_for_updates": false,
+                "volume": {"enabled": false}}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(
+            loaded,
+            Settings {
+                volume: FadeSettings {
+                    enabled: false,
+                    ..Settings::default().volume
+                },
+                end_action: EndAction::Shutdown,
+                restore_on_cancel_or_wake: false,
+                show_time_in_menu_bar: false,
+                last_duration_min: 90,
+                check_for_updates: false,
+                ..Settings::default()
+            }
+        );
+        // Known: only that field takes its default.
+        std::fs::write(
+            &path,
+            r#"{"last_duration_min": 1e400, "dim": {"target_percent": 1e400, "over_min": 5}, "show_time_in_menu_bar": false}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        let defaults = Settings::default();
+        assert_eq!(loaded.last_duration_min, defaults.last_duration_min);
+        assert_eq!(
+            loaded.dim,
+            FadeSettings {
+                over_min: 5,
+                ..defaults.dim
+            }
+        );
+        assert!(!loaded.show_time_in_menu_bar);
+    }
+
+    #[test]
+    fn positional_fades_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let positional = FadeSettings {
+            enabled: false,
+            start_before_min: 30,
+            over_min: 20,
+            target_percent: 35,
+        };
+        std::fs::write(&path, r#"{"dim": [false, 30, 20, 35]}"#).unwrap();
+        assert_eq!(Settings::load_from(&path).dim, positional);
+        // Also when another field sends loading down the field-by-field path.
+        std::fs::write(
+            &path,
+            r#"{"dim": [false, 30, 20, 35], "end_action": "Lock"}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.dim, positional);
+        assert_eq!(loaded.end_action, EndAction::Sleep);
     }
 
     #[test]

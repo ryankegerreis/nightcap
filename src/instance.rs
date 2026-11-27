@@ -11,8 +11,28 @@ pub enum Launch {
 }
 
 /// Windows names are per session (`Local\`), matching the tray and windows a user sees.
+/// Linux uses the user's runtime directory, so it is per user: a second graphical
+/// session of the same user shows the first session's window instead of starting.
 pub fn acquire() -> Launch {
-    imp::acquire("Local\\Nightcap", imp::ACTIVATION_TIMEOUT)
+    #[cfg(target_os = "windows")]
+    {
+        imp::acquire("Local\\Nightcap", imp::ACTIVATION_TIMEOUT)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        match imp::runtime_base(std::env::var_os("XDG_RUNTIME_DIR")) {
+            Ok(base) => imp::acquire(&base, imp::ACTIVATION_TIMEOUT),
+            Err(reason) => {
+                // Never refuse to start because the guard itself is unavailable.
+                log::warn!("Single-instance check unavailable: {reason}");
+                Launch::Primary(imp::Instance::unguarded())
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        imp::acquire("Nightcap", imp::ACTIVATION_TIMEOUT)
+    }
 }
 
 pub use imp::Instance;
@@ -684,13 +704,678 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+/// An advisory lock on `<base>.lock` marks the running copy. It listens on the Unix
+/// socket `<base>.sock`, where a later launch sends when it stops waiting and reads
+/// one byte back: 1 shown, 0 refused. The kernel drops the lock when a copy exits or
+/// crashes, so a stale socket never outlives its owner's claim.
+#[cfg(target_os = "linux")]
+mod imp {
+    use std::{
+        ffi::OsString,
+        fs::{self, File, OpenOptions, Permissions, TryLockError},
+        io::{self, Read, Write},
+        os::unix::{
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            net::{UnixListener, UnixStream},
+        },
+        path::{Path, PathBuf},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread::{self, JoinHandle},
+        time::{Duration, Instant},
+    };
+
+    use super::Launch;
+
+    /// How long a later launch waits for the running copy to show itself or exit.
+    pub(super) const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Leaves time for the reply to reach the launch before its own timeout.
+    const REPLY_MARGIN: Duration = Duration::from_millis(250);
+    /// How often a waiting launch asks again, or checks whether the copy exited.
+    const POLL: Duration = Duration::from_millis(100);
+    /// A client that connects but sends nothing cannot hold up the launches behind it.
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+    /// Owner read and write. The sticky bit keeps the runtime directory's periodic
+    /// clean-up from removing the files while Nightcap runs (XDG Base Directory
+    /// specification): a removed lock path would let a second copy lock a new file.
+    const MODE: u32 = 0o1600;
+
+    /// Where the guard's files go: the runtime directory, if it is what the XDG
+    /// specification promises (absolute, owned by this user, private to them).
+    pub(super) fn runtime_base(dir: Option<OsString>) -> Result<PathBuf, String> {
+        let dir = PathBuf::from(
+            dir.filter(|dir| !dir.is_empty())
+                .ok_or("XDG_RUNTIME_DIR is not set")?,
+        );
+        if !dir.is_absolute() {
+            return Err(format!("XDG_RUNTIME_DIR {} is not absolute", dir.display()));
+        }
+        let metadata = fs::metadata(&dir)
+            .map_err(|error| format!("XDG_RUNTIME_DIR {}: {error}", dir.display()))?;
+        let private = metadata.is_dir()
+            && metadata.uid() == rustix::process::getuid().as_raw()
+            && metadata.mode() & 0o077 == 0;
+        if !private {
+            return Err(format!(
+                "XDG_RUNTIME_DIR {} is not a directory private to this user",
+                dir.display()
+            ));
+        }
+        Ok(dir.join("nightcap"))
+    }
+
+    /// The system-wide monotonic clock, which every process reads alike. It stands
+    /// still while the machine sleeps and is not moved by wall-clock changes.
+    fn monotonic() -> Duration {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        Duration::new(
+            u64::try_from(now.tv_sec).unwrap_or(0),
+            u32::try_from(now.tv_nsec).unwrap_or(0),
+        )
+    }
+
+    /// Connects without waiting: a listener whose queue is full is busy right now.
+    fn connect(socket: &Path) -> io::Result<UnixStream> {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+        let fd = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )?;
+        rustix::net::connect(&fd, &SocketAddrUnix::new(socket)?)?;
+        let stream = UnixStream::from(fd);
+        stream.set_nonblocking(false)?;
+        Ok(stream)
+    }
+
+    /// Holds the lock until dropped; keep it until levels are restored.
+    pub struct Instance {
+        /// None when the guard is unavailable and the app runs unguarded.
+        lock: Option<File>,
+        socket: PathBuf,
+        /// The listener's stop flag and thread.
+        listener: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    }
+
+    impl Instance {
+        pub(super) fn unguarded() -> Self {
+            Self {
+                lock: None,
+                socket: PathBuf::new(),
+                listener: None,
+            }
+        }
+    }
+
+    fn primary(lock: File, socket: PathBuf) -> Launch {
+        // The file may predate the sticky bit, or have been made by another tool.
+        if let Err(error) = lock.set_permissions(Permissions::from_mode(MODE)) {
+            log::warn!("Could not protect the instance lock from clean-up: {error}");
+        }
+        Launch::Primary(Instance {
+            lock: Some(lock),
+            socket,
+            listener: None,
+        })
+    }
+
+    /// Ok(false) while another copy holds the lock.
+    fn try_lock(file: &File) -> io::Result<bool> {
+        match file.try_lock() {
+            Ok(()) => Ok(true),
+            Err(TryLockError::WouldBlock) => Ok(false),
+            Err(TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    pub(super) fn acquire(base: &Path, timeout: Duration) -> Launch {
+        let socket = base.with_extension("sock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(MODE)
+            .open(base.with_extension("lock"));
+        let lock = match lock {
+            Ok(lock) => lock,
+            Err(error) => {
+                // Never refuse to start because the guard itself is unavailable.
+                log::warn!("Single-instance check unavailable: {error}");
+                return Launch::Primary(Instance::unguarded());
+            }
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match try_lock(&lock) {
+                Ok(true) => return primary(lock, socket),
+                Ok(false) => {}
+                Err(error) => {
+                    log::warn!("Single-instance check unavailable: {error}");
+                    return Launch::Primary(Instance::unguarded());
+                }
+            }
+            // A copy that refuses is quitting, and one not listening yet is starting:
+            // either way, ask again until it shows itself or exits.
+            if ask(&socket, deadline) == Some(true) {
+                return Launch::Secondary { shown: true };
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                log::warn!("The running Nightcap did not respond");
+                return Launch::Secondary { shown: false };
+            }
+            thread::sleep(remaining.min(POLL));
+        }
+    }
+
+    /// Whether the running copy showed its window; None when it could not be asked.
+    fn ask(socket: &Path, deadline: Instant) -> Option<bool> {
+        let mut stream = connect(socket).ok()?;
+        // When this launch stops waiting, on the clock both processes share, so time
+        // spent queued behind another launch counts.
+        let stops = monotonic().checked_add(time_left(deadline).ok()?)?;
+        let stops = u64::try_from(stops.as_nanos()).ok()?;
+        write_by(&mut stream, &stops.to_le_bytes(), deadline).ok()?;
+        let mut reply = [0];
+        read_by(&mut stream, &mut reply, deadline).ok()?;
+        Some(reply[0] == 1)
+    }
+
+    /// Answers one launch. One that has (nearly) given up is refused rather than shown late.
+    fn answer(mut stream: UnixStream, activate: &dyn Fn(Duration) -> bool) {
+        let mut request = [0; 8];
+        if read_by(&mut stream, &mut request, Instant::now() + REQUEST_TIMEOUT).is_err() {
+            return;
+        }
+        let left = Duration::from_nanos(u64::from_le_bytes(request))
+            .saturating_sub(monotonic())
+            .min(ACTIVATION_TIMEOUT);
+        let allowed = left.saturating_sub(REPLY_MARGIN);
+        let shown = !allowed.is_zero() && activate(allowed);
+        let _ = write_by(
+            &mut stream,
+            &[u8::from(shown)],
+            Instant::now() + REQUEST_TIMEOUT,
+        );
+    }
+
+    /// The time until `deadline`; an error once it has passed, never "no timeout".
+    fn time_left(deadline: Instant) -> io::Result<Duration> {
+        Some(deadline.saturating_duration_since(Instant::now()))
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| io::ErrorKind::TimedOut.into())
+    }
+
+    /// Reads all of `bytes` by `deadline`, however slowly they arrive.
+    fn read_by(stream: &mut UnixStream, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
+        while !bytes.is_empty() {
+            stream.set_read_timeout(Some(time_left(deadline)?))?;
+            match stream.read(bytes) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(read) => bytes = &mut bytes[read..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes all of `bytes` by `deadline`.
+    fn write_by(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+        while !bytes.is_empty() {
+            stream.set_write_timeout(Some(time_left(deadline)?))?;
+            match stream.write(bytes) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => bytes = &bytes[written..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    impl Instance {
+        /// Answers each later launch on a background thread. `activate` gets the
+        /// time that launch will wait; it should return true once the window has
+        /// been asked to show, and false when it cannot be (the app is quitting)
+        /// or no answer came in time. A refused launch starts its own copy once
+        /// this one exits. Focus remains subject to the window manager.
+        pub fn on_activate(&mut self, activate: impl Fn(Duration) -> bool + Send + 'static) {
+            if self.lock.is_none() || self.listener.is_some() {
+                return;
+            }
+            // A copy that crashed leaves its socket behind. Holding the lock makes
+            // the path this copy's to replace.
+            let _ = fs::remove_file(&self.socket);
+            let listener = match UnixListener::bind(&self.socket) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    log::warn!("Could not listen for later launches: {error}");
+                    return;
+                }
+            };
+            if let Err(error) = fs::set_permissions(&self.socket, Permissions::from_mode(MODE)) {
+                log::warn!("Could not protect the launch socket from clean-up: {error}");
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let thread = thread::Builder::new()
+                .name("nightcap-instance".into())
+                .spawn(move || {
+                    for stream in listener.incoming() {
+                        if stopping.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if let Ok(stream) = stream {
+                            answer(stream, &activate);
+                        }
+                    }
+                });
+            match thread {
+                Ok(thread) => self.listener = Some((stop, thread)),
+                Err(error) => {
+                    log::warn!("Could not listen for later launches: {error}");
+                    let _ = fs::remove_file(&self.socket);
+                }
+            }
+        }
+    }
+
+    impl Drop for Instance {
+        fn drop(&mut self) {
+            if let Some((stop, listener)) = self.listener.take() {
+                stop.store(true, Ordering::Release);
+                // Wake the blocked accept. If that cannot connect at once (the socket
+                // was removed, or its queue is full), the thread ends with the process.
+                if connect(&self.socket).is_ok() {
+                    let _ = listener.join();
+                }
+                // Before the lock is released, so a successor's socket is never removed.
+                let _ = fs::remove_file(&self.socket);
+            }
+            // Dropping the file afterwards releases the lock.
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::mpsc;
+
+        use super::*;
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        fn base(dir: &tempfile::TempDir) -> PathBuf {
+            dir.path().join("nightcap")
+        }
+
+        /// A launch that must become the primary, may listen (accepting or
+        /// refusing), then holds the lock until `exit` is sent or dropped.
+        fn run_primary(base: &Path, listen: Option<bool>) -> (mpsc::Sender<()>, JoinHandle<()>) {
+            let base = base.to_owned();
+            let (ready_tx, ready) = mpsc::channel();
+            let (exit, exit_rx) = mpsc::channel::<()>();
+            let thread = thread::spawn(move || {
+                let Launch::Primary(mut instance) = acquire(&base, TIMEOUT) else {
+                    panic!("{} must start as the primary", base.display());
+                };
+                if let Some(accept) = listen {
+                    instance.on_activate(move |_| accept);
+                }
+                ready_tx.send(()).unwrap();
+                let _ = exit_rx.recv();
+            });
+            ready.recv_timeout(TIMEOUT).unwrap();
+            (exit, thread)
+        }
+
+        /// A later launch: "primary" (it listens and accepts, then exits after
+        /// `hold`), "shown" or "failed".
+        fn later_launch(base: &Path, hold: Duration) -> JoinHandle<&'static str> {
+            let base = base.to_owned();
+            thread::spawn(move || match acquire(&base, TIMEOUT) {
+                Launch::Primary(mut instance) => {
+                    instance.on_activate(|_| true);
+                    thread::sleep(hold);
+                    "primary"
+                }
+                Launch::Secondary { shown: true } => "shown",
+                Launch::Secondary { shown: false } => "failed",
+            })
+        }
+
+        fn outcome(launch: Launch) -> &'static str {
+            match launch {
+                Launch::Primary(_) => "primary",
+                Launch::Secondary { shown: true } => "shown",
+                Launch::Secondary { shown: false } => "failed",
+            }
+        }
+
+        fn request(base: &Path, stops: u64) -> u8 {
+            let mut stream = UnixStream::connect(base.with_extension("sock")).unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            stream.write_all(&stops.to_le_bytes()).unwrap();
+            let mut reply = [9];
+            stream.read_exact(&mut reply).unwrap();
+            reply[0]
+        }
+
+        fn in_ms(milliseconds: u64) -> u64 {
+            (monotonic() + Duration::from_millis(milliseconds)).as_nanos() as u64
+        }
+
+        #[test]
+        fn later_launches_activate_the_first_and_the_guard_is_released_on_exit() {
+            let dir = tempfile::tempdir().unwrap();
+            let base = base(&dir);
+            let (exit, first) = run_primary(&base, Some(true));
+            for _ in 0..2 {
+                let started = Instant::now();
+                assert_eq!(outcome(acquire(&base, TIMEOUT)), "shown");
+                assert!(started.elapsed() < TIMEOUT);
+            }
+            drop(exit);
+            first.join().unwrap();
+            assert!(!base.with_extension("sock").exists(), "socket left behind");
+            let (exit, first) = run_primary(&base, None);
+            drop(exit);
+            first.join().unwrap();
+        }
+
+        #[test]
+        fn the_lock_and_socket_are_protected_from_runtime_clean_up() {
+            let dir = tempfile::tempdir().unwrap();
+            let base = base(&dir);
+            fs::write(base.with_extension("lock"), b"").unwrap();
+            let (exit, first) = run_primary(&base, Some(true));
+            for path in [base.with_extension("lock"), base.with_extension("sock")] {
+                let mode = fs::metadata(&path).unwrap().mode() & 0o7777;
+                assert_eq!(mode, MODE, "{}", path.display());
+            }
+            drop(exit);
+            first.join().unwrap();
+        }
+
+        #[test]
+        fn only_a_private_absolute_runtime_directory_is_used() {
+            let dir = tempfile::tempdir().unwrap();
+            fs::set_permissions(dir.path(), Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                runtime_base(Some(dir.path().into())).unwrap(),
+                dir.path().join("nightcap")
+            );
+            fs::set_permissions(dir.path(), Permissions::from_mode(0o755)).unwrap();
+            assert!(runtime_base(Some(dir.path().into())).is_err(), "shared");
+            let file = dir.path().join("file");
+            fs::write(&file, b"").unwrap();
+            assert!(runtime_base(Some(file.into())).is_err(), "not a directory");
+            assert!(runtime_base(Some("relative".into())).is_err());
+            assert!(runtime_base(Some("".into())).is_err());
+            assert!(runtime_base(None).is_err());
+        }
+
+        #[test]
+        fn a_launch_before_the_first_listens_is_answered() {
+            let dir = tempfile::tempdir().unwrap();
+            let base = base(&dir);
+            let (exit, exit_rx) = mpsc::channel::<()>();
+            let (ready_tx, ready) = mpsc::channel();
+            let first = {
+                let base = base.clone();
+                thread::spawn(move || {
+                    let Launch::Primary(mut instance) = acquire(&base, TIMEOUT) else {
+                        panic!("the first launch must own the instance");
+                    };
+                    ready_tx.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(300));
+                    let (shown, activations) = mpsc::channel();
+                    instance.on_activate(move |_| shown.send(()).is_ok());
+                    let _ = exit_rx.recv();
+                    activations.try_iter().count()
+                })
+            };
+            ready.recv_timeout(TIMEOUT).unwrap();
+            assert_eq!(outcome(acquire(&base, TIMEOUT)), "shown");
+            drop(exit);
+            assert_eq!(first.join().unwrap(), 1);
+        }
+
+        #[test]
+        fn launches_refused_during_quit_start_one_copy_that_shows_for_the_other() {
+            let dir = tempfile::tempdir().unwrap();
+            let base = base(&dir);
+            // A quitting app refuses to show its window.
+            let (exit, first) = run_primary(&base, Some(false));
+            let launches = [
+                later_launch(&base, Duration::from_millis(500)),
+                later_launch(&base, Duration::from_millis(500)),
+            ];
+            thread::sleep(Duration::from_millis(300));
+            drop(exit);
+            first.join().unwrap();
+            let mut outcomes: Vec<_> = launches
+                .into_iter()
+                .map(|launch| launch.join().unwrap())
+                .collect();
+            outcomes.sort();
+            assert_eq!(outcomes, ["primary", "shown"]);
+        }
+
+        #[test]
+        fn a_crashed_copy_leaves_nothing_that_blocks_the_next_launch() {
+            let dir = tempfile::tempdir().unwrap();
+            let base = base(&dir);
+            // A crash keeps neither the lock nor a listener, only the socket file.
+            drop(UnixListener::bind(base.with_extension("sock")).unwrap());
+            fs::write(base.with_extension("lock"), b"").unwrap();
+            let started = Instant::now();
+            let Launch::Primary(mut instance) = acquire(&base, TIMEOUT) else {
+                panic!("a stale socket must not block the next launch");
+            };
+            assert!(started.elapsed() < Duration::from_secs(1));
+            instance.on_activate(|_| true);
+            assert_eq!(outcome(acquire(&base, TIMEOUT)), "shown");
+        }
+
+        #[test]
+        fn a_copy_that_never_answers_is_reported_after_the_timeout() {
+            let dir = tempfile::tempdir().unwrap();
+            let base = base(&dir);
+            let (exit, first) = run_primary(&base, None);
+            let started = Instant::now();
+            assert_eq!(
+                outcome(acquire(&base, Duration::from_millis(400))),
+                "failed"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+            drop(exit);
+            first.join().unwrap();
+        }
+
+        #[test]
+        fn a_full_listener_queue_cannot_hold_a_launch_past_its_deadline() {
+            use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+            let dir = tempfile::tempdir().unwrap();
+            let base = base(&dir);
+            // Bound but never accepting, with its queue filled.
+            let (exit, first) = run_primary(&base, None);
+            let socket = base.with_extension("sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let address = SocketAddrUnix::new(&socket).unwrap();
+            let mut queued = Vec::new();
+            loop {
+                let fd = rustix::net::socket_with(
+                    AddressFamily::UNIX,
+                    SocketType::STREAM,
+                    SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+                    None,
+                )
+                .unwrap();
+                if rustix::net::connect(&fd, &address).is_err() {
+                    break;
+                }
+                queued.push(fd);
+                assert!(queued.len() < 100_000, "the queue never filled");
+            }
+            let (done, outcome_rx) = mpsc::channel();
+            let launch = {
+                let base = base.clone();
+                thread::spawn(move || {
+                    let _ = done.send(outcome(acquire(&base, Duration::from_millis(400))));
+                })
+            };
+            assert_eq!(
+                outcome_rx.recv_timeout(Duration::from_secs(3)),
+                Ok("failed"),
+                "the launch waited on the full queue"
+            );
+            launch.join().unwrap();
+            drop((listener, queued, exit));
+            first.join().unwrap();
+        }
+
+        #[test]
+        fn a_copy_that_reads_the_request_but_never_replies_cannot_hold_a_launch() {
+            let dir = tempfile::tempdir().unwrap();
+            let base = base(&dir);
+            let (exit, first) = run_primary(&base, None);
+            let listener = UnixListener::bind(base.with_extension("sock")).unwrap();
+            let (read_tx, read) = mpsc::channel();
+            let peer = thread::spawn(move || {
+                let mut held = Vec::new();
+                // Accept every attempt, read its request and keep it open unanswered.
+                listener.set_nonblocking(true).unwrap();
+                let until = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < until {
+                    if let Ok((mut stream, _)) = listener.accept() {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut request = [0; 8];
+                        if stream.read_exact(&mut request).is_ok() {
+                            let _ = read_tx.send(());
+                        }
+                        held.push(stream);
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+            let (done, outcome_rx) = mpsc::channel();
+            let launch = {
+                let base = base.clone();
+                thread::spawn(move || {
+                    let _ = done.send(outcome(acquire(&base, Duration::from_millis(400))));
+                })
+            };
+            assert_eq!(
+                outcome_rx.recv_timeout(Duration::from_secs(3)),
+                Ok("failed"),
+                "the launch waited on a reply"
+            );
+            assert!(read.try_recv().is_ok(), "the request was sent and read");
+            launch.join().unwrap();
+            peer.join().unwrap();
+            drop(exit);
+            first.join().unwrap();
+        }
+
+        #[test]
+        fn an_expired_deadline_never_means_waiting_without_a_timeout() {
+            let (mut ours, _theirs) = UnixStream::pair().unwrap();
+            let past = Instant::now() - Duration::from_millis(1);
+            let error = read_by(&mut ours, &mut [0], past).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            let error = write_by(&mut ours, &[0], past).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            // An open but silent peer ends the read at the deadline.
+            let started = Instant::now();
+            let error = read_by(&mut ours, &mut [0], started + Duration::from_millis(100));
+            assert!(error.is_err());
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+
+        #[test]
+        fn expired_silent_or_malformed_requests_are_refused_without_reaching_the_app() {
+            let dir = tempfile::tempdir().unwrap();
+            let base = base(&dir);
+            let (calls_tx, calls) = mpsc::channel();
+            let (exit, exit_rx) = mpsc::channel::<()>();
+            let (ready_tx, ready) = mpsc::channel();
+            let first = {
+                let base = base.clone();
+                thread::spawn(move || {
+                    let Launch::Primary(mut instance) = acquire(&base, TIMEOUT) else {
+                        panic!("the first launch must own the instance");
+                    };
+                    instance.on_activate(move |_| calls_tx.send(()).is_ok());
+                    ready_tx.send(()).unwrap();
+                    let _ = exit_rx.recv();
+                })
+            };
+            ready.recv_timeout(TIMEOUT).unwrap();
+            assert_eq!(request(&base, in_ms(0).saturating_sub(1)), 0);
+            assert_eq!(
+                request(&base, in_ms(100)),
+                0,
+                "less time left than the margin"
+            );
+            assert_eq!(calls.try_iter().count(), 0);
+            assert_eq!(request(&base, in_ms(5000)), 1);
+            assert_eq!(calls.try_iter().count(), 1);
+            // A far-off deadline is capped rather than trusted.
+            assert_eq!(request(&base, u64::MAX), 1);
+            assert_eq!(calls.try_iter().count(), 1);
+            // A client that disconnects early is dropped.
+            drop(UnixStream::connect(base.with_extension("sock")).unwrap());
+            assert_eq!(request(&base, in_ms(5000)), 1);
+            // A client that stays connected but silent is dropped after its time.
+            let silent = UnixStream::connect(base.with_extension("sock")).unwrap();
+            let started = Instant::now();
+            assert_eq!(request(&base, in_ms(5000)), 1);
+            assert!(started.elapsed() < REQUEST_TIMEOUT + Duration::from_secs(1));
+            drop(silent);
+            // So is one trickling its request a byte at a time: the time limit is for
+            // the whole request, not for each read.
+            let (trickling, started_trickle) = mpsc::channel();
+            let trickle = {
+                let socket = base.with_extension("sock");
+                thread::spawn(move || {
+                    let mut stream = UnixStream::connect(socket).unwrap();
+                    for byte in 0..8 {
+                        if stream.write_all(&[0]).is_err() {
+                            break;
+                        }
+                        if byte == 0 {
+                            trickling.send(()).unwrap();
+                        }
+                        thread::sleep(Duration::from_millis(600));
+                    }
+                })
+            };
+            // Queued behind the trickle, which the listener is already reading.
+            started_trickle.recv_timeout(TIMEOUT).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            let started = Instant::now();
+            assert_eq!(request(&base, in_ms(5000)), 1);
+            assert!(started.elapsed() < REQUEST_TIMEOUT + Duration::from_secs(1));
+            trickle.join().unwrap();
+            assert_eq!(calls.try_iter().count(), 3);
+            drop(exit);
+            first.join().unwrap();
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 mod imp {
     use std::time::Duration;
 
     use super::Launch;
 
-    /// macOS app bundles are single-instance through LaunchServices; Linux has no guard yet.
+    /// macOS app bundles are single-instance through LaunchServices.
     pub struct Instance;
 
     pub(super) const ACTIVATION_TIMEOUT: Duration = Duration::ZERO;
