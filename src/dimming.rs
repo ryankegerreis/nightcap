@@ -189,7 +189,15 @@ impl ScreenDimming {
     }
 
     /// A kept original means its restore has not finished, so the next fade starts from it.
+    /// Without one, nothing will restore: the displays keep their faded level, but the
+    /// overlay is cleared, since no one else could remove Nightcap's own window.
     pub(crate) fn end_fade(&mut self, keep_original: bool) {
+        if !keep_original {
+            self.overlay_alpha = 0.0;
+            if self.fading_on_overlay {
+                self.percent = None;
+            }
+        }
         self.track = self.track.reset(keep_original);
         self.fading_on_overlay = false;
         self.overlay_reference = None;
